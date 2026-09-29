@@ -19,7 +19,15 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                              n == 65536))|| // 131072/ 2 (draft_head)
                               (k == 2048 && n == 65536);    // 131072/ 2 (draft_head, short K)
     if (!column_shard) { return nullptr; }
-    if (t == 1) { return n >= 65536 ? launch_q4_gemv_r4_w1_direct : launch_q4_gemv_r1_w8_direct; }
+    if (t == 1) {
+        // The eight-row SM70 schedule is tuned for the V100 TP2 MLP shard. Keep the
+        // inherited one-row/eight-warp route on other targets until they have their own
+        // qualification, because this table is shared by the Ampere builds too.
+#ifdef NINFER_VOLTA_BUILD
+        if (n == 17408) { return launch_q4_gemv_r8_w1_direct; }
+#endif
+        return n >= 65536 ? launch_q4_gemv_r4_w1_direct : launch_q4_gemv_r1_w8_direct;
+    }
     if (t <= 4) { return launch_q4_simt_r8_c4; }
     if (t <= 16) { return launch_q4_simt_r8_c8; }
     return launch_q4_mma_r64_c128;
@@ -128,8 +136,8 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 #ifdef NINFER_VOLTA_BUILD
 bool q4_launch_needs_volta_fallback(Q4Launch launch) noexcept {
     return launch != launch_q4_gemv_r1_w8_direct && launch != launch_q4_gemv_r4_w1_direct &&
-           launch != launch_q4_draft_head_small_t && launch != launch_q4_simt_r8_c4 &&
-           launch != launch_q4_simt_r8_c8;
+           launch != launch_q4_gemv_r8_w1_direct && launch != launch_q4_draft_head_small_t &&
+           launch != launch_q4_simt_r8_c4 && launch != launch_q4_simt_r8_c8;
 }
 #endif
 

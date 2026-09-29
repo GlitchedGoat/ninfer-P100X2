@@ -322,10 +322,8 @@ std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, 
                                                                           max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        // The A8 activation-quantize workspace is a pure function of (tokens, K), and K=5120 is
-        // unchanged by the shard (only the output row count N halves) -- the tp1 query is exact
-        // here, the same rule attn_input_proj's and gdn_input_proj's column shards follow.
-        return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::fp8_linear_swiglu_shard_workspace_capacity_bytes(policy, min_tokens,
+                                                                         max_tokens);
     }
     if (qtype == QType::Q4G64_F16S || qtype == QType::GGML_K) {
         if (policy != LinearPolicy::A16Only) {

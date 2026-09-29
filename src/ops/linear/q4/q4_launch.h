@@ -68,6 +68,8 @@ constexpr std::int32_t kVoltaQpnMinRows = 4096;
 
 void launch_q4_gemv_r4_w1_direct(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);
+void launch_q4_gemv_r8_w1_direct(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream);
 void launch_q4_gemv_r1_w8_direct(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);
 void launch_q4_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);

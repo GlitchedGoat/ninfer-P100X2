@@ -29,7 +29,8 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
-// The tp2 feature guard, now narrowed to DFlash alone.
+// The tp2 feature guard is intentionally small: both text/MTP and DFlash have split-aware
+// execution paths; Vision remains primary-device-only.
 //
 // Every weight both speculative backends need is already SHARDED by the ShardPlan and
 // materialized per device, and the op-level split forms exist and are parity-tested. What decides
@@ -41,20 +42,20 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 //     projection and the MTP post-mixer's column/row-parallel pair; the draft head is
 //     vocabulary-split with an allgather before the proposal argmax; the verify round records and
 //     folds the GDN state per device. `Variant::mtp_*` have array-of-2 split leaves.
-//   * DFlash is NOT wired. Its forward path still composes plain `ops::linear` /
-//     `ops::residual_add` over WHOLE-width tensors, so shard-shaped weights would either
-//     shape-mismatch or, where an extent happens to line up, silently compute half a layer.
+//   * DFlash uses its own TP2 proposal/verification path. Proposal features are kept rank-local,
+//     the vocabulary head is column-parallel, and only rank 0 consumes the gathered selector
+//     image. This avoids treating the drafter as a whole-width single-device graph.
 //
 // The blanket `--tp 2` throw that once hid both backends is gone; this check is deliberately
-// written as its own independent statement so that narrowing the guard again cannot silently take
-// DFlash's rejection with it.
+// written as its own independent statement so that a future Vision restriction cannot silently
+// disable the split speculative routes.
 void require_supported_tp_features(const EngineOptions& options) {
     if (options.tp <= 1) { return; }
     // MTP is split-aware: the stem's fc is row-parallel over the two unpacked norm halves, the
     // MTP layer's attention/post-mixer are the same column/row-parallel pair the text layers use,
     // the draft head is vocabulary-split with an allgather before the proposal argmax, and the GDN
-    // verify round records and folds per device. DFlash is not: its weights are sharded by the
-    // load plan but nothing in its forward path is.
+    // verify round records and folds per device. DFlash has a separate split-aware proposal path;
+    // its rank-0-only selector gather is deliberately not a full bidirectional all-gather.
     // The Vision encoder runs entirely on the primary device against replicated weights and has no
     // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
     if (options.enable_vision) {

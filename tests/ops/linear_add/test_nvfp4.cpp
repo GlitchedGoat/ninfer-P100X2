@@ -87,10 +87,19 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+    int device = 0;
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDevice(&device), "get CUDA device for NVFP4 linear_add");
+    cuda_check(cudaGetDeviceProperties(&properties, device), "query NVFP4 linear_add device");
+    const bool supports_a4 = properties.major >= 12;
+    const std::int32_t first_a4 = (k == 6144 || k == 3072) ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{5, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},
+        Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{1024, ops::LinearPolicy::A16Only},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
@@ -115,6 +124,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+        if (invocation.policy == ops::LinearPolicy::AllowA4 && !supports_a4) { continue; }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -184,6 +194,8 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);
+    failures += run_shape(5120, 3072, 823U);
+    failures += run_shape(5120, 8704, 827U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

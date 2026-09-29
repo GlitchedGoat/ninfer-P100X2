@@ -40,11 +40,10 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        // T==1 keeps the fused decode kernel; T>=2 takes linear()+residual_add() instead of the
-        // fused SmallTFusedA16 kernel, the same reasoning as linear_swiglu's Volta branch: linear()
-        // now reaches the QPN2 tensor-core route and this op's fused kernel never did. Profiling a
-        // real MTP round found this op's fused small_t kernel owning ~18% of round time.
-        return tokens == 1 ? Nvfp4LinearAddRoute::A16 : Nvfp4LinearAddRoute::LinearThenAdd;
+        // Volta's loader pre-packs NVFP4 MLP weights for QPN. The fused row-major decode/small-T
+        // kernels cannot consume that layout, so use the ordinary linear route (QPN for narrow T,
+        // CUTLASS materialization for wide T) and add the residual afterward at every width.
+        return Nvfp4LinearAddRoute::LinearThenAdd;
 #else
         return Nvfp4LinearAddRoute::A16;
 #endif

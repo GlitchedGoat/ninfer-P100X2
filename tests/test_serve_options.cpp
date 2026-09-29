@@ -37,6 +37,8 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
+    failures += check(defaults.default_max_tokens == 65536,
+                      "default output-token budget mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,

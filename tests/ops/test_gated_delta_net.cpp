@@ -567,6 +567,8 @@ int main() {
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    failures += distinct_state_case({"27b TP2 long prefill fused-qk-norm", 8, 24, 3072, true},
+                                     15372u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.

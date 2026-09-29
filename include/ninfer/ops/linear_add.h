@@ -66,7 +66,8 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_add_workspace_capacity_bytes(), scoped to
- *   the call. A16 routes require no storage; quantized-activation routes use the reported capacity.
+ *   the call. Query the selected profile even for A16: Volta routes can require projection,
+ *   split-K, or dequantization storage. Other routes may have a static-zero requirement.
  *   There is no persistent state side effect.
  */
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
@@ -99,24 +100,23 @@ void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 
 //
 // Rank r owns a [K_r,T] activation block and the matching [N,K_r] weight-column shard, exactly as
 // linear_row_parallel() does. The one thing this Op adds beyond that pattern is where the residual
-// add happens: the tp1 kernels above FUSE it into the GEMM epilogue, but a row-parallel rank only
+// add happens: the tp1 route can fuse it into the GEMM epilogue, but a row-parallel rank only
 // ever holds a PARTIAL sum over its own K block, so fusing the (fully-formed, replicated) residual
 // into every rank's partial would add it once per rank -- i.e. count it (tp==2) times instead of
 // once. It must be added exactly once, and the reduction that combines the partials must not see
 // two different bases.
 //
 // This Op resolves that by folding the residual into the reduction itself rather than by adding it
-// again afterwards: rank 0 evaluates `residual = residual + partial_0` with the SAME fused kernels
-// linear_add() above uses (residual's incoming value is its own per-rank replicated copy, which is
+// again afterwards: rank 0 evaluates `residual = residual + partial_0` with the same per-format
+// LinearAdd route (residual's incoming value is its own per-rank replicated copy, which is
 // correct because it enters the sum exactly once, from exactly one rank); rank 1 evaluates the pure
 // GEMM partial `residual = partial_1` (linear(), no residual term, overwriting rank 1's copy, whose
 // pre-call bytes are not needed again). The one `allreduce_sum(residual, staging, ec, events)` that
 // follows then computes `(residual_in + partial_0) + partial_1`, which both ranks are left holding
 // -- the residual added exactly once, before the reduce, with no separate post-reduce add and no
 // change to allreduce_sum's own contract (it is called exactly as documented: summing two per-rank
-// buffers of the collective's own dtype and shape). This is also numerically tighter than adding
-// the residual as its own separate post-reduce step: rank 0's fused kernel rounds the GEMM-plus-
-// residual sum to BF16 once instead of twice.
+// buffers of the collective's own dtype and shape). The selected private profile determines
+// whether rank 0 fuses the residual into GEMM or materializes the projection before adding it.
 //
 // Where a format's linear_add kernels are all EXACT-geometry templates with no runtime-dimensioned
 // escape hatch for a halved K (BF16_CTRL today), rank 0 instead composes the already tp2-capable
@@ -141,7 +141,7 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
                              const std::array<WorkspaceArena*, 2>& workspace,
                              const ExecutionContext& ec, const PeerEvents& events);
 
-/// A16-only row-parallel form; requires no transient workspace.
+/// A16-only convenience form for profiles whose queried transient workspace is zero.
 void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
                              const std::array<Tensor, 2>& residual,
                              const std::array<Tensor, 2>& staging, const ExecutionContext& ec,

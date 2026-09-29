@@ -122,10 +122,20 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
 namespace {
 
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                      Tensor& v, cudaStream_t stream) {
+                      Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr std::int32_t kQRows  = 3072;
     constexpr std::int32_t kKvRows = 512;
-    constexpr std::int32_t kChunk  = kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
+#ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
+        fp8_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);
+        return;
+    }
+    const std::int32_t kChunk = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
+                                    ? kFp8VoltaQpnMaxTokens
+                                    : kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
+#else
+    constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
+#endif
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
         auto* input                = static_cast<std::uint8_t*>(x.data) +
@@ -143,6 +153,13 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
+#ifdef NINFER_VOLTA_BUILD
+        if (active > 1 && fp8_volta_qpn_supported(weight.n, weight.k, active)) {
+            launch_fp8_attn_input_volta_qpn_shard(input_chunk, weight, query_chunk, gate_chunk,
+                                                  key_chunk, value_chunk, stream);
+            continue;
+        }
+#endif
         if (active == 1) {
             fp8_attn_input_decode_launch_shard(input_chunk, weight, query_chunk, gate_chunk,
                                                key_chunk, value_chunk, stream);
@@ -159,7 +176,7 @@ void fp8_attn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor
                                    Tensor& k, Tensor& v, LinearPolicy policy,
                                    WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Fp8AttnInputRoute::A16) {
-        launch_a16_shard(x, weight, q, gate, k, v, stream);
+        launch_a16_shard(x, weight, q, gate, k, v, workspace, stream);
         return;
     }
     if (workspace == nullptr) {

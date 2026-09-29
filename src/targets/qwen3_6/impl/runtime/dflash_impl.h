@@ -344,20 +344,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                  *state.execution.peer->events);
             Tensor part0 = state.execution.work.alloc(DType::BF16, {shard, columns});
             Tensor part1 = state.execution.peer->work->alloc(DType::BF16, {shard, columns});
-            Tensor peer_logits = state.execution.peer->work->alloc(
-                DType::BF16, {TextConfig::output_rows, columns});
             ops::linear_column_parallel(
                 {proposal_hidden, peer_hidden},
                 {state.execution.model.output_head, state.execution.peer->model->output_head},
                 {part0, part1}, *state.execution.peer->execution);
-            for (std::int32_t column = 0; column < columns; ++column) {
-                ops::allgather_rows(
-                    {logits.slice(1, column, 1).view({1, TextConfig::output_rows}),
-                     peer_logits.slice(1, column, 1).view({1, TextConfig::output_rows})},
-                    {part0.slice(1, column, 1).view({1, shard}),
-                     part1.slice(1, column, 1).view({1, shard})},
-                    *state.execution.peer->execution, *state.execution.peer->events);
-            }
+            // The lattice selector runs only on rank 0.  Gathering the full vocabulary to rank 1
+            // doubles the PCIe/DMA-FQ traffic and event choreography without feeding any
+            // consumer, so import only rank 1's shard into rank 0's logits image.
+            ops::gather_columns_rank0(logits, {part0, part1}, *state.execution.peer->execution,
+                                      *state.execution.peer->events);
         }
         Tensor selector_gate = state.execution.work.alloc(
             DType::BF16, {256, static_cast<std::int32_t>(k) * batch_size});

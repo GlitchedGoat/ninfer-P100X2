@@ -1,9 +1,9 @@
 # Dual-GPU (TP2) execution and YaRN 1M context
 
-This document records the design decisions, numerical contracts, and qualification evidence behind
-two additions to the 27B execution package: tensor-parallel execution across two RTX 5090s
-(`--tp 2 --devices A,B`) and YaRN positional scaling (`--rope yarn`) for contexts up to 1,048,576
-tokens.
+This document records the shared TP2 execution design and transport contract. The active V100X2
+profile uses two Tesla V100-SXM2 cards (`--tp 2 --devices A,B`) and native 180K context; the
+retained YaRN sections describe the separate upstream 27B capability and are not V100X2
+measurements.
 
 It is a maintainer reference, not a user guide. User-facing option contracts live in
 [CLI](../cli.md) and [HTTP serving](../serving.md); the measured throughput, memory and retrieval
@@ -41,15 +41,16 @@ positions remain the resident frontier and complete typed checkpoints, as specif
 
 ---
 
-## 2. Transport: no peer-to-peer on these cards
+## 2. Transport: qualified UVA D2D
 
-`cudaDeviceCanAccessPeer` reports **0 in both directions** between two RTX 5090s (GeForce driver
-restriction; PCIe topology PHB). This is a measured property of the hardware, not a configuration
-choice, and it is the single fact that shapes the collective layer.
+On the V100X2 host the two cards are behind a translated `DMA-FQ` IOMMU domain, so direct peer DMA
+is not usable even when the driver advertises peer capability. This is a measured property of the
+hardware, not a configuration choice. Startup detects the domain, leaves direct peer access off,
+and qualifies the same UVA device-to-device copy used by the collectives in both directions.
 
-The collectives are therefore **host-staged asynchronous copies over PCIe**, measured at
-22.55/23.16 GiB/s bulk and 8.50/8.73 µs per 10 KiB transfer. `cudaMemcpyPeerAsync` is the same API
-with or without peer access, so the absence of peer access changes the cost, not the code shape.
+CUDA then selects its driver-managed staging path over PCIe. The collectives do not allocate an
+explicit pinned host buffer or maintain a separate D2H/H2D branch. A previous explicit pinned
+experiment was slower in whole-prefill profiling and is retained only as historical diagnostic data.
 
 `allreduce_sum` / `allgather` live in `include/ninfer/ops/allreduce.h` and
 `src/ops/common/allreduce.cu`. The design is **pull-based with four events per call**. A two-event
@@ -64,7 +65,7 @@ Measured costs:
 | Collectives per decode token | 128 reduces plus one logit all-gather |
 | Whole collective set per token, under CUDA Graphs | ~0.2 ms |
 
-(Both at the 400 W per-GPU cap.)
+(These historical 5090 values are not V100X2 measurements.)
 
 **`cudaMemcpyPeerAsync` is not stream-capturable.** The collective uses `cudaMemcpyAsync` in
 device-to-device/UVA form instead, which is capturable and is what allows the whole dual-device

@@ -1,6 +1,6 @@
-// Verifies PCIe P2P is available between two GPUs (the two RTX 5090s used
-// for TP2) and measures one-way bandwidth in both directions. When P2P is
-// unavailable, measures the automatic host-staged transport instead of
+// Verifies PCIe P2P is available between two GPUs and measures one-way
+// bandwidth in both directions. When P2P is unavailable, measures CUDA's
+// automatic driver-managed staging instead of
 // aborting -- a cross-device copy works without peer access because CUDA
 // silently stages it through host memory, and the TP2 all-reduce design
 // issues that copy regardless of whether true P2P is available (P2P is an
@@ -38,10 +38,10 @@
 //       bandwidth >= 25 GiB/s both directions.
 //   1 = P2P available but bandwidth threshold not met, or a hard CUDA
 //       failure (the CK macro below also exits 1 on any unexpected error).
-//   2 = P2P unavailable (canAccess=0 in either direction); the staged
-//       (host-relayed) transport was measured instead and all numbers are
-//       printed above this exit. This is not a hard failure -- the TP2
-//       plan proceeds via cudaMemcpyPeerAsync's automatic staging, with
+//   2 = P2P unavailable (canAccess=0 in either direction); the CUDA-managed
+//       staged transport was measured instead and all numbers are printed
+//       above this exit. This is not a hard failure -- the TP2 plan proceeds
+//       via the capture-legal UVA D2D copy, with
 //       the measured overhead replacing the design's ≤2% estimate.
 
 #include <cuda_runtime.h>
@@ -129,7 +129,7 @@ int p2p_probe(int dev_a, int dev_b) {
   if (!p2p_available) {
     printf("P2P: UNAVAILABLE (GeForce driver restriction likely)\n");
     printf(
-        "Measuring the staged (host-relayed) transport instead -- a "
+        "Measuring CUDA's driver-managed staging instead -- a "
         "cross-device copy works without peer access because CUDA stages it "
         "through host memory, and the TP2 all-reduce issues it regardless. "
         "(This probe times cudaMemcpyPeerAsync; the collectives now use the "
@@ -194,8 +194,8 @@ int p2p_probe(int dev_a, int dev_b) {
 
   if (!p2p_available) {
     printf(
-        "STAGED: canAccess both directions=0, %d->%d=%.2f GiB/s / %.2f us, "
-        "%d->%d=%.2f GiB/s / %.2f us (staged transport measured, exit 2)\n",
+        "CUDA_STAGED: canAccess both directions=0, %d->%d=%.2f GiB/s / %.2f us, "
+        "%d->%d=%.2f GiB/s / %.2f us (driver-managed staging measured, exit 2)\n",
         dev_a, dev_b, bw_ab, lat_ab_us, dev_b, dev_a, bw_ba, lat_ba_us);
     return 2;
   }

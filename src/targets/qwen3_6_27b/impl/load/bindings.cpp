@@ -1,6 +1,11 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/common/split_launch.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#endif
 #include "targets/qwen3_6_27b/impl/config.h"
 
 #include <algorithm>
@@ -190,6 +195,15 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     // gate_up is column-parallel (output rows split); down is row-parallel (input columns split).
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816 / tp, 5120, device);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408 / tp, device);
+#ifdef NINFER_VOLTA_BUILD
+    // Both MLP matrices use the Volta QPN code layout.  The down matrix is row-parallel, but its
+    // shard-local K extent is still a complete QPN tile (17408 / tp), so it can use the same
+    // prepack transform as gate_up.
+    if (out.gate_up.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
+    }
+#endif
     return out;
 }
 
@@ -1056,6 +1070,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 // the shard.
 void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                         RuntimeModelView& runtime) {
+#ifdef NINFER_VOLTA_BUILD
+    const ::ninfer::ops::detail::CurrentDeviceScope device_scope;
+    ::ninfer::ops::detail::CurrentDeviceScope::set(backing.physical_device(device));
+#endif
     runtime.weights_arena = &backing.device_arena(device);
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
@@ -1118,6 +1136,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     final_norm = artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16,
                                                {5120}, device);
     output_head = materialized_weight(backing, plan.output_head, 248320 / tp, 5120, device);
+#ifdef NINFER_VOLTA_BUILD
+    if (output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        ::ninfer::ops::detail::fp8_prepack_qpn_sm70(output_head);
+    }
+#endif
     if (plan.features.optimized_proposal()) {
         auto& proposal = runtime.optimized_proposal.emplace();
         proposal.head =

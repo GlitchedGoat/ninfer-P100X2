@@ -24,6 +24,27 @@ int q5_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 17408, 409U, kK17408RouteStarts, kK17408RouteInteriors});
+#ifdef NINFER_VOLTA_BUILD
+    constexpr std::array<std::int32_t, 3> kShardRouteStarts{14, 33, 65};
+    constexpr std::array<std::int32_t, 5> kShardRouteInteriors{1, 8, 24, 48, 256};
+#else
+    constexpr std::array<std::int32_t, 3> kShardRouteStarts{33, 49, 129};
+    constexpr std::array<std::int32_t, 4> kShardRouteInteriors{8, 40, 96, 256};
+#endif
+    for (const std::int32_t k : {3072, 8704}) {
+        failures += ninfer::test::linear_add::run_shape(
+            "Q5_A16 LinearAdd TP2 shard", WeightFormat::Q5G64F16S,
+            ShapeCase{5120, k, 419U, kShardRouteStarts, kShardRouteInteriors});
+    }
+#ifdef NINFER_VOLTA_BUILD
+    // The [1,64] arena must cover T=32's split-K accumulator even though both interval
+    // endpoints need no scratch. run_shape executes the public Op with that exact arena.
+    constexpr std::array<std::int32_t, 2> kNarrowStarts{14, 33};
+    constexpr std::array<std::int32_t, 4> kNarrowInteriors{8, 24, 48, 64};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd bounded workspace", WeightFormat::Q5G64F16S,
+        ShapeCase{5120, 8704, 421U, kNarrowStarts, kNarrowInteriors});
+#endif
     return failures;
 }
 

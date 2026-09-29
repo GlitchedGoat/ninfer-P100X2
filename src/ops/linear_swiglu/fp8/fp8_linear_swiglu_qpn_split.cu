@@ -10,18 +10,16 @@ namespace ninfer::ops::detail {
 
 #ifdef NINFER_VOLTA_BUILD
 
-namespace {
-constexpr std::int32_t kIntermediate = 17408; // Fp8MlpGateUpGeometry::kOutputRows / 2
-} // namespace
-
-bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept {
-    return fp8_volta_qpn_supported(kIntermediate, k, t);
+bool fp8_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
+                                            std::int32_t t) noexcept {
+    return n > 0 && (n % 2) == 0 && fp8_volta_qpn_supported(n / 2, k, t);
 }
 
 void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         float* gate_scratch, float* up_scratch,
                                         cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
+    const std::int32_t kIntermediate = weight.n / 2;
 
     Weight gate_weight = weight;
     gate_weight.n      = kIntermediate;

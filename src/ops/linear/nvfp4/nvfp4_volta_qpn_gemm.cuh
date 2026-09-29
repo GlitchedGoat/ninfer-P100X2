@@ -455,8 +455,9 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked;
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
+    const bool tp2_down   = (n == 5120 && k == 8704);
     if (t <= S::kRowsPerTile) {
-        if (gate_up || split_half) {
+        if (gate_up || split_half || tp2_down) {
             launch_nvfp4_qpn_schedule<1, 16, 2>(prepacked, grid, codes, scales, xd, n, k, t,
                                                 inverse_weight_divisor, output, stream);
         } else {

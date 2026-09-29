@@ -9,7 +9,10 @@
 //   (a) the tp1 fused kernel on device 0, over the WHOLE weight, updating a residual in place, and
 //   (b) linear_add_row_parallel over the two K-shards + all-reduce, updating a REPLICATED residual
 //       -- the same initial bytes on both devices, per the Op's own contract -- in place,
-// and (b) is compared against (a). Weight shards come from the SAME translation-invariant
+// Both are checked against an independent FP64 formula at seam coordinates and every coordinate
+// where their pairwise difference exceeds the criterion. Pairwise comparison is diagnostic:
+// neither rounded implementation serves as the mathematical oracle. Weight shards use the same
+// translation-invariant
 // generator test_linear_split.cpp uses (make_weight / bf16_weight_block below), so the two payloads
 // meet only at the logical level, exactly as the tp2 loader's shards do.
 //
@@ -21,11 +24,11 @@
 // design note for the full argument. A double-count bug (residual added on both ranks) would show
 // up as approximately 2x the residual's own magnitude added into the result; a dropped-residual bug
 // (added on neither rank) would show up as the residual's magnitude missing. Both are far outside
-// the 2 BF16 ulp parity bound below, so the ordinary parity comparison already catches either -- no
+// the 2 BF16 ulp bound below, so the independent formula catches either -- no
 // separate assertion is needed to make this suite mean what it says.
 //
 // TOLERANCE. 2 BF16 ulp of the largest output in the tensor, same criterion and same rationale as
-// test_linear_split.cpp's row-parallel leg (two extra BF16 roundings from the split evaluation) --
+// test_linear_split.cpp's row-parallel leg (rounding from the split evaluation) --
 // EXCEPT FP8's AllowA8 route, which needs a wider, separately-justified bound; see
 // kFp8A8RowSplitCriterion's comment below (FP8's A8 activation scale is a whole-K-row reduction,
 // not a local per-group one, so it is not shard-invariant under a K split).
@@ -38,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -424,8 +428,59 @@ int run_case(const Case& test_case, const ExecutionContext& ec, const ops::PeerE
                 failures +=
                     split_residual[slot]->verify_guards(label + " rank " + std::to_string(rank));
                 observed[slot] = from_device_bf16(split_residual[slot]->data(), elements);
-                failures += compare(label + " rank " + std::to_string(rank), observed[slot],
-                                    expected, criterion);
+            }
+
+            const ReductionStats pairwise = compute_reduction_stats(
+                observed[0].data(), expected.data(), static_cast<std::int64_t>(elements));
+            std::cout << "  " << label << " TP1/TP2 diagnostic: max_abs="
+                      << pairwise.maximum_absolute_error << " rel_l2=" << pairwise.relative_l2
+                      << '\n';
+            std::vector<std::size_t> probes;
+            for (const std::int32_t token : seam_samples(tokens)) {
+                for (const std::int32_t row : seam_samples(n)) {
+                    probes.push_back(static_cast<std::size_t>(token) * n + row);
+                }
+            }
+            // Keep every prior pairwise failure under the independent oracle, plus the largest
+            // reference output and all nonfinite values. Two rounded results may straddle the
+            // ideal value while both satisfy its unchanged numerical criterion.
+            std::size_t largest = 0;
+            for (std::size_t index = 0; index < elements; ++index) {
+                if (std::abs(expected[index]) > std::abs(expected[largest])) { largest = index; }
+                if (std::abs(observed[0][index] - expected[index]) >
+                        gross_error_limit(pairwise, criterion) ||
+                    !std::isfinite(expected[index]) || !std::isfinite(observed[0][index]) ||
+                    !std::isfinite(observed[1][index])) {
+                    probes.push_back(index);
+                }
+            }
+            probes.push_back(largest);
+            std::sort(probes.begin(), probes.end());
+            probes.erase(std::unique(probes.begin(), probes.end()), probes.end());
+            std::vector<double> oracle(probes.size());
+            std::vector<double> single(probes.size());
+            std::array<std::vector<double>, 2> split{
+                std::vector<double>(probes.size()), std::vector<double>(probes.size())};
+            for (std::size_t sample = 0; sample < probes.size(); ++sample) {
+                const std::size_t index = probes[sample];
+                const auto row = static_cast<std::int32_t>(index % n);
+                const std::size_t token = index / n;
+                double sum = 0.0;
+                for (std::int32_t column = 0; column < k; ++column) {
+                    const double weight = dense
+                        ? static_cast<double>(bf16_to_f32(
+                              dense_words[0][static_cast<std::size_t>(row) * k + column]))
+                        : qw::logical_weight_fp64(packed[0], row, column);
+                    sum += weight * static_cast<double>(activation[token * k + column]);
+                }
+                oracle[sample] = sum + static_cast<double>(residual0[index]);
+                single[sample] = expected[index];
+                for (int rank = 0; rank < 2; ++rank) { split[rank][sample] = observed[rank][index]; }
+            }
+            failures += compare(label + " TP1/FP64", single, oracle, criterion);
+            for (int rank = 0; rank < 2; ++rank) {
+                failures += compare(label + " rank " + std::to_string(rank) + "/FP64",
+                                    split[rank], oracle, criterion);
             }
 
             // allreduce_sum leaves the identical summed result on both ranks: exact, byte for byte.
@@ -612,11 +667,16 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
+    cudaDeviceProp properties[2]{};
+    for (int rank = 0; rank < 2; ++rank) {
+        cuda_check(cudaGetDeviceProperties(&properties[rank], ec.dev[rank]->device),
+                   "cudaGetDeviceProperties");
+    }
+    const int compute_major = std::min(properties[0].major, properties[1].major);
     const bool peer_access = ops::enable_peer_access(ec);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (CUDA stages the device-to-device copies through "
-                                "host memory)")
+                              : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
     const ops::PeerEvents events(ec);
 
@@ -648,7 +708,13 @@ int main() {
          {1, 8, 24, 25, 48, 128, 1024}, {kA16, kA8}},
     };
 
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec, events); }
+    for (Case test_case : cases) {
+        std::erase_if(test_case.policies, [compute_major](ops::LinearPolicy policy) {
+            return (policy == ops::LinearPolicy::AllowA4 && compute_major < 12) ||
+                   (policy == ops::LinearPolicy::AllowA8 && compute_major < 10);
+        });
+        if (!test_case.policies.empty()) { failures += run_case(test_case, ec, events); }
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " linear_add split\n";
     return failures ? 1 : 0;

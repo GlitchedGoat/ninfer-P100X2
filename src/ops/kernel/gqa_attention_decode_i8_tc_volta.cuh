@@ -4,9 +4,9 @@
 //
 // This is gqa_attention_small_t_tc_volta_partial_kernel (gqa_attention_prefill_volta.cuh) with
 // the KV cache dtype swapped from bf16 to the int8 + per-64-group-scale codec. The tile
-// topology, QK^T/PV compute core, online-softmax recurrence and partial_* output format are
-// character-for-character the same, and the file comment below still governs them; keep the two
-// files in step when either changes.
+// topology, QK^T/PV arithmetic, online-softmax recurrence and partial_* output format are the
+// same. Two warps compute the two independent eight-key QK tiles once and share their FP32
+// scores with all four PV dimension warps. Each warp retains the original softmax/PV order.
 //
 // Why it exists: the INT8 decode path was SIMT-only, and SIMT is what caps it. Measured at 82k,
 // width 4, the INT8 SIMT kernel runs at 1.86 TFLOP/s and the bf16 tensor-core kernel at 2.71 --
@@ -42,8 +42,8 @@
 //      cap with nothing left for Q/K fragments or loop state. Fix: split the head dimension
 //      across warps (DimSplit=4 below) instead of giving each warp the full D range, so each
 //      warp only holds D/4=64 columns resident (8 chunks x 8 floats = 64 registers). Warps
-//      that share a row-tile redundantly recompute the (cheap, register-light) QK^T +
-//      online-softmax step identically and only diverge for the PV accumulate.
+//      reuse one FP32 QK tile, perform the same online-softmax recurrence independently,
+//      and diverge only for the PV accumulate.
 //
 //   2. Shared-memory wall. This kernel reloads Q from shared memory every key-tile
 //      iteration rather than keeping Q fragments resident in registers (that trade-off is
@@ -127,6 +127,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
+    // Lane-major within each score component: consumers and producers access contiguous
+    // banks, including the 24 live rows of a TP2 MTP4 call.
+    __shared__ float scores_s[PVChunks][8][32];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -362,17 +365,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
             }
             __syncthreads();
 
-            // Bc=16 keys are staged together, but QK^T/softmax/PV operate on 8-key
-            // sub-groups within that stage: each mma.sync.m8n8k4 call only covers an
-            // 8-key "N" dimension, so each sub-group gets its own complete online-softmax
-            // rescale step (same recurrence as the outer kb loop, one level finer). Every
-            // dim-split warp sharing this row-tile computes this step identically and
-            // redundantly -- see file comment #1.
-#pragma unroll
-            for (int sub = 0; sub < PVChunks; ++sub) {
-                const int sub_k0 = k0 + sub * 8;
-
-                // --- QK^T: accumulate over the full D=256 head dim, 8 real k-elements/call. ---
+            // QK is independent of the PV dimension slice. Give each eight-key subgroup
+            // to one warp, retaining the exact D=256 MMA accumulation order.
+            if (warp < PVChunks) {
                 float d_score[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
                 for (int c = 0; c < DChunks; ++c) {
@@ -380,10 +375,23 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                     volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]), SmemStride / 2);
                     half2 kf[4];
                     volta_load_k(
-                        kf, reinterpret_cast<const half2*>(&k_s[sub * 8 * SmemStride + c * 8]),
+                        kf, reinterpret_cast<const half2*>(&k_s[warp * 8 * SmemStride + c * 8]),
                         SmemStride / 2);
                     volta_mma_qk(d_score, qf, kf);
                 }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { scores_s[warp][j][lane] = d_score[j]; }
+            }
+            __syncthreads();
+
+            // Softmax/PV still consume the eight-key subgroups in their original order.
+            // The score handoff adds no cast and does not alter max/sum/PV association.
+#pragma unroll
+            for (int sub = 0; sub < PVChunks; ++sub) {
+                const int sub_k0 = k0 + sub * 8;
+                float d_score[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { d_score[j] = scores_s[sub][j][lane]; }
 
                 // --- Causal mask + scale. Row = volta_d_get_i(l) (0..31, this pass's local
                 // row index); each thread's 8 registers span exactly two distinct rows

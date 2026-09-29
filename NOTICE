@@ -61,8 +61,9 @@ The integration is distributed under the Apache License, Version 2.0.
 Model artifacts
 ---------------
 The published artifacts are derived from Qwen/Qwen3.6-27B, Qwen/Qwen3.8-27B and
-Qwen/Qwen3.6-35B-A3B, and from the packed-weight repackagings named in the
-README's License section. Those source repositories are distributed under the
+Qwen/Qwen3.6-35B-A3B. Their NVFP4 profiles also use the fixed packed weights from
+rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm and
+unsloth/Qwen3.8-27B-NVFP4. Those source repositories are distributed under the
 Apache License, Version 2.0.
 
 Vendored dependencies retain their own license files under third_party/.

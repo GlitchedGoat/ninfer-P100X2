@@ -6,8 +6,8 @@
 
 The promoted route is measured on the real Q4_K_M artifact with INT8 KV, TP2 and
 180,000-token capacity. With `prefill_chunk=4096`, an 8,192-token prompt took **4.897 s**
-to prefill (**1,672.9 tok/s**); the fixed 85,000-token code corpus took **67.597–67.943 s**
-(**1,251.0–1,257.5 tok/s**, two runs). The latter has exactly 85,000 occupied prompt tokens.
+to prefill (**1,672.9 tok/s**); the fixed 85,000-token code corpus measured **1,251.44 ± 2.87
+tok/s** on the active UVA-D2D transport path. The latter has exactly 85,000 occupied prompt tokens.
 These are prefill rates, not decode rates, and both exceed the requested 1,000 tok/s target.
 The 4,096-token chunk is the V100X2 launcher default; the Engine and generic CLI retain their
 target-agnostic 1,024-token default.
@@ -33,27 +33,219 @@ The promoted SM70 route decodes each Q4_K block with one cooperative block-wide 
 materializes GGML-K rows into caller-owned FP16 workspace, and uses the existing CUTLASS Volta
 Tensor-Core GEMM, including an FP32 output path for GDN control projection. The packed Q4_K/Q6_K
 bytes remain unchanged. The first two generated IDs were unchanged (`71093, 10504`) in the
-controlled route comparison. These are prefill results only;
-the published decode acceptance remains the separately measured 53.4075 tok/s until a new long
-decode campaign is run.
+controlled route comparison. These are prefill results only; the active long decode result is
+recorded below.
 
-The external references and integration boundaries are:
+### NVFP4 prefill and decode
+
+The active SM70 implementation uses QPN for narrow NVFP4/FP8 projections and CUTLASS for wide
+prefill projections, including prepacked TP2 weights. Wide Linear calls with caller workspace
+decode weights once for the whole call instead of repeating the narrow kernel over 32-token
+chunks. NVFP4 K16 tuples are decoded cooperatively. Both wide prefill and decode retain FP32
+gate/up projections through SwiGLU and round only the final activation to BF16. FP8 wide
+projections apply the stored BF16 row scale in FP32 before the nonlinear combination.
+
+The prepacked FP8 vocabulary head requires a matching kernel even at T=1. Its previous
+row-major GEMV dispatch read the wrong weights for the first token and one-token chunk tails.
+Independent FP64 Linear tests reproduced that defect on both full and TP2 head shapes, and
+pass after the dispatch fix. Performance runs containing that bug are excluded from the current
+result; plausible generated text alone did not establish correctness.
+
+On 2 × V100-SXM2 16 GB, CUDA 12.8, the fixed local `/tmp/v100-code-85000.ids` corpus,
+`qwen3.8-27b/nvfp4`, 85,000 occupied tokens, 180,000 capacity, complete INT8 group-64 KV, TP2,
+CUDA Graphs, greedy sampling, MTP3 and the optimized draft head:
+
+| Implementation | Runs | Prefill tok/s | Committed decode tok/s | MTP acceptance |
+|---|---:|---:|---:|---:|
+| FP32 SwiGLU, shared attention scores/reducer weights, prepared GDN Q/K | 2 | **1,279.44 ± 2.94** | **78.36 ± 0.04** | **79.12%** |
+
+These use `prefill_chunk=3072`, no prefix reuse and no extra benchmark warmup; graphs are primed
+before measurement. Every run produces one token during prefill followed by 512 timed decode
+tokens with model stopping disabled. The two runs match all 513 output IDs and the same 360/455
+accepted drafts over 152 rounds per run. This is a fixed throughput window; the generated C++ is
+truncated at the output limit and is not scored as a complete solution. The 3,072-token chunk reserves
+1,502,358,016 bytes of workspace per GPU; a 4,096-token chunk does not fit alongside the same
+180K capacity on this host. The local report is `profiles/bench/nvfp4_85k_fp32_swiglu.json`;
+the exact command is in the
+[README](../README.md#nvfp4-at-85k-occupied-context).
+
+The earlier 72.28, 75.53 and 78.90 tok/s figures preceded the wide SwiGLU correction. Those paths
+materialized gate/up as BF16 before SiLU/product, with another BF16 rounding after FP8 row scaling.
+Expanded independent FP64 tests failed for both weight formats. The FP32 implementation passes
+the original A16 criterion (relative L2 0.0033, gross absolute 0.005 plus 0.0063 times the maximum
+reference magnitude), including full and TP2 shapes at 3,072 tokens. No tolerance was widened.
+The corrected generated sequence differs, so the older figures are historical measurements rather
+than qualified baselines or a controlled measure of the correction's performance cost.
+
+The reducer computes each split's softmax weight once per CTA and stages eight vectors in
+parallel, preserving the prior FP32 max/denominator tree and ascending numerator accumulation.
+It retains every KV token and adds no quantization. An isolated 85K TP2 four-query reducer probe
+decreased from about 172 to 54 µs with identical BF16 outputs; this is operator-stage timing,
+separate from the end-to-end decode measurement above. A reassociated-sum experiment was faster
+but changed the generated sequence and is not the delivered route.
+
+The INT8 partial-attention kernel now shares two independent QK tiles across four PV warps.
+Each warp keeps the same softmax and PV arithmetic order. The isolated TP2 85K/four-query probe
+decreased from 739 to 647 µs with identical partial accumulators and softmax statistics.
+Long SM70 GDN prefill normalizes Q/K once into FP32 scratch, shared by every state tile/value
+head. The FP32 state update order and BF16 output boundary remain unchanged; 3,072-token TP2
+scratch decreases from 102.28 MiB of previously unused chunked storage to 24 MiB. The public
+GDN benchmark measures 3.887 ms median with cold L2 and CUDA Graph replay (5 warmups, 21 samples).
+Its independent FP64 test covers all outputs and final state, including the full 3,072-token
+TP2 recurrence, nonzero initial state, in-place operation and the 63/64/65-token route boundary.
+
+The complete GQA public-contract suite and the TP2 head-local suite pass the independent FP64
+oracle, including every head/key for four queries at 85K and a 180K envelope. Native/prepacked
+FP8 and NVFP4 Linear prefill tests at T=128/1024/4096 also pass their independent oracle. This
+evidence covers numerical behavior and the measured generation; it does not establish a general
+task-quality score or predict other machines' reported 77–90 tok/s.
+
+The final Volta TP2 validation also corrected Q5 and BF16 residual row-shard dispatch: their
+Ampere MMA routes were not executable on sm_70. The Q5 A16 shard now uses runtime-K SM70 routes
+with its bounded split-K workspace sized at the interior peak, and the BF16 shard uses SM70
+CUTLASS. Independent FP64 tests cover the registered shard shapes; the two-card LinearAdd and
+SwiGLU composition suites pass. These dispatch corrections do not change the measured NVFP4
+artifact's weight format or the profiler breakdown above.
+
+### NVFP4 full-request ledger
+
+The unprofiled two-run measurement above averages:
+
+| Phase | Time | Scope |
+|---|---:|---|
+| Resident model load | 18.650 s | once per invocation; includes 16.246 s upload |
+| Prompt preparation | 0.001570 s | raw 85K token IDs; no tokenizer or media preprocessing |
+| Prefill and first token | 66.435 s | all 85,000 tokens, no prefix reuse |
+| Decode | 6.534 s | 512 committed tokens; 152 MTP rounds |
+| Remaining request overhead | 0.003225 s | submission/publication between measured phases |
+| Complete resident request | 72.974 s | includes preparation, prefill and decode; excludes load/graph priming |
+
+Graph priming happens before the measured request; its duration is not included in this ledger.
+Vision and prefix reuse are inactive for this workload. Model load transfers 22.458 GB to the two
+devices from 21.197 GB of artifact payload; this is separate from request-phase TP2 traffic.
+
+A separate `--profile-measured` run captures all CUDA kernels, copies and runtime calls in the
+same request. It produces identical output IDs and acceptance. Tracing increases prefill to
+67.588 s and decode to 6.966 s, so the following attribution must not replace unprofiled throughput.
+GPU 0's cumulative kernel times are below; GPU 1 runs concurrently and is reported separately in
+the local JSON ledger. Every captured kernel is included, including those grouped in the last row.
+
+| GPU work | Prefill seconds | Decode seconds | Optimization finding |
+|---|---:|---:|---|
+| CUTLASS matrix multiply | 23.096 | — | dominant prefill projection work; wide SwiGLU now writes FP32 intermediates |
+| FP8 QPN projections | 0.001 | 1.701 | native row access remains costly; paired-lane loading was slower and rejected |
+| NVFP4 QPN projections | — | 1.050 | packed Tensor-Core path; retain qualified arithmetic while investigating access/issue cost |
+| W8 draft projections | 0.455 | 0.203 | part of native MTP, measured separately from target projections |
+| Q4 draft vocabulary head | 0.001 | 0.120 | already uses reduced draft vocabulary; speculative tokens do not count as output |
+| Prefill attention core | 18.574 | — | major remaining prefill target: query tile and key-loop utilization |
+| Decode attention partials | 0.002 | 1.719 | QK scores shared across output warps; all history keys retained |
+| Attention reducers | 0.035 | 0.159 | ordered shared-weight reducer retained; reassociation rejected |
+| KV gather/append and masks | 0.317 | — | full context preserved; no retrieval/subsampling |
+| GDN recurrence/QK preparation | 4.643 | 0.121 | prepared Q/K reused; same FP32 state recurrence |
+| GDN control projection | 0.437 | 0.070 | much smaller than main projections; separate FP32 control output |
+| GDN convolution | 0.222 | 0.033 | preserve persistent convolution state and MTP rollback behavior |
+| Weight decoding | 1.918 | — | weights decoded once per wide projection call |
+| Activation conversion | 0.739 | 0.018 | possible producer/consumer fusion, subject to the same numerical boundary |
+| FP8 row scaling | 0.361 | — | selected Linear shapes fuse scaling into GEMM; SwiGLU scales in its FP32 combine |
+| RMS normalization | 0.448 | 0.195 | fusion candidates must be evaluated with their consumers |
+| Residual addition | 0.911 | 0.128 | includes collective local sums; communication ordering constrains fusion |
+| SwiGLU/sigmoid gates | 0.667 | 0.021 | corrected FP32 SwiGLU intermediates; further epilogue fusion remains a candidate |
+| RoPE | 0.010 | 0.018 | small contribution; preserve position semantics |
+| Embedding | 0.005 | 0.004 | small contribution |
+| Split, sampling, state/control kernels | 0.271 | 0.009 | includes acceptance and token publication, not discarded drafts |
+| All kernels | **53.113** | **5.569** | single-device sums, not two-GPU wall time |
+
+The FP8 decode total consists of GDN input 0.667 s, attention input 0.186 s, gate/up 0.218 s,
+and linear/output-head work 0.631 s. Of all decode kernels, target verification/acceptance uses
+4.875 s and subsequent MTP alignment/proposal uses 0.694 s on GPU 0. The split follows each
+`speculative_prepare_verify_inputs` / `mtp_prepare_next_round` boundary; it excludes copies and
+host waits. This is the actual MTP3 schedule, with 360 accepted out of 455 drafts.
+
+| Timeline accounting | Prefill | Decode |
+|---|---:|---:|
+| GPU 0 H2D activity sum | 0.323 s / 112.283 GB | 0.170 s / 1.036 GB |
+| GPU 0 D2H activity sum | 0.376 s / 112.282 GB | 0.113 s / 1.036 GB |
+| GPU 0 local D2D activity sum | 0.127 s / 41.780 GB | 0.003 s / 0.214 GB |
+| GPU 0 timeline with no recorded device activity | 13.636 s | 1.123 s |
+| Neither GPU has recorded device activity | 13.251 s | 0.761 s |
+
+The copy rows are CUPTI activity records for CUDA's driver-managed staging, not complete physical
+PCIe transfer timings. In particular, their large-copy byte/duration ratios cannot be interpreted
+as PCIe bandwidth. The uncovered intervals can contain staging, synchronization and CPU issue
+cost; calling all of them communication or all of them CPU overhead would be unsupported.
+API durations also include waiting and must not be added to device durations. A direct two-rank
+UVA transfer probe found no benefit from issuing the two pulls on separate CPU threads: the
+31,457,280-byte payload measured 3.646 ms sequential versus 3.714 ms parallel (median of 30
+samples, after 5 warmups, exact bytes verified). That candidate is not in production.
+
+To regenerate the breakdown, profile the README command with `-r 1 --profile-measured`, then:
+
+```bash
+nsys export --type sqlite \
+  --output profiles/nsys/nvfp4_85k_fp32_swiglu.sqlite \
+  profiles/nsys/nvfp4_85k_fp32_swiglu.nsys-rep
+.venv/bin/python3 tools/v100/profile_ledger.py \
+  profiles/nsys/nvfp4_85k_fp32_swiglu.sqlite \
+  --benchmark profiles/bench/nvfp4_85k_fp32_swiglu_profile.json \
+  --output profiles/bench/nvfp4_85k_fp32_swiglu_ledger.json
+```
+
+Capture uses `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
+--cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop`.
+The ledger retains every kernel's calls and mean duration for both devices, plus API/copy sums
+and interval-union accounting. The stage table identifies live optimization opportunities;
+it is not a claim that every stage has reached its hardware limit.
+
+### External references and integration boundaries
 
 - [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), an SM70-focused vLLM fork. Its
   Flash-V100 attention and quantized kernels are not drop-in compatible with NInfer's preserved
   GGUF Q4_K/Q6_K storage; porting one requires a separate oracle and graph-capture qualification.
 - [DFlash2](https://inco.ai/blog/dflash2/) and the [Qwen3.8-27B drafter](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2),
   now integrated as an optional five-layer BF16 draft route with dynamic grouped convolution,
-  lattice selection, and TP2 replicated verification. A short two-V100 smoke run completed eight generated tokens with 100% acceptance; no long-context
-  throughput claim is published yet. A temporary llama.cpp `sm_70` build was used only as an external
-  reference: with the same local Q4_K_M target, Q8 KV, an approximately 6,020-token prompt and
-  128 generated tokens, it measured 34.2 tok/s without speculation, 65.6 tok/s with DFlash2
-  draft=3, and 85.0 tok/s with DFlash2 draft=7 on V100×2. These are not NInfer measurements.
+  lattice selection, and TP2 replicated verification. A short two-V100 smoke run completed eight generated tokens with 100% acceptance. The measured
+  85K code-corpus NInfer results are recorded below; a temporary llama.cpp `sm_70` build was used only as an external
+  85K control, not as a short-prompt headline result.
 - [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp), which stores completed KV
   blocks in host RAM and retrieves a query-selected subset into a bounded GPU window. That is an
   approximate attention policy, not a transparent full-180K KV spill: it changes which history
   participates in attention. The V100X2 contract therefore keeps complete-context semantics and
   does not silently substitute KVMem retrieval.
+
+The NInfer benchmark also accepts `--spec dflash --draft-tokens K` and feeds the fixed
+`/tmp/v100-code-85000.ids` corpus directly through `Engine::prepare_tokens()`. With 85,000 occupied
+tokens, INT8 group-64 KV, TP2 (`0,1`), 1,024-token prefill chunks, and a 512-token measured decode
+window, the 98,304-token-capacity run produced:
+
+For an external engine control, the same raw 85,000-token IDs were sent to the local llama.cpp
+build with 98,304 capacity, Q8 KV, DFlash3, and a 128-token fixed window. It produced 30.1 tok/s
+(121 drafted, 87 accepted); NInfer's matching 128-token DFlash3 run produced 25.3 tok/s (110
+drafted, 91 accepted). A separate older short-prompt experiment is excluded because its workload
+was not comparable to this 85K result.
+
+| Route | CUDA Graph | Decode tok/s | Acceptance | Output check |
+|---|---:|---:|---:|---|
+| NInfer DFlash3 | on | **25.19** | 81.21% | same 513 IDs as MTP3 |
+| NInfer DFlash3 | off | **25.08** | 81.21% | same 513 IDs as graph |
+| NInfer DFlash7 | off | **20.52** | 41.56% | repeated special-message output after token 444 |
+| NInfer MTP3 control | on | **52.77** | 75.37% | 513-token window, no EOS/EOG |
+
+The DFlash3 graph/eager output IDs were identical. Requesting a 180,000-token capacity for DFlash
+is rejected during startup on the current two 16 GiB cards: the draft graph/runtime reservation
+requires about 5.48 GiB after weights while only about 3.50 GiB remains per device. These numbers
+are therefore a long-code execution measurement at 98,304 capacity, not a 180K-capacity acceptance
+claim. DFlash7's lower rate and output degeneration make increasing the draft window
+counterproductive for this workload.
+
+The low DFlash rate is not caused by the selector kernel itself. Nsight Systems attributes the
+dominant proposal-round cost to the five-layer BF16 drafter and its full Q4_K vocabulary head;
+the selector top-k/walk kernels are only a small fraction of a round. Before this change, TP2
+also reconstructed the full `[248320, K]` vocabulary image with one cross-device gather per
+draft column and wrote an unused copy on rank 1. NInfer now gathers all columns in one strided
+PCIe operation and keeps the image only on rank 0 (`gather_columns_rank0`), with exact byte/layout
+tests. On the 85K corpus this preserves all 513 output IDs and acceptance, but changes DFlash3
+from 25.19 to about 25.29 tok/s (within run-to-run noise): the remaining gap requires an exact
+fused vocabulary-head/top-k path and/or fused DFlash proposal layers, not another selector tweak.
 
 ### PCIe-only transport optimization
 
@@ -63,14 +255,14 @@ hidden-width all-reduces per committed token (64 layers × mixer/MLP row-paralle
 carrying 10 KiB at batch one. Quantization therefore cannot remove this fixed schedule, explaining
 why Q1, Q4, and Q6 runs converge near the same peak.
 
-The runtime keeps direct UVA P2P when startup qualifies it. On this host it selects a graph-safe
-explicit fallback: one pinned host slot per rank, asynchronous D2H exports followed by peer H2D
-imports, with event ordering across consecutive collectives. The 10 KiB all-reduce suite measures
-**34.47 us mean / 34.17 us p50** (500 iterations, host synchronization included), versus the
-previous implicit CUDA-staged path's approximately 48.4 us. A graph-captured Q4_K_M run with 85,000
-occupied tokens, 180,000 capacity, INT8 KV, and MTP3 produced **53.18 committed tok/s** (89 accepted
-/ 114 drafted, 78.07% acceptance); the matched earlier result was 53.41 tok/s, so this is a
-transport-latency cleanup rather than an 80 tok/s breakthrough.
+The active runtime transfers with captured UVA `cudaMemcpyAsync(...,
+cudaMemcpyDeviceToDevice, ...)` and two-rank event ordering. On this translated-IOMMU host, CUDA
+handles the cross-device D2D copy through its driver-managed staging path. Startup qualifies that
+exact API in both directions; collectives do not allocate explicit pinned-host staging buffers. An
+earlier explicit pinned D2H/H2D experiment measured **34.47 us mean / 34.17 us p50** for a 10 KiB
+all-reduce and **53.18 tok/s** on one 85K decode run (89/114 drafts accepted). That route was
+removed after whole-prefill profiling showed higher aggregate transfer time than the single UVA D2D
+node; its numbers are historical and are not attributed to the active route.
 
 Removing the remaining PCIe dependency requires a pipeline-parallel 32/32 layer split (one hidden
 transfer at the layer boundary instead of two collectives per layer). That is a runtime/state/KV/
@@ -79,26 +271,20 @@ contract.
 
 The active port uses two Tesla V100-SXM2 16 GB cards, CUDA 12.8 (`sm_70`), and the local
 `qwen3.8-27b/gguf-q4-k-m` artifact converted from LM Studio's Qwen3.8-27B Q4_K_M GGUF.
-On the fixed code-generation workload below, three valid runs at exactly 85,000 occupied prompt
-tokens measured **53.4075 ± 0.0639 committed decode tok/s** (mean ± sample standard deviation),
-**18.68% above** the user's approximately 45 tok/s baseline. Each run measures 512 decode tokens
-with 180,000-token capacity. This establishes the speed result for this prompt and output window;
-it does not guarantee the same speed on every prompt. The RTX 5090 tables later in this document
-are inherited results for different hardware and weight profiles.
+On the fixed code-generation workload below, two current runs at exactly 85,000 occupied prompt
+tokens measured **50.68 ± 0.04 committed decode tok/s** (mean ± sample standard deviation) with
+**1,251.44 ± 2.87 prefill tok/s**, 180,000-token capacity and a 128-token output window. This
+establishes the active UVA-D2D result for this prompt and output window; it does not guarantee the
+same speed on every prompt.
 
-Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the selected
-transfer route with exact byte comparisons in both directions, and rejects startup if verification
-fails. On this `DMA-FQ` host, TP2 now uses two long-lived pinned host slots and explicit asynchronous
-D2H/H2D legs for every collective instead of relying on the driver's opaque UVA-D2D staging path.
-The real 10 KiB decode-shaped all-reduce measures **33.67 us mean / 33.05 us p50** over 500
-iterations (down from the earlier 48.4 us host-staged measurement); this reduces transport overhead
-but cannot remove the 128 per-token collective dependencies. The explicit route passes the collective
-suite, including different tensor sizes, guards and 64 consecutive rounds, and the three public
-Engine CUDA Graph measurements below. The INT8 attention test also passes its independent FP64
-oracle at 85K occupied keys for all four queries, all 24 heads and every visible key, with TP1/TP2 comparisons
-and exact cache checks. Real-model MTP/non-MTP teacher forcing and graph/eager regression gates
-pass on their short-prompt fixtures. The source Q4_K/Q6_K codes and scales remain unchanged;
-these numerical and state checks support the tested route without asserting universal quality
+Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the UVA D2D copy
+with exact byte comparisons in both directions, and rejects startup if verification fails. The
+collective suite covers different tensor sizes, guards and 64 consecutive rounds; the public Engine
+CUDA Graph path is exercised by the measurements below. The INT8 attention test also passes its
+independent FP64 oracle at 85K occupied keys for all four queries, all 24 heads and every visible
+key, with TP1/TP2 comparisons and exact cache checks. Real-model MTP/non-MTP teacher forcing and
+graph/eager regression gates pass on their short-prompt fixtures. The source Q4_K/Q6_K codes and
+scales remain unchanged; these checks support the tested routes without asserting universal quality
 parity for all prompts.
 
 | Setting | V100X2 comparison profile |
@@ -111,10 +297,10 @@ parity for all prompts.
 | Primary occupied context | Exactly 85,000 actual prompt tokens |
 | KV cache | INT8 group-64; compared with LM Studio's Q8 KV configuration |
 | CUDA Graph | Enabled |
-| Prefill chunk | 1,024 tokens |
+| Prefill chunk | 4,096 tokens |
 | NInfer MTP | Fixed draft window of three; optimized proposal head (`--lm-head-draft`) |
-| Measured output window | 512 decode tokens plus the first token from prefill; three repetitions |
-| TP2 transport | Verified CUDA host-staged copies on the current IOMMU host |
+| Measured output window | 128 decode tokens; two repetitions |
+| TP2 transport | Verified UVA D2D copies; CUDA-managed staging on the current IOMMU host |
 
 NInfer's `--mtp-draft-tokens 3` uses a fixed three-token proposal window, shortened when the remaining
 output or context budget requires it. Verification may accept zero drafts. This is distinct from
@@ -122,50 +308,39 @@ LM Studio's maximum-three/minimum-zero draft configuration: a minimum draft coun
 its proposal policy to vary how many drafts it attempts, whereas zero accepted drafts describes
 the verification result. The two engines therefore use related, but different, MTP schedules.
 
-| Repetition | Committed decode wall tok/s |
-|---|---:|
-| 1 | 53.3498 |
-| 2 | 53.3966 |
-| 3 | 53.4761 |
-| Mean ± sample standard deviation | **53.4075 ± 0.0639** |
+| Repetitions | Prefill tok/s | Committed decode tok/s |
+|---:|---:|---:|
+| 2 | **1,251.44 ± 2.87** | **50.68 ± 0.04** |
 
-Every repetition produced the same 513 token IDs, with no EOS/EOG token in the captured window,
-and accepted **364 / 444 drafts (81.98%)**. Before the current prefill route, this decode campaign's
-prefill took **298.132–298.154 s** per repetition and was excluded from decode throughput.
-Host CPU use was approximately one of 32 logical cores; observed GPU memory use was
-**13,768 / 13,454 MiB**, including about 313 MiB of desktop use on GPU 0.
+Both repetitions completed without EOS/EOG; aggregate MTP acceptance was **78.07%**. The
+superseded explicit pinned-host route's 53.4075 tok/s result is historical and is not the active
+transport measurement. Host CPU use remains one worker core while CUDA performs the measured work.
 
 A separate short-input code-chat measurement used 512 prompt tokens, the same 180,000-token
 capacity and execution settings, one warmup, and three 256-token decode windows. Its wall decode
 rates were **59.9644, 60.0509 and 60.0721 tok/s**, or **60.0291 ± 0.0571 tok/s** (mean ± sample
 standard deviation), with **65.89%** draft acceptance. All three 257-token outputs were identical
-and EOS/EOG-free. This exceeds the reported 57 tok/s peak numerically, but the unspecified
-occupancy of that peak prevents a matched comparison; it is not the 85K acceptance result.
+and EOS/EOG-free. This short-input result is reported separately from the 85K workload.
 
-The user-reported LM Studio baseline is approximately **45 committed decode tok/s at 85K occupied
-context**, with a reported **57 tok/s peak** whose context occupancy was not specified. The
-approximately 40 tok/s figure at longer context is an estimate. These observations are the
-acceptance reference; the 18.68% gain is relative to the reported 45 tok/s value, rather than the
-matched-engine measurement below. The 57 tok/s peak has not been exceeded by this 85K result and lacks
-the context occupancy needed for a like-for-like comparison.
+The previously reported LM Studio values (approximately 45 committed tok/s and a 57 tok/s peak)
+are retained only as historical observations. Their workload metadata was incomplete and they are
+not used as current acceptance targets or as a matched-engine comparison.
 
-A matched diagnostic run before the current NInfer prefill optimization used LM Studio's CUDA
+A matched diagnostic run before the current NInfer transport change used LM Studio's CUDA
 backend **2.33.0** with its automatic two-GPU split, the same source GGUF and exact 85,000
 prompt IDs, Q8 KV, a requested 180,000-token capacity
 (rounded by the backend to 180,224), and maximum-three/minimum-zero MTP. Both engines used greedy
 sampling and generated 513 output tokens: one from prefill and 512 in the measured decode interval.
 
-| Engine | Decode tok/s | Prefill seconds | Accepted / drafted |
+| Engine | Decode tok/s | Prefill | MTP acceptance |
 |---|---:|---:|---:|
-| NInfer V100X2, mean of three runs | **53.4075** | 298.144 | 364 / 444 per run (81.98%) |
-| LM Studio CUDA 2.33.0, one run | **35.4977** | 185.374 | 365 / 440 (82.95%) |
+| NInfer V100X2, current UVA-D2D mean of two runs | **50.68** | **1,251.44 tok/s** | 78.07% |
+| LM Studio CUDA 2.33.0, historical one run | **35.4977** | 185.374 s | 365 / 440 (82.95%) |
 
 The LM run decoded for **14.42347 s**, evaluated all 85,000 prompt tokens without cache reuse,
-and stopped at the output limit without any EOS/EOG token. NInfer's decode rate is **50.45% higher**
-in this comparison, with similar MTP acceptance. Its prefill is **1.61 times as long**, so this is
-a decode improvement for that earlier implementation, not a current cold-request latency result.
-The single LM run is a diagnostic, not a stable average, and does not replace the user's approximately 45 tok/s
-acceptance baseline.
+and stopped at the output limit without any EOS/EOG token. The LM row used a different 513-token
+output window and the older NInfer transport, so it is retained only as historical cross-engine
+context, not as a current like-for-like comparison.
 
 Measure committed output tokens per decode second, excluding the first token produced by prefill.
 Rejected draft tokens do not count as output. Report repeated measurements and context occupancy;
@@ -252,8 +427,8 @@ With that backend ready, run the matched single-round diagnostic using Python 3.
   --output /tmp/llama-v100x2-85000.json
 ```
 
-This one-round LM Studio diagnostic does not establish a stable average. The NInfer comparison
-against the user's 45 tok/s baseline uses the three measured repetitions above.
+This one-round LM Studio diagnostic does not establish a stable average and is retained only for
+historical cross-engine context.
 
 These are fixed-window code-generation throughput measurements, not evaluations of whether the
 generated code correctly solves the requested programming task.
@@ -266,7 +441,7 @@ claim unchanged model quality or an end-to-end speedup.
 
 ## V100X2 maximum-context capacity sweep
 
-The capacity comparison in the README varies only the requested maximum context from 1,024
+The earlier Q4_K_M capacity comparison in the README varies only the requested maximum context from 1,024
 through 65,536 tokens, doubling at each step. Every request uses the same 512-token code-chat
 prompt and generates 257 tokens: one from prefill and 256 in the measured decode interval.
 It measures the effect of the capacity setting, not inference with that many occupied tokens.
@@ -297,6 +472,27 @@ The runner executes the engines sequentially and stops only its own temporary LM
 Its output directory contains raw JSON responses, engine logs, requested and actual capacities,
 per-repetition timings, MTP counts, and `summary.json` / `summary.md`. The `--engine ninfer`
 and `--engine llama` options allow running the two sides separately in that same directory.
+
+The corrected NVFP4 implementation was separately measured with the same 512-token code-chat fixture,
+256-token decode window, one warmup and three repetitions at 8,192/16,384/32,768/65,536 capacities.
+The results were **97.65 ± 0.08 / 97.67 ± 0.09 / 97.76 ± 0.11 / 97.55 ± 0.15 tok/s**,
+respectively; prefill was 1,369.9–1,370.9 tok/s and MTP acceptance was 70.04% at every capacity.
+All requested capacities were allocated exactly. All 12 runs reproduced the same 257 output IDs,
+without EOS/EOG, accepting 173/247 drafts over 83 rounds each. This is a capacity-setting check
+with 512 occupied prompt tokens, not a filled-context measurement or a matched comparison against
+LM Studio's Q4_K_M weights. Reproduce this NVFP4 sweep with:
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+build-v100/bench/ninfer_v100_corpus \
+  /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  /tmp/v100-code-512.ids --code-chat 512 --output-tokens 1024 \
+  src/core/host_worker_pool.h
+.venv/bin/python3 tools/v100/bench_capacity.py --engine ninfer \
+  --weights /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  --capacities 8192 16384 32768 65536 --corpus /tmp/v100-code-512.ids \
+  --output-dir profiles/bench/nvfp4_fp32_swiglu_capacity
+```
 
 ## V100X2 prefix cache
 

@@ -129,6 +129,13 @@ DeviceArena& MaterializedArtifact::device_arena(int device) {
     return *device_arena_[static_cast<std::size_t>(device)];
 }
 
+int MaterializedArtifact::physical_device(int device) const {
+    if (device < 0 || device >= stats_.device_count) {
+        throw ArtifactError("materialized artifact does not cover that device");
+    }
+    return physical_devices_[static_cast<std::size_t>(device)];
+}
+
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  std::span<DeviceContext* const> devices, LoadProgress* progress) {
     const int device_count = plan.device_count;
@@ -141,6 +148,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     out.stats_.device_count = device_count;
     for (int index = 0; index < device_count; ++index) {
         const auto slot              = static_cast<std::size_t>(index);
+        out.physical_devices_[slot]  = devices[slot]->device;
         const std::uint64_t capacity = plan.device_capacity_bytes[slot];
         if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
             throw ArtifactError("artifact tensor backing size is invalid");

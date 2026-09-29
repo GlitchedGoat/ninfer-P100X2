@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -322,6 +324,110 @@ int run_profile(std::string_view label, const Profile& profile,
                          host_activation.data(), host_activation.size() * sizeof(std::uint16_t));
     failures += verify_unchanged(std::string(label) + " weight", device_weight,
                                  host_weight.payload.data(), host_weight.payload.size());
+    return failures;
+}
+
+int run_column_parallel_profile(std::string_view label, const Profile& shard_profile,
+                                std::span<const std::int32_t> token_cases) {
+    Profile parent_profile = shard_profile;
+    parent_profile.gate_up_rows *= 2;
+    parent_profile.output_rows *= 2;
+    validate_profile(parent_profile);
+    if (token_cases.empty()) { throw std::invalid_argument("LinearSwiGLU split: no token cases"); }
+    if (!cuda_available()) { return 77; }
+    int devices = 0;
+    cuda_check(cudaGetDeviceCount(&devices), "count devices");
+    if (devices < 2) { return 77; }
+    const ExecutionContext ec({0, 1});
+    const std::int32_t maximum_tokens = token_cases.back();
+    const auto policy = ops::LinearPolicy::A16Only;
+    if (shard_profile.activation_compute != ActivationCompute::A16) {
+        throw std::invalid_argument("LinearSwiGLU split oracle fixture requires A16");
+    }
+    struct Rank {
+        quantized_weight::PackedWeight packed;
+        std::vector<std::uint16_t> activation;
+        std::vector<double> expected;
+        std::unique_ptr<test::GuardedDeviceBuffer> weight;
+        std::unique_ptr<test::GuardedDeviceBuffer> x;
+        std::unique_ptr<test::GuardedDeviceBuffer> output;
+        std::unique_ptr<WorkspaceArena> workspace;
+    };
+    std::array<Rank, 2> ranks;
+    const std::size_t capacity = ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
+        shard_profile.qtype, policy, 1, maximum_tokens);
+    for (int rank = 0; rank < 2; ++rank) {
+        cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
+        auto& data = ranks[rank];
+        Profile profile = shard_profile;
+        profile.seed += 73U * rank;
+        quantized_weight::PatternedWeightOptions options;
+        if (profile.qtype == QType::NVFP4) {
+            options.weight_scale_divisor = 0.125F;
+            options.input_scale_divisor = 3.5F;
+        }
+        data.packed = quantized_weight::make_patterned_weight(
+            profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, options);
+        // Both ranks consume the same replicated activation and distinct gate/up shards.
+        data.activation = make_activation(shard_profile, maximum_tokens);
+        data.expected = linear_swiglu_oracle_fp64(
+            profile, data.packed, data.activation, maximum_tokens);
+        data.weight = std::make_unique<test::GuardedDeviceBuffer>(data.packed.payload.size());
+        data.weight->copy_from_host(data.packed.payload.data(), data.packed.payload.size());
+        data.x = std::make_unique<test::GuardedDeviceBuffer>(data.activation.size() * 2);
+        data.x->copy_from_host(data.activation.data(), data.activation.size() * 2);
+        data.workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(capacity, 256));
+    }
+    int failures = 0;
+    for (const auto tokens : token_cases) {
+        std::array<Tensor, 2> x, output;
+        std::array<Weight, 2> weights;
+        std::array<WorkspaceArena*, 2> workspace;
+        const std::size_t elements = checked_elements(shard_profile.output_rows, tokens, "split");
+        for (int rank = 0; rank < 2; ++rank) {
+            cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
+            auto& data = ranks[rank];
+            data.output = std::make_unique<test::GuardedDeviceBuffer>(elements * 2);
+            data.output->fill(0xff);
+            x[rank] = Tensor(data.x->data(), DType::BF16, {shard_profile.input_rows, tokens});
+            output[rank] = Tensor(data.output->data(), DType::BF16,
+                                  {shard_profile.output_rows, tokens});
+            weights[rank] = data.packed.device_weight(data.weight->data());
+            data.workspace->reset();
+            data.workspace->reset_peak();
+            workspace[rank] = data.workspace.get();
+            cuda_check(cudaDeviceSynchronize(), "retire split staging");
+        }
+        ops::linear_swiglu_column_parallel(x, weights, output, policy, workspace, ec);
+        const std::size_t exact = ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
+            shard_profile.qtype, policy, tokens, tokens);
+        for (int rank = 0; rank < 2; ++rank) {
+            cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
+            cuda_check(cudaStreamSynchronize(ec.dev[rank]->stream), "complete split SwiGLU");
+            auto& data = ranks[rank];
+            const std::string name = std::string(label) + " T=" + std::to_string(tokens) +
+                                     " rank=" + std::to_string(rank);
+            failures += compare_output(name, read_bf16_output(*data.output, elements),
+                                        data.expected.data(), ActivationCompute::A16);
+            failures += data.output->verify_guards(name);
+            if (data.workspace->used() != 0 || data.workspace->peak_used() != exact) {
+                std::cerr << name << ": exact workspace query/execution high-water mismatch\n";
+                ++failures;
+            }
+        }
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
+        auto& data = ranks[rank];
+        failures += verify_unchanged(label, *data.weight, data.packed.payload.data(),
+                                     data.packed.payload.size());
+        failures += verify_unchanged(label, *data.x, data.activation.data(), data.activation.size() * 2);
+        data.output.reset();
+        data.workspace.reset();
+        data.x.reset();
+        data.weight.reset();
+    }
+    cuda_check(cudaSetDevice(0), "restore primary device");
     return failures;
 }
 

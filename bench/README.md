@@ -45,6 +45,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8>]
+          [--spec <none|mtp|dflash>] [--draft-tokens <n>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--tp <1|2>] [--devices <id[,id]>]
           [--no-cuda-graph] [--profile-measured]
@@ -62,13 +63,15 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
-`--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP remains available
+through `--mtp-draft-tokens`; the generic form is `--spec mtp --draft-tokens K`, and the 27B
+DFlash2 route is selected with `--spec dflash --draft-tokens K` (K=1..7). `--lm-head-draft`
+selects the optimized proposal head. CUDA Graph decode is enabled by default.
 
 `--tp 2 --devices 0,1` selects two-device execution through the same Engine route. The device list
 must contain one distinct ordinal per rank; an explicit `--device` must match its first entry.
-Schema-v12 JSON records the actual Engine `tp` and ordered `devices` in `environment`; table, CSV,
+Schema-v13 JSON records the actual Engine `tp` and ordered `devices` in `environment`, together with
+the selected speculative backend and draft window; table, CSV,
 and matrix summaries also identify the selected devices. The existing memory summary reports the
 primary device, so its byte counts are not the sum across both GPUs.
 

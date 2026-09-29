@@ -25,7 +25,13 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
 #endif
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
-    if (tp2_shard) { return launch_bf16_mma; }
+    if (tp2_shard) {
+#ifdef NINFER_VOLTA_BUILD
+        return launch_bf16_cutlass_sm70;
+#else
+        return launch_bf16_mma;
+#endif
+    }
     if (t == 1) { return launch_bf16_decode; }
     const std::int32_t small_t_end =
         n == 5120 ? kBf16SmallTMaxTokens : kBf16LinearSmallTDispatchEnd;

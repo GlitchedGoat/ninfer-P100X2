@@ -48,6 +48,13 @@ int run_fp8_a16() {
     };
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {248320, 5120, 823U, Comparison::Sampled, true, vocabulary_invocations});
+    constexpr std::array vocabulary_tp2_invocations{
+        Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {124160, 5120, 824U, Comparison::Sampled, true,
+                           vocabulary_tp2_invocations});
     constexpr std::array vocabulary_policies{
         ops::LinearPolicy::A16Only,
         ops::LinearPolicy::AllowA8,
@@ -86,6 +93,30 @@ int run_fp8_a16() {
         run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
 
+#ifdef NINFER_VOLTA_BUILD
+    // The resident output head is prepacked, including the first-token call and a T=1
+    // remainder after a 32-token chunk. Check its represented FP8 values directly against
+    // the same independent oracle used for the portable artifact layout.
+    constexpr std::array prepacked_head_invocations{
+        Invocation{1, CallForm::A16Convenience}, Invocation{4}, Invocation{33},
+    };
+    for (const int output_rows : {248320, 124160}) {
+        failures += run_shape("FP8_A16_PREPACKED_HEAD", ActivationCompute::A16, make_fp8_weight,
+                              {output_rows, 5120, 833U, Comparison::Sampled, true,
+                               prepacked_head_invocations, true});
+    }
+    constexpr std::array prefill_invocations{
+        Invocation{128}, Invocation{1023}, Invocation{1024}, Invocation{1025}, Invocation{4096},
+    };
+    for (const bool prepacked : {false, true}) {
+        failures += run_shape("FP8_A16_PREFILL", ActivationCompute::A16, make_fp8_weight,
+                              {5120, 3072, 835U, Comparison::Sampled, true,
+                               prefill_invocations, prepacked});
+        failures += run_shape("FP8_A16_PREFILL", ActivationCompute::A16, make_fp8_weight,
+                              {5120, 8704, 837U, Comparison::Sampled, true,
+                               prefill_invocations, prepacked});
+    }
+#endif
     auto packed = make_fp8_weight(14336, 5120, 831U);
     try {
         (void)ops::detail::validate_fp8_weight(packed.weight, "FP8 validator test");

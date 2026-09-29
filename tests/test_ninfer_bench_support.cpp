@@ -105,6 +105,11 @@ int test_cli_contract() {
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
+    const auto dflash = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec",
+                                        "dflash", "--draft-tokens", "7", "--lm-head-draft"});
+    failures += expect(dflash.speculative_backend == ninfer::SpeculativeBackend::DFlash &&
+                           dflash.mtp_draft_tokens == 7,
+                       "DFlash backend and window");
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
@@ -171,6 +176,12 @@ int test_cli_contract() {
                 {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "6"});
         },
         "unsupported MTP window");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash",
+                                  "--draft-tokens", "8"});
+        },
+        "unsupported DFlash window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
@@ -289,6 +300,7 @@ qb::BenchEnvironment sample_environment() {
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    env.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
     env.mtp_draft_tokens                  = 5;
     env.proposal_head                     = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
@@ -313,7 +325,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 12, "report schema v12");
+    failures += expect(report.at("schema_version") == 13, "report schema v13");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("environment").at("tp") == 2, "report actual TP width");
     failures += expect(report.at("environment").at("devices") == Json({1, 0}),
@@ -336,6 +348,9 @@ int test_report_contract() {
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
+                           report.at("config").at("mtp_draft_tokens") == 5,
+                       "speculative configuration");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
                        "graph prime output count");
 

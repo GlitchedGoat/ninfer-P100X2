@@ -39,13 +39,8 @@ struct RouteSpec {
 constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
-    // TP2 row-parallel halves of the two residual geometries (o_proj / gdn/output 6144 -> 3072,
-    // mlp/down 17408 -> 8704). Not a new kernel: the shard is the same row-split tensor with K
-    // halved, so `q5_linear_add_mma_r64_c*` (q5_linear_add_gemm_mma.cu) already reads N and K from
-    // the Weight/Tensor at runtime and its `Full` grid predicate already handles K % 64 == 0 at the
-    // halved extent. Only the GEMV (T=1) and split2 (T=2..16/17) schedules are K-EXACT templates
-    // that do not cover the halved K, so the shard routes below skip straight to the generic MMA
-    // schedule for every token count -- see kK3072ShardRoutes / kK8704ShardRoutes.
+    // TP2 row-parallel halves of attention/GDN output and MLP down-projection. The exact-K
+    // GEMV/split2 templates do not cover these extents; each device profile uses runtime-K routes.
     {5120, 3072, 3072},
     {5120, 8704, 8704},
 }};
@@ -97,21 +92,22 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
 }};
 #endif
 
-// TP2 row-parallel shard routes (K = 3072, 8704). GemvResidual and Split2ExactResidual are K-EXACT
-// templates that do not cover a halved K (see q5_linear_add_gemv.cu / q5_linear_add_gemm_simt.cu),
-// so unlike the tp1 tables above, every token count here routes straight to one of the MMA
-// schedules -- MmaResidualR64C* is fully N/K-generic (q5_linear_add_gemm_mma.cu reads both from the
-// Weight/Tensor at runtime), so this is the SAME qualified compute body as the tp1 route at T>=14
-// (K=6144) / T>=17 (K=17408), not a new kernel. Q5's own ops::linear shard table makes the
-// identical choice for its plain GEMV/split2-exact schedules
-// (src/ops/linear/q5/q5_dispatch.cpp), and this is a performance decision only; re-measuring the
-// shard's own T=1..13 crossover is deliberately deferred tuning work.
+// TP2 row-parallel shard routes (K = 3072, 8704). Ampere MMA is not executable on sm_70.
+// Volta uses runtime-K SIMT for small T and CUTLASS for wide T; the fused Volta MMA band below
+// replaces the table's selection in its supported interval, just as for the full shapes.
+#ifdef NINFER_VOLTA_BUILD
+constexpr std::array<RouteSpec, 2> kShardRoutes{{
+    {{1, 16}, Q5LinearAddScheduleId::SimtWideTResidual},
+    {{17, kAnyCols}, Q5LinearAddScheduleId::CutlassSm70TensorCoreResidual},
+}};
+#else
 constexpr std::array<RouteSpec, 4> kShardRoutes{{
     {{1, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
+#endif
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
@@ -231,14 +227,20 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("q5 linear_add: invalid column interval");
     }
-    // CutlassSm70TensorCoreResidual's workspace is monotonic in cols (the FP16 weight-dequant
-    // buffer is fixed at rows*k, the activation-cast buffer scales with cols), and the fused
-    // tensor-core route's accumulator is rows*cols*4, also monotonic, so the true maximum over
-    // [min_cols,max_cols] is always at one of the two endpoints.
     const Q5LinearAddPlan at_min = q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
     const Q5LinearAddPlan at_max = q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
-
-    return std::max(at_min.workspace_bytes, at_max.workspace_bytes);
+    std::size_t peak = std::max(at_min.workspace_bytes, at_max.workspace_bytes);
+#ifdef NINFER_VOLTA_BUILD
+    // CUTLASS workspace is monotonic in T, but fused MMA drops its accumulator when the
+    // split count becomes one (currently T=33). Inspect the bounded fused band as well, so
+    // intervals such as [1,64] reserve the actual interior peak rather than zero bytes.
+    const std::int32_t first = std::max(min_cols, q5_volta_mma_min_cols(k));
+    const std::int32_t last = std::min(max_cols, kVoltaMmaMaxCols);
+    for (std::int32_t cols = first; cols <= last; ++cols) {
+        peak = std::max(peak, q5_linear_add_resolve_plan({rows, k, padded_k, cols}).workspace_bytes);
+    }
+#endif
+    return peak;
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,

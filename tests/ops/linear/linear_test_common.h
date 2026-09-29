@@ -39,6 +39,7 @@ struct ShapeCase {
     Comparison comparison;
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
+    bool prepack_volta = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,

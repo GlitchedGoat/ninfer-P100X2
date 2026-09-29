@@ -9,8 +9,8 @@
 //   allreduce_sum - independent FP64 elementwise sum of the two represented BF16 inputs. The
 //     Op's observable output is BF16, so the comparison allows one BF16 ulp of output storage
 //     rounding (relative 3.95e-3 >= 2^-8); the oracle itself performs no rounding.
-//   allgather_rows - exact: the Op only relocates rows, so every destination byte is compared
-//     bit-for-bit against the concatenated source halves.
+//   allgather_rows/gather_columns_rank0 - exact: the Ops only relocate bytes, so every destination
+//     byte is compared bit-for-bit against an independently constructed concatenation.
 #include "ninfer/ops/allreduce.h"
 #include "ops/op_tester.h"
 
@@ -191,6 +191,69 @@ int run_allgather_case(const char* label, std::int32_t rows_0, std::int32_t rows
                              from_device<std::uint16_t>(source_device_1.data(), part_1), bits_1);
     failures += destination_1.verify_guards("allgather destination device 1");
     failures += source_device_1.verify_guards("allgather source device 1");
+    return failures;
+}
+
+int run_gather_columns_rank0_case(const char* label, std::int32_t width_0,
+                                  std::int32_t width_1, std::int32_t columns,
+                                  std::uint32_t seed, const ExecutionContext& ec,
+                                  const ops::PeerEvents& events) {
+    const std::int32_t width = width_0 + width_1;
+    const std::size_t count_0 = static_cast<std::size_t>(width_0) * columns;
+    const std::size_t count_1 = static_cast<std::size_t>(width_1) * columns;
+    std::vector<float> values_0(count_0), values_1(count_1);
+    fill_uniform(values_0, seed, -8.0f, 8.0f);
+    fill_uniform(values_1, seed + 1, -8.0f, 8.0f);
+    const auto bits_0 = encode_bf16(values_0);
+    const auto bits_1 = encode_bf16(values_1);
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(width) * columns);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        std::copy_n(bits_0.data() + static_cast<std::size_t>(column) * width_0, width_0,
+                    expected.data() + static_cast<std::size_t>(column) * width);
+        std::copy_n(bits_1.data() + static_cast<std::size_t>(column) * width_1, width_1,
+                    expected.data() + static_cast<std::size_t>(column) * width + width_0);
+    }
+    const std::size_t full_bytes = expected.size() * sizeof(std::uint16_t);
+
+    set_device(ec, 0);
+    GuardedDeviceBuffer source_0(count_0 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer destination_0(full_bytes);
+    source_0.copy_from_host(bits_0.data(), source_0.bytes());
+    destination_0.fill(0xcd);
+    set_device(ec, 1);
+    GuardedDeviceBuffer source_1(count_1 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer destination_1(full_bytes);
+    source_1.copy_from_host(bits_1.data(), source_1.bytes());
+    destination_1.fill(0xcd);
+
+    const std::array<Tensor, 2> destination{
+        Tensor(destination_0.data(), DType::BF16, {width, columns}),
+        Tensor(destination_1.data(), DType::BF16, {width, columns})};
+    const std::array<Tensor, 2> part{
+        Tensor(source_0.data(), DType::BF16, {width_0, columns}),
+        Tensor(source_1.data(), DType::BF16, {width_1, columns})};
+
+    retire_staging(ec);
+    ops::gather_columns_rank0(destination[0], part, ec, events);
+    synchronize_both(ec);
+
+    int failures = 0;
+    set_device(ec, 0);
+    failures += verify_exact((std::string(label) + " device 0").c_str(),
+                             from_device<std::uint16_t>(destination_0.data(), expected.size()),
+                             expected);
+    failures += verify_exact("gather_columns_rank0 source device 0 unchanged",
+                             from_device<std::uint16_t>(source_0.data(), count_0), bits_0);
+    failures += destination_0.verify_guards("gather_columns_rank0 destination device 0");
+    failures += source_0.verify_guards("gather_columns_rank0 source device 0");
+    set_device(ec, 1);
+    failures += verify_exact("gather_columns_rank0 unused destination remains untouched",
+                             from_device<std::uint16_t>(destination_1.data(), expected.size()),
+                             std::vector<std::uint16_t>(expected.size(), 0xcdcd));
+    failures += verify_exact("gather_columns_rank0 source device 1 unchanged",
+                             from_device<std::uint16_t>(source_1.data(), count_1), bits_1);
+    failures += destination_1.verify_guards("gather_columns_rank0 unused destination device 1");
+    failures += source_1.verify_guards("gather_columns_rank0 source device 1");
     return failures;
 }
 
@@ -385,7 +448,7 @@ int main() {
     const bool peer_access = ops::enable_peer_access(ec);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (explicit pinned host staging)")
+                              : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
     const ops::PeerEvents events(ec);
 
@@ -404,6 +467,10 @@ int main() {
     failures += run_allgather_case("allgather_rows [1,248320]", 124160, 124160, 1, 202u, ec, events);
     failures += run_allgather_case("allgather_rows [5120,3] uneven", 2, 1, 5120, 203u, ec, events);
     failures += run_allgather_case("allgather_rows [7,2] minimal", 1, 1, 7, 204u, ec, events);
+    failures += run_gather_columns_rank0_case("gather_columns_rank0 [248320,3]", 124160,
+                                              124160, 3, 205u, ec, events);
+    failures += run_gather_columns_rank0_case("gather_columns_rank0 [11,7] uneven", 4, 7, 7,
+                                              206u, ec, events);
 
     failures += run_chained_case(ec, events);
     failures += run_microbenchmark(ec, events);

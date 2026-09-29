@@ -70,10 +70,11 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. W8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; GGML_K and the
- *   Q4 composed split route use a projected BF16 plane, while A4/A8 routes use caller-owned
- *   activation storage and may use private projection storage. There is no persistent
- *   state side effect.
+ *   scoped to the call. W8 requires zero bytes. NVFP4 and row-scaled FP8 A16 may require private
+ *   projection, decoded-weight, and activation storage depending on the device and token extent.
+ *   GGML_K and the Q4 composed split route use a projected plane; A4/A8 routes also use private
+ *   activation storage. None of these transient representations is a semantic rounding boundary.
+ *   There is no persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);
@@ -186,9 +187,9 @@ void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::ar
                                    const ExecutionContext& ec);
 
 /**
- * A16-only column-parallel convenience form. Passes a null workspace per rank, so it admits NVFP4
- * (whose A16 routes need none) but rejects Q4G64_F16S with a clear throw -- use the policy-bearing
- * overload with an allocated arena for Q4.
+ * A16-only column-parallel convenience form. Passes a null workspace per rank, so it admits only
+ * profiles whose capacity query returns zero. Use the policy-bearing overload with an allocated
+ * arena for every route requiring scratch, including Volta NVFP4 and wide row-scaled FP8.
  */
 void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
                                    const std::array<Tensor, 2>& out, const ExecutionContext& ec);

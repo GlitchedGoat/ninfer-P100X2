@@ -283,6 +283,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
     ops/linear/fp8/fp8_volta_qpn_gemm.cu
     ops/linear/fp8/fp8_cutlass_sm70.cu
+    ops/linear/fp8/fp8_prepack_sm70.cu
     ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
     ops/linear/nvfp4/nvfp4_volta_mma_gemm.cu
     ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
@@ -294,9 +295,9 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/w8/w8_volta_qpn_gemm.cu
     ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
     ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
-    ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_qpn_split.cu
+    ops/linear_swiglu/swiglu_fp32.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
     ops/launcher/gqa_attention_volta_flash.cu

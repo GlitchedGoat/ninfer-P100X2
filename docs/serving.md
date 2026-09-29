@@ -532,7 +532,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--default-max-tokens N` | output limit when omitted by a request | `65536` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |

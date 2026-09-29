@@ -90,11 +90,9 @@ void q5_linear_add_simt_wide_t_launch(const Tensor& x, const Weight& w, Tensor& 
     // full_slabs>0 enables the staged/vectorized prefetch path instead of routing every group
     // through the scalar tail (direct global reads). Every offset q5_simt_consume_slab derives
     // from x0 (xslab = slab*1024 elems, c*256 elems, lane*8 elems) is a multiple of 16 bytes in
-    // bf16 units, and k (6144 or 17408, this op's only two supported shapes) is itself a
-    // multiple of 1024, so a single runtime check on x.data's own alignment is sufficient to
-    // guarantee every subsequent load_vec<uint4> stays 16-byte aligned -- see
-    // q5_rowsplit_gemm_simt.cuh's q5_simt_consume_slab. Falls back to the always-correct
-    // full_slabs=0 scalar tail if that check fails.
+    // bf16 units. Requiring K to be a multiple of 1024 and x.data to be 16-byte aligned keeps
+    // every subsequent load_vec<uint4> aligned; see q5_rowsplit_gemm_simt.cuh's
+    // q5_simt_consume_slab. Other extents, including the K=8704 shard, use the scalar tail.
     const bool staged_safe = (k % 1024) == 0 &&
                              (reinterpret_cast<std::uintptr_t>(x.data) % 16) == 0;
     const std::int32_t full_slabs = staged_safe ? (k / 1024) : 0;

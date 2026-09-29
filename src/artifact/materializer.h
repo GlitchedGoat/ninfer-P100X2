@@ -57,6 +57,7 @@ public:
     DeviceArena& device_arena();
     DeviceArena& device_arena(int device);
     [[nodiscard]] int device_count() const noexcept { return stats_.device_count; }
+    [[nodiscard]] int physical_device(int device) const;
 
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
@@ -69,6 +70,7 @@ private:
     };
 
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> device_arena_;
+    std::array<int, kMaximumDevices> physical_devices_{};
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

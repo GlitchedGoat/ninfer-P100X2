@@ -515,6 +515,14 @@ TrafficBytes chunked_pipeline_traffic(const Problem& problem) {
 }
 
 TrafficBytes running_traffic(const Problem& problem) {
+#ifdef NINFER_VOLTA_BUILD
+    // Q and K each have an FP32 write/read round trip. This is logical tensor I/O,
+    // not measured DRAM traffic; recurrent tiles may reuse the prepared rows in cache.
+    const double intermediate = problem.tokens >= gated_delta_net_detail::kChunkSize
+                                    ? 8.0 * qk_tensor_bytes(problem)
+                                    : 0.0;
+    return {running_logical_bytes(problem) + intermediate, intermediate};
+#else
     const std::int32_t full_tokens =
         (problem.tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
     if (full_tokens == 0) { return {running_logical_bytes(problem), 0.0}; }
@@ -535,6 +543,7 @@ TrafficBytes running_traffic(const Problem& problem) {
         traffic.intermediate += 2.0 * qk_tensor_bytes(tail);
     }
     return traffic;
+#endif
 }
 
 TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
@@ -548,11 +557,16 @@ TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
 }
 
 std::string running_implementation(std::int32_t tokens) {
+#ifdef NINFER_VOLTA_BUILD
+    return tokens >= gated_delta_net_detail::kChunkSize ? "public.recurrent.qk_fp32_prepared"
+                                                       : "public.recurrent.qk_fused";
+#else
     const std::int32_t full_tokens =
         (tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
     if (full_tokens == 0) { return "public.recurrent.qk_fused"; }
     if (full_tokens == tokens) { return "public.l2norm_x2+chunked"; }
     return "public.l2norm_x2+chunked+recurrent_tail";
+#endif
 }
 
 BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
@@ -588,14 +602,18 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
     const TrafficBytes traffic         = running_traffic(problem);
 
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t full_chunks = 0;
+#else
     const std::int32_t full_chunks = tokens / gated_delta_net_detail::kChunkSize;
+#endif
     return {
         "running",
         "fused",
         running_implementation(tokens),
         tokens,
         full_chunks,
-        tokens % gated_delta_net_detail::kChunkSize,
+        tokens - full_chunks * gated_delta_net_detail::kChunkSize,
         workspace_bytes,
         measurement.graph_nodes,
         running_logical_bytes(problem),

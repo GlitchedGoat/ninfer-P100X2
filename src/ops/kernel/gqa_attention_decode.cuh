@@ -242,6 +242,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 
     __shared__ float reduce[256];
+    __shared__ float weights[Geometry::DecodeSplits];
+    __shared__ float values[256];
 
     float local_m = -CUDART_INF_F;
     for (int split = tid; split < active_split_count; split += blockDim.x) {
@@ -270,12 +272,13 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     for (int split = tid; split < active_split_count; split += blockDim.x) {
         const float tile_l =
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
+        float weight = -1.0f;
         if (tile_l > 0.0f) {
-            local_l +=
-                tile_l *
-                expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
-                     head_m);
+            weight = expf(
+                partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] - head_m);
+            local_l += tile_l * weight;
         }
+        weights[split] = weight;
     }
     reduce[tid] = local_l;
     __syncthreads();
@@ -286,23 +289,38 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
     const float head_l = reduce[0];
 
-    const int d = d_start + tid;
-    if (tid >= DChunk || d >= kGqaHeadDim) { return; }
-
+    // Fetch consecutive split vectors cooperatively, then sum them in their original
+    // ascending order. Weight sharing removes repeated exp/stat loads; staging overlaps
+    // the vector reads without changing the FP32 denominator or numerator association.
+    static_assert(DChunk >= 32 && 256 % DChunk == 0);
+    constexpr int kSplitTile = 256 / DChunk;
+    const int group = tid / DChunk;
+    const int local_d = tid % DChunk;
+    const int d = d_start + local_d;
     float numerator = 0.0f;
     if (head_l > 0.0f) {
-        for (int split = 0; split < active_split_count; ++split) {
-            const float tile_l =
-                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
-            if (tile_l <= 0.0f) { continue; }
-            const float weight = expf(
-                partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] - head_m);
-            numerator +=
-                __bfloat162float(
-                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]) *
-                weight;
+        for (int first = 0; first < active_split_count; first += kSplitTile) {
+            const int split = first + group;
+            float value = 0.0f;
+            if (split < active_split_count && weights[split] >= 0.0f) {
+                value = __bfloat162float(
+                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]);
+            }
+            values[tid] = value;
+            __syncthreads();
+            if (group == 0) {
+#pragma unroll
+                for (int item = 0; item < kSplitTile; ++item) {
+                    const int source = first + item;
+                    if (source < active_split_count && weights[source] >= 0.0f) {
+                        numerator += values[item * DChunk + local_d] * weights[source];
+                    }
+                }
+            }
+            __syncthreads();
         }
     }
+    if (group != 0) { return; }
     bool valid = true;
     if constexpr (Masked) {
         int absolute_column = token;

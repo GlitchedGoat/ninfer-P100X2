@@ -397,7 +397,9 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #undef NINFER_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = 64;
+    // Warps fetch consecutive splits for 32 adjacent dimensions; one warp sums the
+    // staged values in order. Eight blocks per head also cover the single-query TP2 grid.
+    constexpr int kDChunk      = 32;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {

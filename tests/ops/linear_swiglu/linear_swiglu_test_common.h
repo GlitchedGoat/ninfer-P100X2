@@ -26,4 +26,7 @@ struct Profile {
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases);
 
+int run_column_parallel_profile(std::string_view label, const Profile& shard_profile,
+                                std::span<const std::int32_t> token_cases);
+
 } // namespace ninfer::test::linear_swiglu

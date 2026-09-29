@@ -891,11 +891,16 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
+    cudaDeviceProp properties[2]{};
+    for (int rank = 0; rank < 2; ++rank) {
+        cuda_check(cudaGetDeviceProperties(&properties[rank], ec.dev[rank]->device),
+                   "cudaGetDeviceProperties");
+    }
+    const int compute_major = std::min(properties[0].major, properties[1].major);
     const bool peer_access = ops::enable_peer_access(ec);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
-                              : "unavailable (CUDA stages the device-to-device copies through "
-                                "host memory)")
+                              : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
     const ops::PeerEvents events(ec);
 
@@ -925,11 +930,20 @@ int main() {
         {"fp8 gate_up", QType::FP8_E4M3FN_ROW_BF16S, 38u, {1, 2, 3, 4, 5, 48, 128, 1024},
          {kA16, kA8}},
     };
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec); }
+    for (Case test_case : cases) {
+        // A4/A8 are separate hardware profiles. Keep the supported A16 split cases active on
+        // Volta instead of aborting the whole suite on a newer-device-only policy.
+        std::erase_if(test_case.policies, [compute_major](ops::LinearPolicy policy) {
+            return (policy == ops::LinearPolicy::AllowA4 && compute_major < 12) ||
+                   (policy == ops::LinearPolicy::AllowA8 && compute_major < 10);
+        });
+        if (!test_case.policies.empty()) { failures += run_case(test_case, ec); }
+    }
 
+    const auto nvfp4_pipeline_policy = compute_major >= 12 ? kA4 : kA16;
     const std::vector<PipelineCase> pipeline_cases{
-        {"nvfp4+nvfp4", QType::NVFP4, QType::NVFP4, 41u, 8, kA4},
-        {"nvfp4+nvfp4 T=1024", QType::NVFP4, QType::NVFP4, 42u, 1024, kA4},
+        {"nvfp4+nvfp4", QType::NVFP4, QType::NVFP4, 41u, 8, nvfp4_pipeline_policy},
+        {"nvfp4+nvfp4 T=1024", QType::NVFP4, QType::NVFP4, 42u, 1024, nvfp4_pipeline_policy},
         {"q4+q5 (groupwise profile)", QType::Q4G64_F16S, QType::Q5G64_F16S, 43u, 8, kA16},
         // The real Text-layer-56-63 profile -- both gate_up and down bound as FP8 (the
         // flagship qwen3_8 profile's own MLP-tail weights). A16Only only: linear_add's row-parallel

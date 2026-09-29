@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 12;
+inline constexpr int kSchemaVersion                   = 13;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -63,6 +63,7 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
     int device                     = 0;
@@ -118,6 +119,7 @@ struct BenchEnvironment {
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache                        = KvCacheStorage::BFloat16;
+    SpeculativeBackend speculative_backend         = SpeculativeBackend::None;
     std::uint32_t mtp_draft_tokens                 = 0;
     ProposalHead proposal_head                     = ProposalHead::Full;
     bool use_cuda_graph                            = true;
@@ -140,7 +142,9 @@ void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t co
 
 std::vector<TokenId> load_corpus_ids(const std::string& path);
 std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
-std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens);
+std::string speculative_backend_name(SpeculativeBackend backend);
+std::string decode_path_name(bool use_cuda_graph, SpeculativeBackend backend,
+                             std::uint32_t draft_tokens);
 std::uint32_t decode_graph_prime_output_tokens(std::uint32_t mtp_draft_tokens);
 std::uint32_t decode_graph_prime_required_context(std::uint32_t mtp_draft_tokens);
 
