@@ -1,5 +1,7 @@
 # NInfer V100X2
 
+[中文文档](README.zh-CN.md) · [Performance methodology](docs/performance.md)
+
 This fork is tuned for one-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**
 (`sm_70`, CUDA 12.8). Its default profile uses the LM Studio Q4_K_M-derived `.ninfer` artifact,
 180,000-token context capacity, complete INT8 group-64 KV, TP2, CUDA Graphs, and MTP with up to
@@ -33,9 +35,10 @@ intentionally omitted.
   normalization across state tiles. The sequential FP32 state transition is unchanged. The
   3,072-token TP2 GDN scratch allocation is 24 MiB.
 - **TP2 transfers:** collectives use graph-capturable UVA device-to-device copies and two event
-  pairs. Startup checks exact transfer bytes in both directions. On this host's translated
-  `DMA-FQ` IOMMU domain, direct P2P is unavailable and CUDA selects its driver-managed staging
-  path; NInfer does not maintain a second explicit pinned-host copy route.
+  pairs. Startup checks exact transfer bytes in both directions. This host now uses direct
+  PCIe P2P after rebooting with `iommu=pt` and identity IOMMU domains. On translated `DMA`/`DMA-FQ`
+  domains, startup instead selects verified CUDA-managed staging. Neither path maintains a
+  second explicit pinned-host copy route; PCIe P2P is not NVLink.
 - **Volta TP2 residuals:** Q5 row shards now select executable SM70 SIMT, fused MMA, or CUTLASS
   routes with the actual peak workspace reserved. BF16 row shards use the SM70 CUTLASS route.
   Both paths pass their independent FP64 operator checks and the two-card composition tests.
@@ -54,8 +57,99 @@ intentionally omitted.
 
 All NInfer results below are from this V100X2 host. Decode tok/s counts committed output tokens,
 not drafted tokens; occupied prompt length is reported separately from maximum capacity.
+The two areas distinguish the current direct-P2P configuration from the peer-off control and
+earlier staging measurements. NVFP4 and Q4_K_M are different weight artifacts, not a matched
+quantization-quality comparison.
 
-### Official NVFP4 v3 artifact validation
+### P2P enabled
+
+Measured on 2026-10-01 with two V100-SXM2 16 GB cards at 300 W each, CUDA 12.8, PCIe 3.0 ×16,
+PHB topology, `iommu=pt`, and identity IOMMU domains. NVIDIA P2P read/write checks pass and
+NInfer automatically enables direct P2P. No inference algorithm or weight changes were needed.
+
+#### NVFP4 v3 occupied-context sweep
+
+Official `qwen3.8-27b/nvfp4` v3 artifact, TP2, complete INT8 group-64 KV, greedy MTP3, optimized
+draft head, CUDA Graphs, 3,072-token prefill chunks and **180,000 context capacity** (180032 KV
+positions allocated). Each cell uses two cold-prompt requests without prefix reuse or an extra
+request warmup; graphs are primed before measurement. Every request generates 513 tokens:
+one from prefill and **512 timed committed decode tokens**. Rates are mean ± sample SD.
+
+| Actual input tokens | Prefill tok/s | Committed decode tok/s | MTP acceptance |
+|---:|---:|---:|---:|
+| 3,072 | 1,783.96 ± 43.38 | 105.48 ± 0.01 | 72.97% |
+| 8,192 | 1,754.43 ± 18.24 | 114.49 ± 0.01 | 81.98% |
+| 16,384 | 1,699.06 ± 9.73 | 108.29 ± 0.003 | 79.47% |
+| 32,768 | 1,596.24 ± 2.94 | 101.63 ± 0.03 | 79.69% |
+| 65,536 | 1,397.83 ± 0.72 | 88.34 ± 0.04 | 79.12% |
+| 85,000 | **1,306.48 ± 3.95** | **83.18 ± 0.13** | **79.12%** |
+
+Both repetitions at every length produced identical output IDs and MTP statistics, without
+EOS/EOG. Each prompt preserves the task and assistant suffix; its source body and acceptance
+rate differ, so the 8K result does not imply that longer context is intrinsically faster. These
+are fixed output windows, not complete-program quality scores.
+
+At 85K, the same-input peer-off control below measured 79.18 tok/s: direct P2P improves committed
+decode by **5.05%**, with all 513 output IDs and MTP statistics identical across both paths and
+repetitions. The resident request averages 65.061 s prefill, 6.155 s decode and 71.220 s total;
+model loading takes 19.662 s once, outside request timing. The historical 78.424 figure below
+used the pre-reboot corpus and is not the causal P2P baseline.
+
+#### NVFP4 v3 capacity sweep: fixed 512-token input
+
+Only the maximum context changes. TP2, INT8 KV, greedy MTP3, optimized draft head, CUDA Graphs
+and 1,024-token chunks stay fixed. Each capacity uses one discarded warmup and three measured
+requests, with 512 input tokens and 256 timed decode tokens (257 total output tokens).
+Decode here uses first-token-to-completion **wall time**, not just Engine decode-phase time.
+
+| Maximum context | Wall decode tok/s | Prefill tok/s | MTP acceptance |
+|---:|---:|---:|---:|
+| 1,024 | 106.12 ± 0.01 | 1,443.78 | 70.04% |
+| 2,048 | 106.12 ± 0.04 | 1,438.44 | 70.04% |
+| 4,096 | 105.96 ± 0.02 | 1,440.81 | 70.04% |
+| 8,192 | 105.98 ± 0.01 | 1,442.96 | 70.04% |
+| 16,384 | 106.06 ± 0.04 | 1,443.37 | 70.04% |
+| 32,768 | 106.00 ± 0.03 | 1,443.77 | 70.04% |
+| 65,536 | 106.01 ± 0.06 | 1,443.42 | 70.04% |
+
+All seven capacities were allocated exactly. All 21 measured runs produced the same 257 IDs
+and acceptance statistics: 173/247 drafts accepted over 83 rounds per request. This is a
+short-input capacity check, not a 64K-filled-context result.
+
+#### Communication and regression checks
+
+The 10 KiB BF16 all-reduce measured 26.6085 µs mean, 25.901 µs p50 and 43.910 µs p99 over
+500 host-synchronized iterations. The matched peer-off path measured 47.7961 µs mean:
+**44.33% lower communication latency**, not 44.33% end-to-end inference improvement. Both
+paths passed exact-transfer, uneven-shape, guard and 64-consecutive-round checks.
+
+Q4_K_M and NVFP4 v3 passed the real TP2 MTP and prefix-cache regressions. Graph/eager outputs,
+logits, acceptance and retained frontiers agree; each artifact had zero disagreements at
+64 teacher-forcing positions. At a 3,274-token prompt, median cold/cached TTFT was
+3.33492 s / 16.8689 ms for Q4_K_M and 3.01954 s / 14.6475 ms for NVFP4.
+See [regression qualifications](docs/performance.md#p2p-enabled) for the existing Q4 cold/cache
+near-tie differences and the limits of these checks.
+
+### P2P disabled
+
+This area covers verified CUDA-managed UVA D2D staging, not an explicit NInfer pinned-host
+copy branch. Before `iommu=pt`, the host's translated `DMA-FQ` domains prevented direct P2P.
+The current peer-off A/B control uses a process-local CUDA capability-query shim, without
+changing system settings. It is a diagnostic, not an advertised CLI switch.
+
+#### NVFP4 v3 same-input 85K control
+
+The same 85,000 input IDs, 180,000 capacity, 512 timed decode tokens, INT8 KV, TP2, greedy MTP3,
+optimized draft head and CUDA Graphs as the P2P-enabled run, with two repetitions:
+
+| Prefill tok/s | Committed decode tok/s | Wall decode tok/s | MTP acceptance |
+|---:|---:|---:|---:|
+| 1,297.94 ± 2.66 | 79.18 ± 0.014 | 79.151 | 79.12% |
+
+Both communication paths accepted 360/455 drafts over 152 rounds per request. All output IDs
+and speculative fields match. The same-input improvement is 5.0459% decode / 0.6578% prefill.
+
+#### Earlier official NVFP4 v3 artifact validation
 
 `neroued/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer` is a 23.72-GB, 1246-physical-object
 `NINFER\x00\x03` container. Its projected `qwen3.8-27b/nvfp4` identity loaded on both V100s with
@@ -66,10 +160,11 @@ The short check is a compatibility smoke test, not a long-context performance cl
 512-prompt/512-output benchmark measured 1,344.24 ± 33.15 prefill tok/s and 98.831 ± 0.027
 committed decode tok/s. At the acceptance workload (85,000 occupied tokens, 180,000 capacity,
 512 output tokens), the same v3 artifact measured 1,277.61 ± 3.12 prefill tok/s and 78.424 ± 0.0004
-committed decode tok/s over two repetitions; MTP3 acceptance was 79.12%. The 120.66 figure is
-therefore a real short-window peak, not the representative decode rate.
+committed decode tok/s over two repetitions before P2P was enabled; MTP3 acceptance was 79.12%.
+These earlier runs use the pre-reboot corpus, not the current same-input A/B control.
+The 120.66 figure is therefore a real short-window peak, not the representative decode rate.
 
-### Q4_K_M prefill
+#### Earlier Q4_K_M prefill
 
 TP2, INT8 KV, `prefill_chunk=4096`, and 180,000-token capacity:
 
@@ -84,16 +179,16 @@ tok/s. For the 85K corpus, chunks 1,024/2,048/4,096 measured 1,133.0/1,213.4/1,2
 The 4,096-token chunk reserves 1.49 GiB per device. These are prefill measurements, not decode
 rates.
 
-The active TP2 collective path was also run independently on the two V100s: a 10 KiB BF16
+The staging TP2 collective path was also run independently on the two V100s: a 10 KiB BF16
 all-reduce (the decode-shaped hidden block) measured 48.16 µs mean, 47.09 µs p50 and 64.92 µs p99
 over 500 host-synchronized iterations. The test passed all exact-value, guard, uneven-shape and
-64-consecutive-round checks. This fixed PCIe/event schedule is why changing Q4/Q6/Q1 weight codes
-cannot remove the decode ceiling by itself.
+64-consecutive-round checks. Weight quantization cannot eliminate the fixed collective schedule;
+this microbenchmark alone does not establish a hardware-only decode ceiling.
 
-### Q4_K_M decode
+#### Earlier Q4_K_M decode
 
 With exactly 85,000 occupied prompt tokens, 180,000 capacity, TP2, INT8 KV, MTP3, optimized draft
-head and CUDA Graphs, the active UVA-D2D transport path measured two 128-token windows:
+head and CUDA Graphs, the pre-P2P staging path measured two 128-token windows:
 
 | Repetitions | Prefill rate | Committed decode rate |
 |---:|---:|---:|
@@ -106,7 +201,7 @@ measured **60.0291 ± 0.0571 tok/s** over three 256-token decode windows; this i
 occupied-context result.
 
 The superseded explicit pinned-host experiment reported **53.4075 ± 0.0639 tok/s** over three
-512-token windows; it is not the active transport result and is retained only as historical context.
+512-token windows; it is not the retained transport implementation and is historical context only.
 An earlier matched diagnostic used LM Studio CUDA 2.33.0's automatic GPU split with the same
 85,000 prompt IDs, source GGUF, greedy sampling, Q8 KV, maximum context 180,000 (backend rounded
 to 180,224), and max-three/min-zero MTP. It measured 35.4977 tok/s in one run. LM Studio's
@@ -114,7 +209,7 @@ single-run result is a diagnostic, not a repeated comparison.
 Earlier user-reported 45/57 tok/s figures lacked complete workload metadata and are not used as
 measured acceptance results.
 
-### Q4_K_M maximum-context capacity sweep
+#### Earlier Q4_K_M maximum-context capacity sweep
 
 This earlier Q4_K_M sweep changes only the configured maximum context. It uses a 512-token code prompt,
 a 256-token decode window, greedy sampling, Q8/INT8 KV and MTP3. Each cell is the mean ± sample
@@ -137,7 +232,7 @@ windows were EOS/EOG-free. With this short prompt neither engine slowed material
 increased; LM Studio was about 4% faster. This table is a capacity-setting comparison, not an
 85K-filled-context benchmark.
 
-### NVFP4 at 512-token input
+#### Earlier NVFP4 at 512-token input
 
 The corrected NVFP4 implementation uses a 512-token code prompt and 256 timed decode tokens, with one
 warmup and three measured requests per capacity. TP2, INT8 KV, greedy MTP3, optimized draft head,
@@ -156,7 +251,7 @@ All four requested capacities were allocated exactly. All 12 measured runs produ
 capacity checks, not 8K–64K occupied-context decode. The LM Studio table above uses Q4_K_M;
 it is not a matched NVFP4 comparison.
 
-### NVFP4 at 85K occupied context
+#### Earlier NVFP4 at 85K occupied context
 
 Qwen3.8-27B NVFP4, exactly **85,000 prompt tokens**, **180,000 capacity**, TP2, complete INT8
 group-64 KV, greedy sampling, MTP3, optimized draft head, CUDA Graphs and 3,072-token prefill chunks:
@@ -186,31 +281,19 @@ preserves the original order and introduces no additional quantization or approx
 The 3,072-token chunk reserves 1.40 GiB of workspace per device; 4,096 does not fit this NVFP4
 artifact together with 180K capacity on the measured host.
 
-Reproduce the measurement with the local artifact and fixed corpus:
-
-```bash
-LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-build-v100/bench/ninfer_bench \
-  --weights /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
-  --corpus /tmp/v100-code-85000.ids -pg 85000,512 \
-  --max-ctx 180000 --prefill-chunk 3072 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft --tp 2 --devices 0,1 \
-  -r 2 --warmup 0 --capture-generation -o json \
-  --output-file profiles/bench/nvfp4_85k_fp32_swiglu.json
-```
-
-The measured request averages 1.57 ms of prompt preparation, 66.435 s of prefill and 6.534 s of
+This earlier staging request averages 1.57 ms of prompt preparation, 66.435 s of prefill and 6.534 s of
 decode, or 72.974 s total. The same invocation loads the resident model once in 18.65 s, including
 16.25 s of upload. These are raw token-ID inputs, so preparation does not include text tokenization.
 The complete per-stage GPU breakdown, MTP verify/proposal costs, copy activity, timing gaps and
-remaining optimization decisions are in [the performance ledger](docs/performance.md#nvfp4-full-request-ledger).
+remaining optimization decisions are in [the staging performance ledger](docs/performance.md#nvfp4-full-request-ledger).
+Current P2P reproduction commands are in [performance methodology](docs/performance.md#p2p-enabled).
 
 An earlier NVFP4 TP2 comparison against the `plus1998/Ninfer-V100-Duo` code path at a 3K prompt,
 98,304 capacity and MTP3 measured 976 tok/s prefill / 69.22 tok/s decode in this fork versus
 973.5 / 68.96 tok/s upstream. This is a short-input cross-check only, not an 85K result. The
 upstream repository and its reported numbers should not be treated as measurements of this fork.
 
-### DFlash2 experiment
+#### Earlier DFlash2 experiment
 
 On the fixed 85K code corpus at 98,304 capacity, DFlash3 measured **25.19 tok/s** with 81.21%
 acceptance; CUDA Graph and eager runs produced identical 513-token IDs. DFlash7 measured
@@ -259,9 +342,10 @@ Set `NINFER_V100X2_ARTIFACT`, `NINFER_V100X2_DEVICES`, `NINFER_V100X2_MAX_CONTEX
 `NINFER_V100X2_DRAFT_TOKENS` to override the launcher defaults. The launcher does not constrain
 host CPU affinity; benchmark CPU use should remain below the operator's 85% ceiling.
 
-The fixed 85K token corpus used by the measurements is local at `/tmp/v100-code-85000.ids` and is
-not included in the repository. See [performance methodology](docs/performance.md) for benchmark
-commands and additional qualifications.
+The current P2P corpus is local at `profiles/bench/v100-code-85000-iommu-pt.ids`; earlier staging
+measurements used `/tmp/v100-code-85000.ids`. Corpora, model artifacts and raw profiler reports
+are not included in the repository. See [performance methodology](docs/performance.md) for
+corpus generation, benchmark commands and additional qualifications.
 
 ## Verification
 
