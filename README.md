@@ -39,6 +39,12 @@ intentionally omitted.
 - **Volta TP2 residuals:** Q5 row shards now select executable SM70 SIMT, fused MMA, or CUTLASS
   routes with the actual peak workspace reserved. BF16 row shards use the SM70 CUTLASS route.
   Both paths pass their independent FP64 operator checks and the two-card composition tests.
+- **NVFP4 v3 container:** the reader accepts the upstream `NINFER\x00\x03` single-file
+  `qwen3.8-27b` container and projects its physical objects and logical bindings into the
+  registered `qwen3.8-27b/nvfp4` identity without repacking weight bytes. The v3
+  `tokenizer_config.json` chat template is exposed verbatim. Text and MTP load through the normal
+  Engine path; v3 Vision objects are projected for the existing Vision route, while the optional
+  v3 DFlash2 component is not advertised or selected.
 - **MTP and DFlash:** the Q4_K_M target uses the native MTP route. An optional five-layer BF16
   DFlash2 route is integrated for experiments, with TP2 draft-column gathering on rank 0. It is
   much slower than MTP on the measured long-code workload and does not fit the 180K allocation on
@@ -48,6 +54,20 @@ intentionally omitted.
 
 All NInfer results below are from this V100X2 host. Decode tok/s counts committed output tokens,
 not drafted tokens; occupied prompt length is reported separately from maximum capacity.
+
+### Official NVFP4 v3 artifact validation
+
+`neroued/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer` is a 23.72-GB, 1246-physical-object
+`NINFER\x00\x03` container. Its projected `qwen3.8-27b/nvfp4` identity loaded on both V100s with
+INT8 KV and MTP3 at `--max-context 180000` (180032 allocated KV positions); 671 tensors and six
+frontend resources were materialized per the normal Engine path. A short greedy MTP check produced
+21 tokens in five rounds with 100% acceptance (120.66 committed tok/s at 1024-token capacity).
+The short check is a compatibility smoke test, not a long-context performance claim. A stable
+512-prompt/512-output benchmark measured 1,344.24 ± 33.15 prefill tok/s and 98.831 ± 0.027
+committed decode tok/s. At the acceptance workload (85,000 occupied tokens, 180,000 capacity,
+512 output tokens), the same v3 artifact measured 1,277.61 ± 3.12 prefill tok/s and 78.424 ± 0.0004
+committed decode tok/s over two repetitions; MTP3 acceptance was 79.12%. The 120.66 figure is
+therefore a real short-window peak, not the representative decode rate.
 
 ### Q4_K_M prefill
 

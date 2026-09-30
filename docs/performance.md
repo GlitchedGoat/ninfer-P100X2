@@ -57,7 +57,16 @@ CUDA Graphs, greedy sampling, MTP3 and the optimized draft head:
 
 | Implementation | Runs | Prefill tok/s | Committed decode tok/s | MTP acceptance |
 |---|---:|---:|---:|---:|
-| FP32 SwiGLU, shared attention scores/reducer weights, prepared GDN Q/K | 2 | **1,279.44 ± 2.94** | **78.36 ± 0.04** | **79.12%** |
+| FP32 SwiGLU, shared attention scores/reducer weights, prepared GDN Q/K (v2 artifact) | 2 | **1,279.44 ± 2.94** | **78.36 ± 0.04** | **79.12%** |
+| Same route, official upstream v3 container | 2 | **1,277.61 ± 3.12** | **78.424 ± 0.0004** | **79.12%** |
+
+The same workload was rerun against the official `NINFER\x00\x03` container
+`neroued/Qwen3.8-27B-nvfp4-NInfer` after the reader compatibility adapter was added. The v3
+artifact measured **1,277.61 ± 3.12 prefill tok/s** and **78.424 ± 0.0004 committed decode
+tok/s** over two repetitions, with the same **79.12%** MTP3 acceptance. The report is
+`profiles/bench/nvfp4_v3_85k.json`; this is the current v3-container result. A separate stable
+512-prompt/512-output run measured **98.831 ± 0.027 committed tok/s** at 2,048-token capacity;
+the 120.66 tok/s result from a 21-token smoke request is a short-window peak, not a full benchmark.
 
 These use `prefill_chunk=3072`, no prefix reuse and no extra benchmark warmup; graphs are primed
 before measurement. Every run produces one token during prefill followed by 512 timed decode

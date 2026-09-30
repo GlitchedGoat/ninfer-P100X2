@@ -32,6 +32,17 @@ the artifact inventory or identity.
 The identity is read from the version-2 artifact directory. The filename, object count, and any
 representative tensor descriptor do not select the model or weights profile.
 
+### 1.1 Upstream v3 container compatibility
+
+The reader also accepts the official single-file `NINFER\x00\x03` container published as
+`neroued/Qwen3.8-27B-nvfp4-NInfer`. This is a narrow reader compatibility path for this registered
+identity, not a second product artifact lane: the adapter validates the v3 metadata, projects its
+`bindings`/`uses` records to the logical names documented below, and exposes the result as
+`qwen3.8-27b/nvfp4`. Physical payload offsets and packed codes are retained; no runtime weight
+repacking occurs. The v3 tokenizer configuration supplies the chat-template resource used by the
+frontend. Text and MTP are verified through the public Engine route; Vision objects are projected
+for the existing Vision route. v3 DFlash2 objects are not selected by this target.
+
 ## 2. Fixed target facts
 
 All matrix shapes use logical `[N,K] = [output rows,input columns]` notation. NVFP4 groups and all
