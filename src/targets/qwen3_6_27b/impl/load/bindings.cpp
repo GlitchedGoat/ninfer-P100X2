@@ -981,14 +981,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         .format = out.mtp_format};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
-    // Optional Qwen3.8 DFlash2 draft package.  All checkpoint tensors are BF16 and are kept in
-    // the same .ninfer container as the Q4_K target weights; ValidateOnly is used when another
-    // speculative backend is selected so the artifact remains a single registered identity.
+    // Optional Qwen3.8 DFlash2 package: native GGUF-derived artifacts carry BF16 projections;
+    // official NVFP4 v3 carries W8 projections. Norms, convolution and selector stay BF16.
+    // Disabled draft objects are validated without making them resident.
     const bool has_dflash2 = binder.has_tensor("dflash/feature_projection");
     if (features.dflash() && !has_dflash2) {
         throw std::invalid_argument("qwen3.8-27b: --spec dflash requires the DFlash2 package in the artifact");
     }
     if (has_dflash2) {
+        out.dflash.projection_format = weights_profile == WeightsProfile::Qwen38Nvfp4
+                                            ? NumericFormat::W8G32_F16S : NumericFormat::BF16;
         const artifact::TensorPlacement dflash_placement =
             features.dflash() ? artifact::TensorPlacement::Device
                                : artifact::TensorPlacement::ValidateOnly;
@@ -997,19 +999,24 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             return artifact::bind_tensor(binder, name, NumericFormat::BF16, shape,
                                          dflash_placement);
         };
-        out.dflash.feature_projection = bind_dflash("dflash/feature_projection", {5120, 25600});
+        const auto bind_projection = [&](std::string_view name,
+                                          std::initializer_list<std::uint64_t> shape) {
+            return artifact::bind_tensor(binder, name, out.dflash.projection_format, shape,
+                                         dflash_placement);
+        };
+        out.dflash.feature_projection = bind_projection("dflash/feature_projection", {5120, 25600});
         out.dflash.context_norm       = bind_dflash("dflash/context_norm", {5120});
         for (std::size_t layer = 0; layer < out.dflash.layers.size(); ++layer) {
             auto& target = out.dflash.layers[layer];
             const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
             target.input_norm = bind_dflash(prefix + "input_norm", {5120});
-            target.query_key_value = bind_dflash(prefix + "attention/query_key_value", {6144, 5120});
+            target.query_key_value = bind_projection(prefix + "attention/query_key_value", {6144, 5120});
             target.query_norm = bind_dflash(prefix + "attention/query_norm", {128});
             target.key_norm = bind_dflash(prefix + "attention/key_norm", {128});
-            target.attention_output = bind_dflash(prefix + "attention/output", {5120, 4096});
+            target.attention_output = bind_projection(prefix + "attention/output", {5120, 4096});
             target.post_attention_norm = bind_dflash(prefix + "post_attention_norm", {5120});
-            target.gate_up = bind_dflash(prefix + "mlp/gate_up", {34816, 5120});
-            target.down = bind_dflash(prefix + "mlp/down", {5120, 17408});
+            target.gate_up = bind_projection(prefix + "mlp/gate_up", {34816, 5120});
+            target.down = bind_projection(prefix + "mlp/down", {5120, 17408});
             target.attention_conv_base_kernel = bind_dflash(
                 prefix + "attention_conv/base_kernel", {5120, 2, 2});
             target.attention_conv_kernel_projection = bind_dflash(
@@ -1205,7 +1212,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     if (plan.features.dflash()) {
         auto& draft = runtime.dflash.emplace();
         draft.feature_projection = artifact::materialized_weight(
-            backing, plan.dflash.feature_projection, NumericFormat::BF16, 5120, 25600, device);
+            backing, plan.dflash.feature_projection, plan.dflash.projection_format, 5120, 25600, device);
         draft.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
                                                             NumericFormat::BF16, {5120}, device);
         for (std::size_t layer = 0; layer < draft.layers.size(); ++layer) {
@@ -1213,22 +1220,23 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             auto& target = draft.layers[layer];
             target.input_norm = artifact::materialized_tensor(backing, source.input_norm,
                                                                 NumericFormat::BF16, {5120}, device);
-            target.query_key_value = artifact::materialized_weight(
-                backing, source.query_key_value, NumericFormat::BF16, 6144, 5120, device);
-            target.context_key = row_view(target.query_key_value, 4096, 1024);
-            target.context_value = row_view(target.query_key_value, 5120, 1024);
+            const Weight packed = artifact::materialized_weight(
+                backing, source.query_key_value, plan.dflash.projection_format, 6144, 5120, device);
+            target.query = row_view(packed, 0, 4096);
+            target.key = row_view(packed, 4096, 1024);
+            target.value = row_view(packed, 5120, 1024);
             target.query_norm = artifact::materialized_tensor(backing, source.query_norm,
                                                                 NumericFormat::BF16, {128}, device);
             target.key_norm = artifact::materialized_tensor(backing, source.key_norm,
                                                              NumericFormat::BF16, {128}, device);
             target.attention_output = artifact::materialized_weight(
-                backing, source.attention_output, NumericFormat::BF16, 5120, 4096, device);
+                backing, source.attention_output, plan.dflash.projection_format, 5120, 4096, device);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.gate_up = artifact::materialized_weight(backing, source.gate_up,
-                                                            NumericFormat::BF16, 34816, 5120, device);
+                                                            plan.dflash.projection_format, 34816, 5120, device);
             target.down = artifact::materialized_weight(backing, source.down,
-                                                        NumericFormat::BF16, 5120, 17408, device);
+                                                        plan.dflash.projection_format, 5120, 17408, device);
             target.attention_conv_base_kernel = artifact::materialized_tensor(
                 backing, source.attention_conv_base_kernel, NumericFormat::BF16, {5120, 2, 2}, device);
             target.attention_conv_kernel_projection = artifact::materialized_weight(

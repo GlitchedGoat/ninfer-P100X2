@@ -276,12 +276,13 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens);
+                             Tensor& target_tokens, bool greedy_target = false);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& target_tokens, DFlashFeatureSink& sink,
+                             bool greedy_target = false);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -320,7 +321,8 @@ public:
                              ops::GqaExecutionEnvelope envelope,
                              const std::array<Tensor, 2>& hidden,
                              const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens);
+                             const std::array<Tensor, 2>& target_tokens,
+                             bool greedy_target = false);
     void target_verify_batch(const std::array<Tensor, 2>& ids,
                              const std::array<Tensor, 2>& cache_positions,
                              const std::array<Tensor, 2>& rope_positions,
@@ -331,7 +333,12 @@ public:
                              const std::array<Tensor, 2>& hidden,
                              const std::array<Tensor, 2>& logits,
                              const std::array<Tensor, 2>& target_tokens,
-                             DFlashFeatureSink& sink);
+                             DFlashFeatureSink& sink, bool greedy_target = false);
+    // Greedy TP2 verification can reduce each vocabulary shard to one exact (value, id) winner,
+    // exchange two tiny [1,T] tensors, and merge them. This avoids the full [V,T] all-gather; the
+    // full-logit overload above remains the route for temperature/penalty sampling.
+    void target_argmax_tp2(const std::array<Tensor, 2>& hidden,
+                           const std::array<Tensor, 2>& target_tokens);
     void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                   const std::array<Tensor, 2>& cache_positions,
                                   const std::array<Tensor, 2>& rope_positions,

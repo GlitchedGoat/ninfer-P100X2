@@ -2,6 +2,9 @@
 
 [中文文档](README.zh-CN.md) · [Performance methodology](docs/performance.md)
 
+Performance results are separated into [P2P enabled](#p2p-enabled) and
+[P2P disabled](#p2p-disabled); build and launch instructions are shared below.
+
 This fork is tuned for one-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**
 (`sm_70`, CUDA 12.8). Its default profile uses the LM Studio Q4_K_M-derived `.ninfer` artifact,
 180,000-token context capacity, complete INT8 group-64 KV, TP2, CUDA Graphs, and MTP with up to
@@ -21,7 +24,8 @@ intentionally omitted.
   output path. The original GGUF Q4_K/Q6_K codes and scales are kept unchanged.
 - **Volta FP8/NVFP4 execution:** wide prefill projections decode weights once per call and use
   SM70 CUTLASS, including the prepacked TP2 matrices. NVFP4 decoding reads complete K16 tuples
-  cooperatively. Decode uses QPN Tensor-Core kernels. Both wide prefill and decode keep gate/up
+  cooperatively. Wide TP2 NVFP4 MLP calls at T≥2048 use a 256-column GEMM tile.
+  Decode uses QPN Tensor-Core kernels. Both wide prefill and decode keep gate/up
   projections in FP32 through SwiGLU, rounding only the final activation to BF16.
   The prepacked FP8 output head now uses its matching kernel for single-token calls and chunk
   tails too; reading that layout through row-major GEMV was a correctness bug. NVFP4 A4 is not
@@ -31,6 +35,9 @@ intentionally omitted.
   history token, the same KV format and the same partial-output precision. The INT8 attention
   kernel also computes each QK score tile once and shares it across the four output-dimension
   warps, preserving their softmax and PV accumulation order.
+- **DFlash sliding-window attention:** the Volta path uses FP32 split numerators and a warp-per-row
+  route once enough rows are in flight; direct tiny windows retain the CTA route. The supported
+  local window is 2,048 or 4,096 positions, and the complete-history target KV is unchanged.
 - **GDN prefill:** long normalized inputs prepare each Q/K row once in FP32, avoiding repeated
   normalization across state tiles. The sequential FP32 state transition is unchanged. The
   3,072-token TP2 GDN scratch allocation is 24 MiB.
@@ -46,12 +53,15 @@ intentionally omitted.
   `qwen3.8-27b` container and projects its physical objects and logical bindings into the
   registered `qwen3.8-27b/nvfp4` identity without repacking weight bytes. The v3
   `tokenizer_config.json` chat template is exposed verbatim. Text and MTP load through the normal
-  Engine path; v3 Vision objects are projected for the existing Vision route, while the optional
-  v3 DFlash2 component is not advertised or selected.
+  Engine path; v3 Vision objects are projected for the existing Vision route. Its optional
+  five-layer DFlash2 package is also bound for text-only TP2 experiments.
 - **MTP and DFlash:** the Q4_K_M target uses the native MTP route. An optional five-layer BF16
-  DFlash2 route is integrated for experiments, with TP2 draft-column gathering on rank 0. It is
-  much slower than MTP on the measured long-code workload and does not fit the 180K allocation on
-  the current two cards; see the measurements below.
+  auxiliary / W8-projection DFlash2 route is integrated with TP2. Greedy target verification
+  exchanges shard argmax values/IDs instead of full logits; proposal selection merges each
+  rank's exact top-16 keys. Sampled verification retains the full-logit route. Removing its unused
+  full-history draft KV pool leaves the all-local v3 route at 98,304-token capacity; 180,000-capacity
+  DFlash is not claimed on two 16-GB cards. Narrow BF16 draft projections use direct BF16
+  operands with FP32 SIMT accumulation on V100. MTP remains the default.
 
 ## Measurements
 
@@ -65,7 +75,9 @@ quantization-quality comparison.
 
 Measured on 2026-10-01 with two V100-SXM2 16 GB cards at 300 W each, CUDA 12.8, PCIe 3.0 ×16,
 PHB topology, `iommu=pt`, and identity IOMMU domains. NVIDIA P2P read/write checks pass and
-NInfer automatically enables direct P2P. No inference algorithm or weight changes were needed.
+NInfer automatically enables direct P2P. No inference algorithm or weight changes were needed
+for the MTP P2P A/B evaluation. Both transport areas use the same launch commands; startup
+qualifies the actual bidirectional copy route. `iommu=pt` alone does not prove working P2P.
 
 #### NVFP4 v3 occupied-context sweep
 
@@ -94,6 +106,16 @@ decode by **5.05%**, with all 513 output IDs and MTP statistics identical across
 repetitions. The resident request averages 65.061 s prefill, 6.155 s decode and 71.220 s total;
 model loading takes 19.662 s once, outside request timing. The historical 78.424 figure below
 used the pre-reboot corpus and is not the causal P2P baseline.
+
+#### Qualified NVFP4 prefill update
+
+A matched 85K-input / 180K-capacity MTP3 comparison at chunk=2,560, with two cold requests
+per implementation, measures **1,297.05 ± 2.21 → 1,311.92 ± 2.06 prefill tok/s (+1.15%)**
+for the wider TP2 MLP tile. All 513 output IDs and acceptance counters match. Decode measures
+81.63 → 81.71 tok/s; this does not establish a stable decode improvement. Chunk=2,560 was used
+because desktop VRAM occupancy made larger chunks fail the startup allowance during this run.
+The earlier chunk=3,072 table is not its matched control. Independent numerical criteria were
+not relaxed; no new lossy attention option qualified for delivery.
 
 #### NVFP4 v3 capacity sweep: fixed 512-token input
 
@@ -129,6 +151,72 @@ logits, acceptance and retained frontiers agree; each artifact had zero disagree
 3.33492 s / 16.8689 ms for Q4_K_M and 3.01954 s / 14.6475 ms for NVFP4.
 See [regression qualifications](docs/performance.md#p2p-enabled) for the existing Q4 cold/cache
 near-tie differences and the limits of these checks.
+
+#### DFlash2 v3 route (separate capacity)
+
+The optional five-layer v3 drafter is measured separately from the 180K MTP acceptance profile.
+The delivered route uses 98,304 capacity, 1,024-token chunks, full target INT8 KV,
+TP2, greedy sampling, CUDA Graphs and DFlash7. It is text-only and needs the optional v3 drafter.
+On the saved 85,000-token LRU-code input, one cold request per window measures:
+
+| Timed committed tokens | Prefill tok/s | Decode tok/s | Accepted/drafted |
+|---:|---:|---:|---:|
+| 512 | 1,185.52 | **99.93** | 422/623 (67.74%) |
+| 2,048, forced window | 1,182.63 | **95.87** | 1674/2612 (64.09%) |
+
+The 512-token window has no EOS/EOG. The forced 2,048-token window continues past `<|im_end|>`
+at total output token 1,150 because benchmark stopping is disabled; it is sustained execution
+data, **not useful long-code completion speed**. All 513/2049 IDs and acceptance counters match
+the preceding argmax-only route. The single-run sharded-selector differences (0.6–0.8%) do not
+establish a stable speedup. Independent selector and real graph/eager / 64-position
+teacher-forcing checks pass; these are not universal model-quality scores.
+
+On the separate 85K high-code corpus, single forced 2,048-token windows measure DFlash3/5/7
+at 79.30/76.10/87.91 tok/s versus MTP3 at 86.14, all at 98,304 capacity and chunk=1,024.
+These windows continue past the first `<|im_end|>` at total output token 942 (917 for DFlash5),
+so they are stress measurements, not useful completion speeds. DFlash3/7 match the MTP output
+IDs; DFlash5 does not. DFlash7 also takes longer for the complete resident request
+(95.40 versus 92.92 seconds). Fresh 1,024-token windows are slower; larger experimental drafts
+9/11/15 brought no benefit and were removed. The supported 27B maximum remains seven.
+
+Earlier P2P-enabled v3 snapshots, before these vocabulary-transfer reductions: 3,072 input / 512
+timed output tokens measured 143.06 tok/s (two runs). A different 85K code corpus measured DFlash7
+73.38 tok/s (47.18% acceptance) versus MTP3 83.13 tok/s (78.56%). Different corpora, windows and
+acceptance prevent using those numbers or the peer-off MTP table as the current run's speedup
+baseline. See [DFlash method and reproduction](docs/performance.md#dflash2-v3-separate-capacity).
+
+#### Stop-aware non-code sweep
+
+The same v3 artifact was tested with story, translation, 32-record JSONL and logic tasks:
+**80 requests**, fixed 98,304 capacity / chunk 1,024 / TP2 / INT8 KV / greedy / CUDA Graphs,
+no prefix reuse, and model-default stopping enabled. All requests finish at the first model
+end token rather than continuing past EOS. D/M below means **DFlash7 / MTP3**, in committed
+decode tok/s. Native prompt sizes are 129 / 395 / 118 / 417 tokens in column order; their
+rates are two-run means. Every other cell is one measured request, not a repeated mean.
+
+| Actual input tokens | Story D/M | Translation D/M | JSONL D/M | Logic D/M |
+|---:|---:|---:|---:|---:|
+| native | 49.20 / 74.83 | 134.68 / 123.00 | 210.50 / 137.09 | 158.88 / 126.10 |
+| 1024 | 51.24 / 76.66 | 127.44 / 117.58 | 206.30 / 135.98 | 157.87 / 125.01 |
+| 2048 | 51.09 / 74.41 | 128.45 / 116.14 | 200.78 / 133.63 | 173.32 / 126.34 |
+| 4096 | 47.60 / 70.98 | 116.31 / 113.49 | 201.09 / 133.82 | 162.94 / 125.98 |
+| 8192 | 49.11 / 70.17 | 125.74 / 116.00 | 198.69 / 132.06 | 166.37 / 125.39 |
+| 16384 | 44.80 / 68.16 | 112.08 / 110.15 | 192.60 / 128.33 | 161.27 / 120.91 |
+| 32768 | 41.44 / 63.23 | 110.56 / 108.44 | 175.01 / 119.59 | 142.03 / 111.83 |
+| 65536 | 36.02 / 55.63 | 85.29 / 89.32 | 148.14 / 104.67 | 122.20 / 98.14 |
+| 85000 | 32.26 / 51.67 | 79.61 / 84.86 | 137.65 / 98.77 | 111.05 / 91.60 |
+
+JSONL is faster with DFlash at every tested length; at 85K, acceptance is 98.30% and decode
+is 39.37% faster with identical output IDs. Story acceptance is only about 12–14%, making
+DFlash slower than MTP. DFlash prefill is slower throughout this sweep, so faster decode
+does not imply a faster complete request: at 85K, logic takes 78.47 / 76.87 seconds D/M.
+
+All JSONL exact checks and logic CHECKs pass; translations pass section/glossary checks only.
+Some stories violate length/literal requirements, including a missing `ORCHID-37` in the
+native DFlash story. Only 30 of 36 task/length pairs have identical output IDs, so this is
+not a universal token-parity or no-quality-loss result. All four 85K pairs match exactly.
+[Full prefill, acceptance, output-length and whole-request tables](docs/performance.md#stop-aware-non-code-workloads-dflash7-versus-mtp3)
+include the per-row output qualifications.
 
 ### P2P disabled
 
@@ -293,15 +381,11 @@ An earlier NVFP4 TP2 comparison against the `plus1998/Ninfer-V100-Duo` code path
 973.5 / 68.96 tok/s upstream. This is a short-input cross-check only, not an 85K result. The
 upstream repository and its reported numbers should not be treated as measurements of this fork.
 
-#### Earlier DFlash2 experiment
+#### Historical DFlash2 experiment
 
-On the fixed 85K code corpus at 98,304 capacity, DFlash3 measured **25.19 tok/s** with 81.21%
-acceptance; CUDA Graph and eager runs produced identical 513-token IDs. DFlash7 measured
-**20.52 tok/s** with 41.56% acceptance and entered repeated special-message output after token 444.
-The matched MTP3 control measured **52.77 tok/s**. The 180K DFlash allocation is rejected at
-startup because the five-layer draft graph reservation does not fit the remaining memory. The
-rank-0 gather change preserves output IDs but did not materially improve end-to-end DFlash speed;
-the draft forward and full Q4_K vocabulary head dominate proposal cost.
+The old fixed-85K figures (DFlash3 **25.19 tok/s**, DFlash7 **20.52 tok/s**) used the pre-v3
+container and old KV layout. They are retained only as historical context; the current v3 result
+is the 98,304-capacity measurement above, and 180K DFlash is intentionally not advertised.
 
 ## Build and run
 

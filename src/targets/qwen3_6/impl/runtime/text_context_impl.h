@@ -831,7 +831,8 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                      Tensor& logits, Tensor& target_tokens) {
+                                      Tensor& logits, Tensor& target_tokens, bool greedy_target) {
+    (void)greedy_target;
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, tap);
@@ -842,7 +843,8 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      DFlashFeatureSink& sink, bool greedy_target) {
+    (void)greedy_target;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, sink);
 }
@@ -1966,6 +1968,59 @@ void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits
     }
 }
 
+void TextContext::target_argmax_tp2(const std::array<Tensor, 2>& hidden,
+                                    const std::array<Tensor, 2>& target_tokens) {
+    if (!tp2()) { throw std::logic_error("tensor-parallel target argmax requires a peer"); }
+    const ExecutionContext& execution       = ec();
+    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const std::int32_t columns              = hidden[0].ne[1];
+    if (columns <= 0) { throw std::invalid_argument("target argmax requires columns"); }
+    for (std::size_t r = 0; r < 2; ++r) {
+        require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, columns},
+                             "target argmax hidden");
+        require_tensor_shape(target_tokens[r], DType::I32, {columns},
+                             "target argmax tokens");
+    }
+
+    auto scope_0 = work_.scope();
+    auto scope_1 = tp_->work->scope();
+    std::array<Tensor, 2> part;
+    std::array<Tensor, 2> local_values;
+    std::array<Tensor, 2> local_indices;
+    for (std::size_t r = 0; r < 2; ++r) {
+        part[r]          = ws[r]->alloc(DType::BF16, {kShardVocab, columns});
+        local_values[r]  = ws[r]->alloc(DType::FP32, {columns});
+        local_indices[r] = ws[r]->alloc(DType::I32, {columns});
+    }
+    ops::linear_column_parallel(hidden, {*lm_head_, *lm_head_peer_}, part, execution);
+    const std::int32_t first_rows  = kShardVocab;
+    const std::int32_t second_rows = kCfg.token_domain - first_rows;
+    if (second_rows <= 0 || second_rows > kShardVocab) {
+        throw std::logic_error("target argmax vocabulary shards do not cover token domain");
+    }
+    for_each_rank(execution, [&](int rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        ops::argmax_with_value(part[r], local_values[r], local_indices[r],
+                               r == 0 ? first_rows : second_rows, stream_for(rank));
+    });
+
+    // Gather only two values and two local IDs per column to rank 0.  The existing pull-based
+    // collective is graph-capturable and preserves the source lifetime edge on both ranks.
+    Tensor gathered_values = work_.alloc(DType::FP32, {2, columns});
+    Tensor gathered_indices = work_.alloc(DType::I32, {2, columns});
+    ops::gather_columns_rank0(
+        gathered_values,
+        {local_values[0].view({1, columns}), local_values[1].view({1, columns})}, execution,
+        *tp_->events);
+    ops::gather_columns_rank0(
+        gathered_indices,
+        {local_indices[0].view({1, columns}), local_indices[1].view({1, columns})}, execution,
+        *tp_->events);
+    Tensor merged = target_tokens[0];
+    ops::merge_argmax_shards(gathered_values, gathered_indices, merged, first_rows, ctx_.stream);
+    ops::broadcast_rank0(target_tokens[0], target_tokens[1], execution, *tp_->events);
+}
+
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
                                                  bool finalize_at_end,
@@ -2556,7 +2611,8 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
                                       ops::GqaExecutionEnvelope envelope,
                                       const std::array<Tensor, 2>& hidden,
                                       const std::array<Tensor, 2>& logits,
-                                      const std::array<Tensor, 2>& target_tokens) {
+                                      const std::array<Tensor, 2>& target_tokens,
+                                      bool greedy_target) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution       = ec();
     const std::array<WorkspaceArena*, 2> ws = workspaces();
@@ -2637,16 +2693,19 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
             ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps, true,
                          flat_hidden[r], stream_for(rank));
         });
-        logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
-        // The argmax is REPLICATED, not rank 0's alone: both ranks hold the identical gathered
-        // logits (the gather is an exact relocation and IEEE addition is commutative, so the two
-        // buffers are bit-identical), and rank 1 needs its own target tokens to run the same
-        // acceptance arithmetic without a control-tensor transfer.
-        for_each_rank(execution, [&](int rank) {
-            const auto r       = static_cast<std::size_t>(rank);
-            Tensor flat_tokens = target_tokens[r].view({columns});
-            ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
-        });
+        if (greedy_target) {
+            target_argmax_tp2(flat_hidden,
+                              {target_tokens[0].view({columns}), target_tokens[1].view({columns})});
+        } else {
+            logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
+            // The argmax is replicated, not rank 0's alone: both ranks hold the identical gathered
+            // logits and rank 1 needs its own target tokens for acceptance without a control transfer.
+            for_each_rank(execution, [&](int rank) {
+                const auto r       = static_cast<std::size_t>(rank);
+                Tensor flat_tokens = target_tokens[r].view({columns});
+                ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
+            });
+        }
     }
     work_.reset();
     tp_->work->reset();
@@ -2662,7 +2721,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
                                       const std::array<Tensor, 2>& hidden,
                                       const std::array<Tensor, 2>& logits,
                                       const std::array<Tensor, 2>& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      DFlashFeatureSink& sink, bool greedy_target) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution = ec();
     const std::array<WorkspaceArena*, 2> ws = workspaces();
@@ -2733,12 +2792,18 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
                 }
             });
         }
-        logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
-        for_each_rank(execution, [&](int rank) {
-            const auto r = static_cast<std::size_t>(rank);
-            Tensor flat_tokens = target_tokens[r].view({width * batch});
-            ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
-        });
+        if (greedy_target) {
+            target_argmax_tp2(flat_hidden,
+                              {target_tokens[0].view({width * batch}),
+                               target_tokens[1].view({width * batch})});
+        } else {
+            logits_tp2(flat_hidden, flat_logits[0], flat_logits[1]);
+            for_each_rank(execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                Tensor flat_tokens = target_tokens[r].view({width * batch});
+                ops::argmax(flat_logits[r], flat_tokens, kCfg.token_domain, stream_for(rank));
+            });
+        }
     }
     work_.reset();
     tp_->work->reset();

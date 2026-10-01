@@ -8,7 +8,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope) {
+                          ops::GqaExecutionEnvelope envelope, bool greedy_target) {
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
@@ -17,17 +17,25 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 *frame.feature_sink);
+                                 *frame.feature_sink, greedy_target);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
-                                 frame.target_hidden, frame.target_logits, frame.target_tokens);
+                                 frame.target_hidden, frame.target_logits, frame.target_tokens,
+                                 greedy_target);
     }
-    ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
-                                          frame.current_extents, frame.frontiers, frame.anchors,
-                                          frame.licensed_tokens, frame.licensed_counts,
-                                          frame.accepted_drafts, TextConfig::token_domain,
-                                          frame.sampling, execution.work, execution.device.stream);
+    if (greedy_target) {
+        ops::speculative_accept_greedy_tokens(
+            frame.target_tokens, frame.drafts, frame.current_extents, frame.frontiers,
+            frame.anchors, frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
+            TextConfig::token_domain, frame.sampling, execution.device.stream);
+    } else {
+        ops::speculative_accept_greedy_drafts(
+            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+            frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
+            execution.device.stream);
+    }
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
@@ -36,7 +44,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope) {
+                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope,
+                          bool greedy_target) {
     if (execution.peer == nullptr) {
         throw std::logic_error("tensor-parallel target verify requires a peer");
     }
@@ -56,7 +65,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  {frame.lanes, peer.lanes}, envelope,
                                  {frame.target_hidden, peer.target_hidden},
                                  {frame.target_logits, peer.target_logits},
-                                 {frame.target_tokens, peer.target_tokens}, *frame.feature_sink);
+                                 {frame.target_tokens, peer.target_tokens}, *frame.feature_sink,
+                                 greedy_target);
     } else {
         card.target_verify_batch({frame.ids, peer.ids},
                                  {frame.cache_positions, peer.cache_positions},
@@ -65,7 +75,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  {frame.kv_table_rows, peer.kv_table_rows}, {frame.lanes, peer.lanes},
                                  envelope, {frame.target_hidden, peer.target_hidden},
                                  {frame.target_logits, peer.target_logits},
-                                 {frame.target_tokens, peer.target_tokens});
+                                 {frame.target_tokens, peer.target_tokens}, greedy_target);
     }
     const ExecutionContext& ec      = *execution.peer->execution;
     WorkspaceArena* work[2]         = {&execution.work, execution.peer->work};
@@ -74,11 +84,17 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         const auto r              = static_cast<std::size_t>(rank);
         TargetVerifyFrameView& v  = *views[r];
         cudaStream_t stream       = ec.dev[rank]->stream;
-        ops::speculative_accept_greedy_drafts(v.target_tokens, v.target_logits, v.drafts,
-                                              v.current_extents, v.frontiers, v.anchors,
-                                              v.licensed_tokens, v.licensed_counts,
-                                              v.accepted_drafts, TextConfig::token_domain,
-                                              v.sampling, *work[r], stream);
+        if (greedy_target) {
+            ops::speculative_accept_greedy_tokens(
+                v.target_tokens, v.drafts, v.current_extents, v.frontiers, v.anchors,
+                v.licensed_tokens, v.licensed_counts, v.accepted_drafts, TextConfig::token_domain,
+                v.sampling, stream);
+        } else {
+            ops::speculative_accept_greedy_drafts(
+                v.target_tokens, v.target_logits, v.drafts, v.current_extents, v.frontiers,
+                v.anchors, v.licensed_tokens, v.licensed_counts, v.accepted_drafts,
+                TextConfig::token_domain, v.sampling, *work[r], stream);
+        }
         ops::speculative_select_accepted_hidden(v.target_hidden, v.accepted_drafts,
                                                 v.selected_hidden, stream);
     });

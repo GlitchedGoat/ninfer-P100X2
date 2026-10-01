@@ -38,7 +38,8 @@ int run_nvfp4_a16() {
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
 #ifdef NINFER_VOLTA_BUILD
     constexpr std::array prefill_invocations{
-        Invocation{128}, Invocation{1024}, Invocation{4096},
+        Invocation{128}, Invocation{1024}, Invocation{2047}, Invocation{2048}, Invocation{2049},
+        Invocation{3072}, Invocation{4096},
     };
     for (const bool prepacked : {false, true}) {
         // The oracle decodes the original artifact bytes, independently of both the load-time

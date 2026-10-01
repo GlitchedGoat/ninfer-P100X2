@@ -142,6 +142,7 @@ struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
+    bool greedy_target                   = false;
     DecodeGraphDefinition definition;
 };
 

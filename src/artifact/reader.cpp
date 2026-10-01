@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -415,8 +416,12 @@ public:
                 {"vision/merger/norm_" + std::string(part)});
         }
 
+        const bool has_dflash2 = directory_.at("components").contains("dflash2");
+        if (has_dflash2) { add_dflash2(); }
+
         constexpr std::size_t kStructuralObjects = 1012;
-        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers;
+        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers +
+                                     (has_dflash2 ? 66 : 0);
         if (selected_.size() != expected) {
             throw ArtifactError("qwen3.8-27b v3 projection produced " +
                                 std::to_string(selected_.size()) + " objects; expected " +
@@ -447,6 +452,15 @@ public:
                 for (const auto& dimension : object->at("shape")) {
                     converted["shape"].push_back(
                         require_v3_unsigned(dimension, "v3 shape dimension", true));
+                }
+                if (old_name.starts_with("dflash/") && old_name.ends_with("conv/base_kernel")) {
+                    // v3 describes the checkpoint's [side,tap,channel] row-major tensor;
+                    // the native Tensor descriptor is ne0-fast [channel,tap,side].
+                    // These are the SAME bytes, not a transpose or weight repack.
+                    if (converted["shape"] != Json::array({2, 2, 5120})) {
+                        throw ArtifactError(old_name + ": invalid DFlash2 convolution shape");
+                    }
+                    converted["shape"] = {std::uint64_t{5120}, std::uint64_t{2}, std::uint64_t{2}};
                 }
                 converted["format"] = formats.at(require_string(object->at("format"), "v3 format"));
                 converted["layout"] = layouts.at(require_string(object->at("layout"), "v3 layout"));
@@ -479,6 +493,54 @@ public:
     }
 
 private:
+    void add_dflash2() {
+        const auto& component = directory_.at("components").at("dflash2");
+        const auto& config = component.at("config");
+        const auto& draft = config.at("dflash_config");
+        if (component.at("target") != "text" ||
+            config.at("num_hidden_layers") != 5 || config.at("intermediate_size") != 17408 ||
+            config.at("num_attention_heads") != 32 || config.at("num_key_value_heads") != 8 ||
+            config.at("head_dim") != 128 || config.at("sliding_window") != 2048 ||
+            config.at("layer_types") != Json::array({"sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention"}) ||
+            config.at("rope_parameters").at("rope_theta") != 10000000.0 ||
+            std::abs(config.at("rms_norm_eps").get<double>() - 1e-6) > 1e-13 ||
+            draft.at("target_layer_ids") != Json::array({5, 19, 33, 47, 61}) ||
+            draft.at("mask_token_id") != 248070 || draft.at("conv_kernel_size") != 2 ||
+            draft.at("conv_group_size") != 16 || draft.at("selector_rank") != 256 ||
+            draft.at("selector_top_k") != 16) {
+            throw ArtifactError("unsupported qwen3.8-27b v3 DFlash2 configuration");
+        }
+        for (const char* role : {"feature_projection", "context_norm", "final_norm"}) {
+            add("dflash/" + std::string(role), {"dflash2/" + std::string(role)});
+        }
+        for (int layer = 0; layer < 5; ++layer) {
+            const std::string suffix = "layers/" + std::to_string(layer) + "/";
+            const std::string old_prefix = "dflash/" + suffix;
+            const std::string prefix = "dflash2/" + suffix;
+            add(old_prefix + "attention/query_key_value",
+                {prefix + "attention/query", prefix + "attention/key", prefix + "attention/value"});
+            // Context K/V are aliases of the same QKV rows, not independent parameters.
+            for (const char* role : {"key", "value"}) {
+                if (binding_parts(prefix + "attention/context_" + role) !=
+                    binding_parts(prefix + "attention/" + role)) {
+                    throw ArtifactError(prefix + "attention/context_" + role + ": alias differs");
+                }
+            }
+            add(old_prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
+            for (const char* role : {"input_norm", "post_attention_norm", "attention/query_norm",
+                    "attention/key_norm", "attention/output", "mlp/down",
+                    "attention_conv/base_kernel", "attention_conv/kernel_projection",
+                    "mlp_conv/base_kernel", "mlp_conv/kernel_projection"}) {
+                add(old_prefix + role, {prefix + role});
+            }
+        }
+        for (const char* role : {"hidden_projection", "predecessor_codebook", "successor_codebook"}) {
+            add("dflash/candidate_selector/" + std::string(role),
+                {"dflash2/candidate_selector/" + std::string(role)});
+        }
+    }
+
     const Json& object(std::string_view id) const {
         const auto found = objects_.find(id);
         if (found == objects_.end()) { throw ArtifactError("missing v3 object: " + std::string(id)); }

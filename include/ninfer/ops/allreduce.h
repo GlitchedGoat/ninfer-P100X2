@@ -191,9 +191,10 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
                     const ExecutionContext& ec, const PeerEvents& events);
 
 /**
- * Exact one-way vocabulary gather used by DFlash's rank-0 selector.  `destination` is the full
- * `[C,T]` image on rank 0; `part[0]` and `part[1]` are the leading/trailing `[C_r,T]` shards on their owning
- * ranks.  Rank 1 is deliberately not written because it never consumes DFlash proposal logits.
+ * Exact one-way vocabulary gather used by DFlash's rank-0 selector. `destination` is the full
+ * `[C,T]` image on rank 0; `part[0]` and `part[1]` are the leading/trailing `[C_r,T]` shards on
+ * their owning ranks. The first/contiguous dimension is concatenated for every column. Rank 1 is
+ * deliberately not written because it never consumes DFlash proposal logits.
  * The source lifetime edge still orders rank 1 after rank 0 has finished importing its shard,
  * so the same work buffers may be reused by the next graph round.
  */

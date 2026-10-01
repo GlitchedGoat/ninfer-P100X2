@@ -171,6 +171,7 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    bool greedy_target = false;
 };
 
 struct DFlashAppendContext {
@@ -219,7 +220,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope, bool greedy_target = false);
 // tp == 2 form. `peer` is rank 1's identically-shaped view of ITS OWN frame; the acceptance
 // arithmetic is replicated there rather than transferred, because every one of its inputs is
 // either the ingress record (copied to both frames) or the gathered logits (bit-identical on both
@@ -227,7 +228,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 // egress transfer stay on rank 0 alone.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope);
+                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope,
+                          bool greedy_target = false);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,

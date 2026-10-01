@@ -8,7 +8,7 @@ The current host was measured on 2026-10-01 after rebooting with `iommu=pt`: two
 V100-SXM2 16 GB cards, CUDA 12.8 / SM70, 300 W per GPU, PCIe 3.0 ×16 and PHB topology.
 Both GPU IOMMU domains are `identity`; NVIDIA peer read/write checks pass, and NInfer
 automatically enables its existing direct-P2P UVA D2D route. This is PCIe P2P, not NVLink.
-No model weights or inference algorithms changed for this evaluation.
+No model weights or inference algorithms changed for the MTP P2P A/B evaluation.
 
 The official upstream v3 `qwen3.8-27b/nvfp4` artifact at
 `/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer` uses the public Engine route with TP2, devices
@@ -93,6 +93,278 @@ sequences are bit-identical. NVFP4 reports no such divergences in these fixtures
 were relaxed. These checks support the measured inference state and communication transition,
 not a universal task-quality score or a quality comparison between NVFP4 and Q4_K_M.
 The independent CUDA mathematical suites were not rerun for this communication-only change.
+
+#### Qualified NVFP4 prefill update
+
+Wide SM70 TP2 NVFP4 MLP projections with T≥2048 and N/K=17408/5120 or 5120/8704 use
+a CUTLASS 128×256×32 threadblock instead of 128×128×32. Other geometries retain their
+existing tile. The represented weights, FP32 accumulation/SwiGLU boundary and workspace
+contract are unchanged. NVFP4 Linear and fused SwiGLU pass their independent mathematical
+oracles without relaxed criteria, including the affected TP2 shapes.
+
+The matched public-Engine measurement uses the official v3 artifact, the saved
+`profiles/bench/v100-code-85000-iommu-pt.ids` corpus, 85000 occupied input tokens, 180000
+capacity, chunk=2560, INT8 KV, TP2, greedy optimized MTP3, CUDA Graphs and 512 timed decode
+tokens. Each implementation uses two cold requests, no prefix reuse and no extra warmup;
+loading and graph priming are outside request timing.
+
+| MLP tile | Prefill tok/s | Committed decode tok/s | Acceptance |
+|---|---:|---:|---:|
+| 128 columns, control | 1297.05 ± 2.21 | 81.630 ± 0.031 | 77.11% |
+| 256 columns, delivered | 1311.92 ± 2.06 | 81.715 ± 0.022 | 77.11% |
+
+Prefill improves **1.1466%**. All 513 output IDs and acceptance counters match across both
+implementations and repetitions; each request accepts 357/463 drafts over 155 rounds.
+The small decode difference is not claimed as a stable gain. Desktop VRAM occupancy made
+chunk=3072/2944 fail the startup allowance during this measurement, so chunk=2560 was used
+without reducing the allowance. The earlier 3072-chunk occupancy table is not the matched
+control. Reports are `profiles/bench/optimization_8h/nvfp4_85k_mtp3_chunk2560_initial.json`
+and `nvfp4_85k_chunk2560_tile256.json` in the same directory. Reproduction uses the MTP command
+below with `--prefill-chunk 2560` and `-r 2`.
+
+A faster 16-key softmax-update candidate changed output IDs and acceptance and did not
+establish a >10% gain with small quality loss. It was removed; the target attention retains
+its original FP32 accumulation order. No new lossy-attention switch is delivered.
+
+#### DFlash2 v3: separate capacity
+
+The official v3 artifact's optional five-layer drafter is bound for text-only TP2 execution,
+preserving its W8 projections and BF16 auxiliary tensors. All five draft layers use local
+sliding-window attention; the unused draft Full-KV pool is not allocated for this all-local
+27B variant. The main target KV remains complete. The verified profile is 98,304 capacity with
+a 1,024-token prefill chunk; 180,000-capacity DFlash is not claimed on two 16-GiB cards.
+Per-device sequence storage is 1,974,840,832 bytes and workspace is 780,790,272 bytes.
+
+The delivered implementation reduces two full-vocabulary transfers. Greedy target verification
+computes an argmax value/ID on each vocabulary shard, gathers those pairs, merges the global
+ID and broadcasts it. Sampling still uses full target logits. DFlash2 proposal selection
+computes each shard's exact top-16 keys (ordered represented BF16 logit plus complemented
+global token ID), gathers a `[32,columns]` image and merges the global top-16 before the same
+lattice walk. A global top-16 member must occur in its shard's top-16, so this reduces transfer
+volume without pruning any previously eligible candidate. Neither change alters target KV,
+weight precision, attention history or the lattice scoring formula.
+
+On the saved `profiles/bench/optimization_8h/lru_code_85000.ids` corpus, actual occupancy is
+85,000 input tokens. The following are **single cold requests**, not repeated means: greedy,
+INT8 group-64 KV, TP2, DFlash7, CUDA Graphs, no prefix reuse and no extra request warmup.
+Graph priming and model loading are outside request timing. Each request emits one additional
+prefill token before the timed committed decode window.
+
+| Timed decode tokens | Prefill tok/s | Committed decode tok/s | Accepted/drafted | Rounds |
+|---:|---:|---:|---:|---:|
+| 512 | 1185.52 | **99.93** | 422/623 (67.74%) | 90 |
+| 2048, forced window | 1182.63 | **95.87** | 1674/2612 (64.09%) | 374 |
+
+The 512-token window contains no EOS/EOG. In the 2,048-token window, `<|im_end|>` appears at
+total output token 1,150 (zero-based index 1,149). Model-default stopping is disabled by the
+benchmark, so the rest includes special-message tokens and further reasoning. This is sustained
+execution data, not useful long-code completion throughput or a scored complete solution.
+All 513/2049 output IDs and every acceptance counter match the prior argmax-only route. That
+route measured 99.32/95.12 decode tok/s respectively; the 0.6–0.8% single-run difference does
+not establish a stable selector speedup. No full-logit versus argmax-only controlled A/B has
+been rerun for these windows, so older reports do not establish an isolated argmax speedup.
+
+The selector test checks full-vocabulary and sharded routes against the same independent CPU
+sort and FP64 lattice oracle, including logit ties, uneven shards, multiple columns and the
+248320-row model vocabulary. The real DFlash7 TP2 Engine gate checks graph/eager committed IDs
+and acceptance and 64 fresh non-speculative teacher-forcing positions: zero disagreements,
+worst emitted-logit deficit zero. Earlier v3 gates additionally cover prefix replay and early
+stopping. These checks are not a universal model-capability score or an NVFP4/Q4 quality comparison.
+
+Earlier P2P-enabled v3 snapshots, before these transfer reductions, measured 143.06 ± 0.13
+decode tok/s on 3,072 input / 512 timed output tokens (two repetitions). On the distinct
+`profiles/bench/v100-code-85000-iommu-pt.ids` corpus at the same 98,304 capacity and chunk,
+DFlash7 measured 73.38 ± 0.012 decode tok/s (47.18% acceptance, 1178.39 prefill tok/s), versus
+83.13 ± 0.002 for its MTP3 control (78.56% acceptance, 1226.21 prefill tok/s). These are earlier
+code snapshots, not current remeasurements. Different prompts, output lengths and acceptance
+prevent calculating a current speedup against those figures or the 180K MTP tables. There is
+no paired P2P-disabled measurement of the current DFlash route.
+
+The separate saved high-code corpus `profiles/bench/v100-code-85000-iommu-pt.ids` was also
+measured at 85000 input tokens, capacity 98304 and chunk1024, with the same TP2/INT8/greedy/
+Graph settings. These are single cold requests, not repeated means. Model-default stopping
+is disabled; **all of these windows continue past the response's first end token**.
+
+| Backend | Timed decode tokens | Prefill tok/s | Committed decode tok/s | Accepted/drafted | Resident request s |
+|---|---:|---:|---:|---:|---:|
+| DFlash3 | 2048 | 1183.83 | 79.30 | 1432/1845 (77.62%) | 97.63 |
+| DFlash5 | 2048 | 1181.42 | 76.10 | 1578/2350 (67.15%) | 98.87 |
+| DFlash7 | 2048 | 1178.94 | 87.91 | 1640/2853 (57.48%) | 95.40 |
+| MTP3 | 2048 | 1229.42 | 86.14 | 1461/1761 (82.96%) | 92.92 |
+| DFlash3 | 1024, fresh | 1184.32 | 70.87 | 679/1034 (65.67%) | 86.23 |
+| DFlash5 | 1024, fresh | 1181.50 | 63.82 | 741/1411 (52.52%) | 87.99 |
+| DFlash7 | 1024, fresh | 1179.42 | 68.72 | 763/1826 (41.79%) | 86.98 |
+
+The first `<|im_end|>` is at total output token 942 for DFlash3/7 and MTP3, and 917 for
+DFlash5. Post-stop output includes repeated special-message/code sequences; its improved
+predictability affects acceptance and throughput. These rates are sustained stress results,
+not useful long-code completion speeds. DFlash3/7 have identical 2049 IDs to MTP3 and their
+fresh 1025 IDs match that prefix. DFlash5 first differs at total output token 355; this
+comparison does not establish token-identical behavior for every draft window.
+DFlash7's single-run decode advantage over MTP3 is only 2.06%, while the complete resident
+request is slower (95.40 versus 92.92 seconds). No stable universal DFlash speedup is claimed.
+
+Temporary draft9/11/15 support measured 58.47/45.77/42.79 tok/s on the fresh 1024-token
+window, with acceptance falling to 36.73%/30.38%/22.27%. It did not improve performance
+and was reverted; the supported 27B maximum remains seven. These fresh 1024-window and
+wider-draft measurements were taken after the optimization deadline, not within the eight-hour
+window. Local reports use `highcode_<backend>_85k_2048_current.json`,
+`highcode_<backend>_85k_1024_fresh.json` and `highcode_dflash<k>_85k_1024_experimental.json`
+under `profiles/bench/optimization_8h/current/`.
+
+An existing eager diagnostic trace isolates the stages at 85K input, capacity98304,
+chunk1024, DFlash7 and 128 timed outputs over 28 rounds. NVTX GPU-projected averages are
+7.27 ms/round for proposal (including selector), 1.06 ms for selector (including the head
+projection), and 48.24 ms for target verification/acceptance. The selector range is nested,
+and dual-GPU work overlaps; these are not additive kernel totals. Eager execution and tracing
+also add overhead, so the timings diagnose this route rather than predict production Graph
+throughput. Target verification dominates this trace, not just the five-layer drafter.
+The saved trace is `profiles/nsys/optimization_8h/highcode_dflash7_85k_128_eager_instrumented`;
+temporary diagnostic instrumentation was removed. The Graph trace did not expose enough node
+detail to support a complete Graph-mode stage breakdown.
+
+To reproduce using the existing artifact and saved LRU corpus (change `-pg` to `85000,2048`
+for the forced long window):
+
+```bash
+taskset -c 0-15 env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  build-v100/bench/ninfer_bench \
+  --weights /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  --corpus profiles/bench/optimization_8h/lru_code_85000.ids -pg 85000,512 \
+  --max-ctx 98304 --prefill-chunk 1024 --kv-dtype int8 --tp 2 --devices 0,1 \
+  --spec dflash --draft-tokens 7 --warmup 0 -r 1 --capture-generation -o json
+```
+
+The local reports are under `profiles/bench/optimization_8h/current/`, named
+`lru_dflash7_sharded_selector_85k_512.json` and `lru_dflash7_sharded_selector_85k_2048.json`.
+Raw reports and corpora are not committed.
+
+#### Stop-aware non-code workloads: DFlash7 versus MTP3
+
+On 2026-10-01, the same official NVFP4 v3 artifact was measured through the public Engine
+on this PCIe-P2P V100X2 using four tasks: a three-chapter Chinese story requesting 900–1200
+Chinese characters and `ORCHID-37`; a six-section English-to-Chinese translation with at least
+20 glossary entries; exactly 32 JSONL records with prescribed fields, arithmetic and field
+order; and the five-slot logic puzzle with expected final `CHECK=4606`.
+
+Both backends use **98,304 context/KV capacity**, prefill chunk 1,024, TP2 devices 0,1,
+INT8 group-64 KV, CUDA Graphs, one active request, greedy sampling and zero presence/frequency
+penalties. DFlash uses seven drafts and the full proposal head; MTP uses three drafts and
+the optimized proposal head. Thinking and prefix reuse are disabled. Model loading and graph
+priming are outside request timing. The maximum output is 2,048 tokens, with model-default
+stopping **enabled**. All 80 requests stop at their first model end token, below the output
+limit; there is no forced post-stop continuation. Committed decode throughput is
+`(generated_token_count - 1) / decode_seconds`; the first generated token belongs to prefill.
+Total output counts below include that first token and the terminating model token.
+
+Native prompts contain 129 / 395 / 118 / 417 tokens for story / translation / JSONL / logic.
+Each native prompt has two cold-prompt repetitions per backend; decode rates show mean ± sample
+standard deviation and prefill rates show means. Each task at exactly
+1,024 / 2,048 / 4,096 / 8,192 / 16,384 / 32,768 / 65,536 / 85,000 occupied input tokens has
+**one measured request per backend**, not a repeated mean. Distinct local technical documents
+provide non-repeated background before the unchanged final task/template. Their raw token IDs
+were frozen before measurement and shared by both backends. This is neither a retrieval-quality
+test nor a single-variable causal experiment in length, since visible background content varies.
+
+The campaign resumed after an unexpected host reset, retaining completed requests and running
+only missing cases. Power limits remained 300 W per card; post-reset P2P read/write checks still
+passed. All within-backend native repetitions reproduce their output IDs and acceptance counters.
+The local task-specific harness, frozen cases and reports are
+`profiles/bench/other_inputs_20261001/{other_inputs.cpp,cases.json,dflash7.json,mtp3.json}`;
+the harness uses the public Engine for all inference. Raw reports and corpora are not committed.
+
+In every paired table, **D/M means DFlash7 / MTP3**. An identical-ID entry is an exact comparison
+of the complete generated token sequence, not a task-quality score.
+
+##### Chinese story
+
+| Actual input tokens | Prefill tok/s D/M | Committed decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical output IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 129 (native) | 593.52 / 618.57 | 49.20 ± 0.004 / 74.83 ± 0.004 | 12.16% / 39.35% | 1257 / 1087 | No |
+| 1024 | 1520.14 / 1663.46 | 51.24 / 76.66 | 13.74% / 41.56% | 1084 / 1084 | Yes |
+| 2048 | 1569.95 / 1661.93 | 51.09 / 74.41 | 14.48% / 40.66% | 1162 / 1162 | Yes |
+| 4096 | 1559.68 / 1650.43 | 47.60 / 70.98 | 12.34% / 36.87% | 835 / 835 | Yes |
+| 8192 | 1537.54 / 1623.52 | 49.11 / 70.17 | 13.69% / 37.43% | 1122 / 1122 | Yes |
+| 16384 | 1489.53 / 1571.28 | 44.80 / 68.16 | 12.04% / 37.52% | 914 / 861 | No |
+| 32768 | 1401.28 / 1474.85 | 41.44 / 63.23 | 12.52% / 37.09% | 1030 / 1030 | Yes |
+| 65536 | 1250.19 / 1303.80 | 36.02 / 55.63 | 13.04% / 37.44% | 1033 / 1033 | Yes |
+| 85000 | 1182.64 / 1233.38 | 32.26 / 51.67 | 12.06% / 36.30% | 961 / 961 | Yes |
+
+##### English → Chinese translation
+
+| Actual input tokens | Prefill tok/s D/M | Committed decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical output IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 395 (native) | 1196.01 / 1234.86 | 134.68 ± 0.005 / 123.00 ± 0.039 | 58.31% / 86.43% | 930 / 908 | No |
+| 1024 | 1576.32 / 1661.44 | 127.44 / 117.58 | 55.27% / 81.42% | 779 / 779 | Yes |
+| 2048 | 1571.21 / 1661.55 | 128.45 / 116.14 | 57.40% / 81.62% | 839 / 839 | Yes |
+| 4096 | 1559.48 / 1650.06 | 116.31 / 113.49 | 50.71% / 78.92% | 688 / 688 | Yes |
+| 8192 | 1534.84 / 1623.27 | 125.74 / 116.00 | 57.38% / 83.90% | 923 / 923 | No |
+| 16384 | 1487.15 / 1571.02 | 112.08 / 110.15 | 51.64% / 80.86% | 743 / 741 | No |
+| 32768 | 1401.27 / 1471.30 | 110.56 / 108.44 | 57.29% / 87.20% | 952 / 952 | Yes |
+| 65536 | 1248.25 / 1302.42 | 85.29 / 89.32 | 50.40% / 80.53% | 893 / 893 | Yes |
+| 85000 | 1180.46 / 1230.43 | 79.61 / 84.86 | 50.80% / 81.41% | 893 / 893 | Yes |
+
+##### 32-record JSONL
+
+| Actual input tokens | Prefill tok/s D/M | Committed decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical output IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 118 (native) | 580.80 / 582.25 | 210.50 ± 0.058 / 137.09 ± 0.043 | 99.05% / 100.00% | 1190 / 1190 | Yes |
+| 1024 | 1577.96 / 1658.23 | 206.30 / 135.98 | 99.05% / 99.89% | 1190 / 1190 | Yes |
+| 2048 | 1569.36 / 1662.03 | 200.78 / 133.63 | 99.05% / 99.89% | 1190 / 1190 | Yes |
+| 4096 | 1560.76 / 1649.45 | 201.09 / 133.82 | 99.05% / 100.00% | 1190 / 1190 | Yes |
+| 8192 | 1529.92 / 1623.11 | 198.69 / 132.06 | 99.05% / 99.78% | 1190 / 1190 | Yes |
+| 16384 | 1489.98 / 1570.78 | 192.60 / 128.33 | 99.05% / 100.00% | 1190 / 1190 | Yes |
+| 32768 | 1400.07 / 1472.45 | 175.01 / 119.59 | 99.05% / 100.00% | 1190 / 1190 | Yes |
+| 65536 | 1246.28 / 1302.94 | 148.14 / 104.67 | 98.30% / 99.89% | 1190 / 1190 | Yes |
+| 85000 | 1178.83 / 1228.32 | 137.65 / 98.77 | 98.30% / 100.00% | 1190 / 1190 | Yes |
+
+##### Five-slot logic puzzle
+
+| Actual input tokens | Prefill tok/s D/M | Committed decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical output IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 417 (native) | 1237.40 / 1279.63 | 158.88 ± 0.013 / 126.10 ± 0.034 | 71.64% / 89.30% | 1204 / 1204 | Yes |
+| 1024 | 1577.52 / 1664.03 | 157.87 / 125.01 | 71.83% / 89.14% | 652 / 652 | Yes |
+| 2048 | 1571.71 / 1661.37 | 173.32 / 126.34 | 82.86% / 92.18% | 850 / 850 | Yes |
+| 4096 | 1562.27 / 1649.73 | 162.94 / 125.98 | 76.98% / 91.47% | 805 / 805 | Yes |
+| 8192 | 1531.70 / 1623.05 | 166.37 / 125.39 | 80.61% / 93.24% | 837 / 823 | No |
+| 16384 | 1486.20 / 1570.62 | 161.27 / 120.91 | 80.65% / 92.24% | 824 / 824 | Yes |
+| 32768 | 1399.80 / 1465.85 | 142.03 / 111.83 | 77.55% / 90.98% | 676 / 676 | Yes |
+| 65536 | 1245.29 / 1302.07 | 122.20 / 98.14 | 78.44% / 91.67% | 689 / 689 | Yes |
+| 85000 | 1176.65 / 1226.37 | 111.05 / 91.60 | 76.41% / 90.37% | 693 / 693 | Yes |
+
+##### Whole-request interpretation and output qualifications
+
+| Task at 85,000 input tokens | Prefill seconds D/M | Decode seconds D/M | Complete resident request seconds D/M |
+|---|---:|---:|---:|
+| Chinese story | 71.87 / 68.92 | 29.76 / 18.58 | 101.64 / 87.50 |
+| English → Chinese translation | 72.01 / 69.08 | 11.20 / 10.51 | 83.21 / 79.60 |
+| 32-record JSONL | 72.11 / 69.20 | 8.64 / 12.04 | 80.75 / 81.24 |
+| Five-slot logic puzzle | 72.24 / 69.31 | 6.23 / 7.55 | 78.47 / 76.87 |
+
+DFlash7 improves JSONL decode by 39.37% and logic decode by 21.24% at 85K, with identical output
+IDs, but is slower on story and translation decode. Its prefill is slower for all tested tasks
+and lengths. At 85K, JSONL's complete request improves by only about 0.61% in this single pair;
+logic's complete request is slower despite faster decode. These single measurements do not
+establish stable whole-request gains or a universal DFlash speedup.
+
+All 10 JSONL completions per backend pass exact record/value/count and field-order checks.
+All 10 logic completions per backend end in `CHECK=4606`; the expected service/color/port
+mapping was also reviewed, including responses that use separate assignments rather than
+the checker's canonical `Slot N:` block. All translations retain six section headings and
+at least 20 glossary entries (25–60 here); those structural checks are not an independent
+translation-accuracy or technical-boundary score.
+
+Story compliance is incomplete in both backends: native stories contain 1,586 / 1,379 Chinese
+characters, beyond the requested 900–1,200, and the native DFlash story omits `ORCHID-37`.
+Both 4K stories also omit that literal ID. Only the 16K and 85K story rows satisfy all of the
+listed literal/length/chapter checks; this does not score plot quality or every semantic detail.
+
+Complete output IDs differ for native story/translation, 8K translation/logic, and 16K
+story/translation; their first differences are at total output tokens 20/692, 243/296 and
+33/380 respectively. The other 30 of 36 task/occupancy pairs match exactly, including every
+85K pair and every JSONL pair. Different-output rows are descriptive workload measurements,
+not strict same-output speedups. No claim of universally token-identical or quality-loss-free
+DFlash behavior follows from this sweep.
 
 #### Reproduction on the current host
 
@@ -360,20 +632,20 @@ do not relabel the retained staging attribution as a measurement of the current 
   Flash-V100 attention and quantized kernels are not drop-in compatible with NInfer's preserved
   GGUF Q4_K/Q6_K storage; porting one requires a separate oracle and graph-capture qualification.
 - [DFlash2](https://inco.ai/blog/dflash2/) and the [Qwen3.8-27B drafter](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2),
-  now integrated as an optional five-layer BF16 draft route with dynamic grouped convolution,
-  lattice selection, and TP2 replicated verification. A short two-V100 smoke run completed eight generated tokens with 100% acceptance. The measured
-  85K code-corpus NInfer results are recorded below; a temporary llama.cpp `sm_70` build was used only as an external
-  85K control, not as a short-prompt headline result.
+  integrated with dynamic grouped convolution, lattice selection, and TP2 verification.
+  The optional v3 package preserves W8 projections and BF16 auxiliary tensors; its measurements
+  are in the [P2P-enabled section](#dflash2-v3-separate-capacity). A temporary llama.cpp `sm_70`
+  build was used only as the historical external 85K control below.
 - [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp), which stores completed KV
   blocks in host RAM and retrieves a query-selected subset into a bounded GPU window. That is an
   approximate attention policy, not a transparent full-180K KV spill: it changes which history
   participates in attention. The V100X2 contract therefore keeps complete-context semantics and
   does not silently substitute KVMem retrieval.
 
-The NInfer benchmark also accepts `--spec dflash --draft-tokens K` and feeds the fixed
-`/tmp/v100-code-85000.ids` corpus directly through `Engine::prepare_tokens()`. With 85,000 occupied
-tokens, INT8 group-64 KV, TP2 (`0,1`), 1,024-token prefill chunks, and a 512-token measured decode
-window, the 98,304-token-capacity run produced:
+#### Historical pre-v3 DFlash2 route
+
+The following table is historical and belongs to the pre-v3 route. The NInfer benchmark also accepts
+`--spec dflash --draft-tokens K` and feeds a saved corpus directly through `Engine::prepare_tokens()`.
 
 For an external engine control, the same raw 85,000-token IDs were sent to the local llama.cpp
 build with 98,304 capacity, Q8 KV, DFlash3, and a 128-token fixed window. It produced 30.1 tok/s
@@ -381,29 +653,29 @@ build with 98,304 capacity, Q8 KV, DFlash3, and a 128-token fixed window. It pro
 drafted, 91 accepted). A separate older short-prompt experiment is excluded because its workload
 was not comparable to this 85K result.
 
-| Route | CUDA Graph | Decode tok/s | Acceptance | Output check |
+| Historical route | CUDA Graph | Decode tok/s | Acceptance | Output check |
 |---|---:|---:|---:|---|
 | NInfer DFlash3 | on | **25.19** | 81.21% | same 513 IDs as MTP3 |
 | NInfer DFlash3 | off | **25.08** | 81.21% | same 513 IDs as graph |
 | NInfer DFlash7 | off | **20.52** | 41.56% | repeated special-message output after token 444 |
 | NInfer MTP3 control | on | **52.77** | 75.37% | 513-token window, no EOS/EOG |
 
-The DFlash3 graph/eager output IDs were identical. Requesting a 180,000-token capacity for DFlash
-is rejected during startup on the current two 16 GiB cards: the draft graph/runtime reservation
+The DFlash3 graph/eager output IDs were identical. Requesting a 180,000-token capacity for this
+pre-v3 DFlash layout was rejected during startup on the two 16 GiB cards: the draft graph/runtime reservation
 requires about 5.48 GiB after weights while only about 3.50 GiB remains per device. These numbers
 are therefore a long-code execution measurement at 98,304 capacity, not a 180K-capacity acceptance
-claim. DFlash7's lower rate and output degeneration make increasing the draft window
-counterproductive for this workload.
+claim. DFlash7's lower rate and output degeneration made increasing the draft window
+counterproductive in that older route and workload, not in every current v3 workload.
 
-The low DFlash rate is not caused by the selector kernel itself. Nsight Systems attributes the
+The low historical DFlash rate was not caused by the selector kernel itself. Nsight Systems attributed the
 dominant proposal-round cost to the five-layer BF16 drafter and its full Q4_K vocabulary head;
 the selector top-k/walk kernels are only a small fraction of a round. Before this change, TP2
 also reconstructed the full `[248320, K]` vocabulary image with one cross-device gather per
-draft column and wrote an unused copy on rank 1. NInfer now gathers all columns in one strided
-PCIe operation and keeps the image only on rank 0 (`gather_columns_rank0`), with exact byte/layout
-tests. On the 85K corpus this preserves all 513 output IDs and acceptance, but changes DFlash3
-from 25.19 to about 25.29 tok/s (within run-to-run noise): the remaining gap requires an exact
-fused vocabulary-head/top-k path and/or fused DFlash proposal layers, not another selector tweak.
+draft column and wrote an unused copy on rank 1. An intermediate route gathered all columns in one strided
+PCIe operation and kept the image only on rank 0 (`gather_columns_rank0`), with exact byte/layout
+tests. On that 85K corpus this preserved all 513 output IDs and acceptance, but changed DFlash3
+from 25.19 to about 25.29 tok/s (within run-to-run noise). This identified draft projections and
+the full-vocabulary head as major remaining costs; it does not profile the current v3 route.
 
 #### PCIe-only transport optimization
 
