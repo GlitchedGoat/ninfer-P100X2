@@ -20,7 +20,11 @@ for the selected tool.
 | Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
 | Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
+| Evaluate native RAM-KV on fixed long-context fixtures | [`v100/bench_ram_kv.py`](v100/bench_ram_kv.py) |
+| Measure stop-aware TP2 task output on saved workloads | [`v100/bench_tasks.cpp`](v100/bench_tasks.cpp), see [`bench/README.md`](../bench/README.md#stop-aware-v100-task-probes) |
+| Record read-only V100/reset telemetry | [`v100/health_log.py`](v100/health_log.py) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
+| Start/configure a local HTTP server with PyQt | [`v100/ninfer_gui.py`](v100/ninfer_gui.py) and [`../docs/gui.md`](../docs/gui.md) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
 ## Artifact workflow
@@ -81,6 +85,29 @@ python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 
 See [`tools/bench/README.md`](bench/README.md) and [`bench/README.md`](../bench/README.md) for the
 orchestrator and executable contracts.
+
+`v100/bench_ram_kv.py` also records 200 ms GPU power/temperature/ECC/clocks/PCIe and per-second host
+CPU/memory/temperature/AER/EDAC counters under each run's `health/`, together with PCIe replay and
+traffic, live kernel/system journal events, case boundaries, cgroup memory/events/pressure and
+workload thread states/wait channels. The existing one-second Engine progress logs are enabled
+and copied into synced logs; this does not add CUDA synchronization. Each record is synced to
+disk; `report.json` is atomically updated
+after each completed case. This does not change power limits, clocks or system settings, and
+cannot guarantee that a sudden reset will leave its cause in the logs. Use the collector alone
+with a new output directory:
+
+```bash
+.venv/bin/python3 tools/v100/health_log.py --output profiles/bench/health-run
+```
+
+Add `--pid PID` to capture only that workload's RSS, faults/CPU counters, I/O and thread
+states/wait channels once per second. Python runners can use `HealthLog.attach_pid(pid)` and
+`follow_file(path, name, from_start=False)` to preserve new application events without replaying
+previous resumed logs. Startup also records the GPU topology; no settings are changed.
+
+Stop it with Ctrl-C after the workload. GPU rows use local timestamps; host/events use UTC ISO
+timestamps, and the event log records the boot ID. RAM-KV archive budget and the benchmark's
+32 GB server cgroup limit are separate; see [the native RAM-KV contract](../docs/maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment).
 
 ## Serving smoke
 

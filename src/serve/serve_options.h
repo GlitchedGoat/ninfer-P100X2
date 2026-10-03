@@ -46,10 +46,12 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     int tp                                 = 1;
+    int storage_device                     = -1;
     // Resolved device ids, one per tp rank. Always populated by parse_serve_options() (from
     // --devices, or synthesized as {device} when --devices is omitted).
     std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

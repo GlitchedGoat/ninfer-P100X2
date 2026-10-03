@@ -49,7 +49,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
 // with a null workspace throws, the same way ops::linear's own nvfp4_dispatch does.
 [[nodiscard]] std::size_t
 nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                   std::int32_t max_tokens);
+                                                   std::int32_t max_tokens, int tp);
 
 void nvfp4_linear_swiglu_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                              cudaStream_t stream);

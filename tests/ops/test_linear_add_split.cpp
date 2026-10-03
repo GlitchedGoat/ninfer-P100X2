@@ -599,7 +599,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                       Tensor(r1.p, DType::BF16, {kN, 1})};
         const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 2}),
                                             Tensor(stage1.p, DType::BF16, {kN, 1})};
-        ops::linear_add_row_parallel(x, {fake, fake}, r, staging, ec, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, 2>{fake, fake}, r, staging, ec, events);
     });
 
     expect_throw("row N", [&] {
@@ -611,7 +611,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                       Tensor(r1.p, DType::BF16, {kN / 2, 1})};
         const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN / 2, 1})};
-        ops::linear_add_row_parallel(x, {fake, other}, r, staging, ec, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, 2>{fake, other}, r, staging, ec, events);
     });
 
     expect_throw("tp1 context", [&] {
@@ -624,7 +624,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                             Tensor(stage1.p, DType::BF16, {kN, 1})};
         // require_split_context rejects `single` before events is ever touched, so the outer
         // (valid) events object is fine to reuse here.
-        ops::linear_add_row_parallel(x, {fake, fake}, r, staging, single, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, 2>{fake, fake}, r, staging, single, events);
     });
 
     expect_throw("unsupported format", [&] {
@@ -638,7 +638,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                       Tensor(r1.p, DType::BF16, {kN, 1})};
         const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN, 1})};
-        ops::linear_add_row_parallel(x, {w8, w8}, r, staging, ec, events);
+        ops::linear_add_row_parallel(x, std::array<Weight, 2>{w8, w8}, r, staging, ec, events);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";
@@ -678,7 +678,7 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, peer_access);
 
     failures += verify_split_rejections(ec, events);
 

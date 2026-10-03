@@ -29,6 +29,7 @@ enum class NumericFormat {
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
     GGML_K,
+    FP8_E4M3FN_BLOCK128_BF16S,
 };
 
 enum class StorageLayout {
@@ -37,6 +38,7 @@ enum class StorageLayout {
     BlockScaleK16M128x4V1,
     RowScaleV1,
     GgmlK256V1,
+    BlockScaleM128K128V1,
 };
 
 enum class ResourceEncoding {
@@ -98,6 +100,17 @@ struct RowScaleGeometry {
 };
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+struct Fp8BlockGeometry {
+    std::uint64_t rows;
+    std::uint64_t columns;
+    std::uint64_t row_blocks;
+    std::uint64_t column_blocks;
+    std::uint64_t scale_plane_offset;
+    std::uint64_t scale_plane_bytes;
+    std::uint64_t encoded_bytes;
+};
+Fp8BlockGeometry fp8_block_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
 // --- Tensor slicing (TP2 sharded materialization) ---------------------------------------------
 //

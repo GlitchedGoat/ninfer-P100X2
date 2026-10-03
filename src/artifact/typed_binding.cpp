@@ -26,6 +26,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return StorageLayout::BlockScaleM128K128V1;
     case NumericFormat::GGML_K:
         return StorageLayout::GgmlK256V1;
     }
@@ -52,6 +54,8 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return QType::FP8_E4M3FN_BLOCK128_BF16S;
     case NumericFormat::GGML_K:
         return QType::GGML_K;
     }
@@ -212,6 +216,30 @@ Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandl
 Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
                            NumericFormat format, std::int32_t rows, std::int32_t columns,
                            int device) {
+    if (format == NumericFormat::FP8_E4M3FN_BLOCK128_BF16S) {
+        const std::array<std::uint64_t, 2> shape{
+            static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)};
+        const auto geometry = fp8_block_geometry(format, shape);
+        require_placement_bytes(materialized, handle, device, geometry.encoded_bytes);
+        Weight out{};
+        out.payload = materialized.device_data(handle, device);
+        out.payload_bytes = geometry.encoded_bytes;
+        out.qdata = out.payload;
+        out.scales = static_cast<const std::byte*>(out.payload) + geometry.scale_plane_offset;
+        out.qtype = QType::FP8_E4M3FN_BLOCK128_BF16S;
+        out.layout = QuantLayout::BlockScale128;
+        out.group = out.group_size = 128;
+        out.ndim = 2;
+        out.n = out.shape[0] = out.padded_shape[0] = rows;
+        out.k = out.shape[1] = out.padded_shape[1] = columns;
+        out.scale_dtype = DType::BF16;
+        out.scale_ne[0] = columns / 128;
+        out.scale_ne[1] = rows / 128;
+        out.scale_nb[0] = 2;
+        out.scale_nb[1] = (columns / 128) * 2;
+        out.scale_nb[2] = out.scale_nb[3] = geometry.scale_plane_bytes;
+        return out;
+    }
     if (format == NumericFormat::GGML_K) {
         Weight out{};
         out.payload = materialized.device_data(handle, device);

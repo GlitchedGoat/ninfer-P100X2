@@ -38,11 +38,12 @@ std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
     if (q_heads == 16) { return 2; }
     if (q_heads == 12) { return 2; }
+    if (q_heads == 6) { return 1; }
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
 void require_kv_heads(std::int32_t kv_heads, const char* op) {
-    if (kv_heads != 4 && kv_heads != 2) {
+    if (kv_heads != 4 && kv_heads != 2 && kv_heads != 1) {
         throw std::invalid_argument(std::string(op) + ": unsupported KV head geometry");
     }
 }
@@ -301,7 +302,7 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
     // store) for every tile. ChunkedSmallT is the correct fallback -- slower, but it is the path
     // 16q/2kv prefill used before the flash route existed. Re-enabling that geometry means
     // reconciling the two cols_per_warp definitions upstream first.
-    return (q_heads == 24 || q_heads == 12) && batch_size == 1 &&
+    return (q_heads == 24 || q_heads == 12 || q_heads == 6) && batch_size == 1 &&
            (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
            width >= detail::kVoltaFlashMinimumWidth;
 }
@@ -322,7 +323,7 @@ template <class Allocator>
 VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::int32_t q_heads,
                                                    std::int32_t width,
                                                    GqaExecutionEnvelope envelope) {
-    const std::int32_t kv_heads = q_heads == 24 ? 4 : 2;
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention Volta Flash workspace");
     // Both the gathered K/V and the mask are sized by the padded key extent; see
     // the FATTN_KQ_STRIDE note in gqa_attention_volta_flash.cu.
     const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
@@ -466,7 +467,7 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
 std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
-                                                   std::int32_t max_width) {
+                                                   std::int32_t max_width, bool resident_read) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
@@ -542,6 +543,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
+    if (resident_read) {
+        if (batch_size != 1) { throw std::invalid_argument("resident GQA requires B=1"); }
+        maximum += ((static_cast<std::size_t>(max_width) * sizeof(std::int32_t) + 255) / 256 + 1) * 256;
+    }
     return maximum;
 }
 
@@ -552,6 +557,26 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
+    if (cache.read_indices.data != nullptr) {
+        if (q.ne[3] != 1 || cache.read_capacity == 0 ||
+            cache.read_indices.dtype != DType::I32 || cache.read_tables.dtype != DType::I32 ||
+            cache.read_indices.ne[0] != cache.block_tables.ne[0] ||
+            cache.read_tables.ne[0] != cache.block_tables.ne[0]) {
+            throw std::invalid_argument("gqa_attention: invalid chronological resident view");
+        }
+        auto remap_scope = workspace.scope();
+        Tensor compact = workspace.alloc(DType::I32, {positions.ne[0], positions.ne[1]});
+        detail::gqa_remap_positions_launch(positions, cache.read_indices, compact, stream);
+        cache.block_tables = cache.read_tables;
+        cache.read_indices = Tensor{};
+        cache.read_tables = Tensor{};
+        const auto maximum = std::min(envelope.max_visible_keys, cache.read_capacity);
+        const GqaExecutionEnvelope bounded{
+            envelope.min_visible_keys == envelope.max_visible_keys ? maximum : 1U, maximum};
+        gqa_attention(q, k, v, compact, valid_columns, kv_table_rows, scale, cache, bounded,
+                      workspace, out, stream);
+        return;
+    }
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("gqa_attention: k/v must be BF16");
     }
@@ -634,6 +659,19 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "gqa_attention_cached";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
+
+    if (cache.read_indices.data != nullptr) {
+        auto remap_scope = workspace.scope();
+        Tensor compact = workspace.alloc(DType::I32, {positions.ne[0]});
+        detail::gqa_remap_positions_launch(positions, cache.read_indices, compact, stream);
+        PagedKVLayerView resident = cache;
+        resident.block_table = cache.read_table.view({cache.block_table.ne[0]});
+        resident.read_indices = Tensor{};
+        resident.read_table = Tensor{};
+        const auto maximum = std::min(envelope.max_visible_keys, cache.read_capacity);
+        gqa_attention_cached(q, compact, scale, resident, {1U, maximum}, workspace, out, stream);
+        return;
+    }
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =

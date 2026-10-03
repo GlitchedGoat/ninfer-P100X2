@@ -97,6 +97,8 @@ struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
+    // Last user query's bounded lexical tokens; target-independent retrieval metadata.
+    std::vector<TokenId> retrieval_tokens;
     std::int32_t rope_delta = 0;
     // One immutable payload per Vision item, in the same order as vision_items.
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;

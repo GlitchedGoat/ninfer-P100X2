@@ -1,5 +1,6 @@
 #include "artifact/materializer.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -79,6 +80,120 @@ struct ReadSpan {
 
 } // namespace
 
+struct MaterializedArtifact::VirtualMapping {
+    CUdeviceptr base = 0;
+    std::size_t virtual_bytes = 0;
+    struct Segment {
+        CUmemGenericAllocationHandle handle = 0;
+        std::size_t virtual_offset = 0;
+        std::size_t bytes = 0;
+    };
+    std::vector<Segment> segments;
+
+    ~VirtualMapping() {
+        int previous = 0;
+        (void)cudaGetDevice(&previous);
+        // The runtime primary context remains current for the owning engine; VMM teardown does not
+        // require a device-side synchronization because materialization waits on both load streams
+        // before the mapping can be destroyed.
+        for (const Segment& segment : segments) {
+            if (base != 0 && segment.bytes != 0) {
+                (void)cuMemUnmap(base + segment.virtual_offset, segment.bytes);
+            }
+            if (segment.handle != 0) { (void)cuMemRelease(segment.handle); }
+        }
+        if (base != 0) { (void)cuMemAddressFree(base, virtual_bytes); }
+        (void)cudaSetDevice(previous);
+    }
+};
+
+MaterializedArtifact::MaterializedArtifact() = default;
+MaterializedArtifact::~MaterializedArtifact() = default;
+MaterializedArtifact::MaterializedArtifact(MaterializedArtifact&&) noexcept = default;
+MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&&) noexcept = default;
+
+std::string driver_error(CUresult result) {
+    const char* name = nullptr;
+    const char* message = nullptr;
+    (void)cuGetErrorName(result, &name);
+    (void)cuGetErrorString(result, &message);
+    return std::string(name != nullptr ? name : "CUDA_ERROR_UNKNOWN") + ": " +
+           (message != nullptr ? message : "unknown driver error");
+}
+
+void driver_check(CUresult result, const char* operation) {
+    if (result != CUDA_SUCCESS) {
+        throw ArtifactError(std::string(operation) + " failed: " + driver_error(result));
+    }
+}
+
+std::unique_ptr<MaterializedArtifact::VirtualMapping>
+create_virtual_mapping(const VirtualDeviceMaterialization& placement,
+                        std::span<DeviceContext* const> devices) {
+    if (devices.size() != kVirtualStorageDevices || placement.virtual_bytes == 0 ||
+        placement.segments.empty()) {
+        throw ArtifactError("virtual materialization requires two nonempty device slices");
+    }
+    driver_check(cuInit(0), "cuInit");
+    std::size_t granularity = 0;
+    CUmemAllocationProp prop{};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = devices[0]->device;
+    driver_check(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                 "cuMemGetAllocationGranularity");
+    auto mapping = std::make_unique<MaterializedArtifact::VirtualMapping>();
+    if (placement.virtual_bytes > std::numeric_limits<std::size_t>::max() - (granularity - 1)) {
+        throw ArtifactError("virtual materialization address size overflows size_t");
+    }
+    mapping->virtual_bytes = static_cast<std::size_t>(
+        (placement.virtual_bytes + granularity - 1) / granularity * granularity);
+    try {
+        driver_check(cuMemAddressReserve(&mapping->base, mapping->virtual_bytes, granularity, 0, 0),
+                     "cuMemAddressReserve");
+        for (const VirtualDeviceSegment& segment : placement.segments) {
+            if (segment.device < 0 || segment.device >= static_cast<int>(kVirtualStorageDevices) ||
+                segment.bytes == 0 || segment.virtual_offset % granularity != 0 ||
+                segment.bytes % granularity != 0 ||
+                segment.virtual_offset > mapping->virtual_bytes ||
+                segment.bytes > mapping->virtual_bytes - segment.virtual_offset) {
+                throw ArtifactError("virtual materialization segment is not VMM-aligned");
+            }
+            for (const auto& mapped : mapping->segments) {
+                const auto begin = static_cast<std::uint64_t>(segment.virtual_offset);
+                const auto end = begin + segment.bytes;
+                const auto mapped_begin = static_cast<std::uint64_t>(mapped.virtual_offset);
+                const auto mapped_end = mapped_begin + mapped.bytes;
+                if (begin < mapped_end && mapped_begin < end) {
+                    throw ArtifactError("virtual materialization segments overlap");
+                }
+            }
+            prop.location.id = devices[static_cast<std::size_t>(segment.device)]->device;
+            MaterializedArtifact::VirtualMapping::Segment mapped;
+            mapped.virtual_offset = static_cast<std::size_t>(segment.virtual_offset);
+            mapped.bytes          = static_cast<std::size_t>(segment.bytes);
+            driver_check(cuMemCreate(&mapped.handle, mapped.bytes, &prop, 0), "cuMemCreate");
+            mapping->segments.push_back(mapped);
+            driver_check(cuMemMap(mapping->base + mapped.virtual_offset, mapped.bytes, 0,
+                                  mapped.handle, 0),
+                         "cuMemMap(segment)");
+        }
+        std::array<CUmemAccessDesc, kVirtualStorageDevices> access{};
+        for (int device = 0; device < static_cast<int>(kVirtualStorageDevices); ++device) {
+            access[static_cast<std::size_t>(device)].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access[static_cast<std::size_t>(device)].location.id =
+                devices[static_cast<std::size_t>(device)]->device;
+            access[static_cast<std::size_t>(device)].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            driver_check(cuMemSetAccess(mapping->base, mapping->virtual_bytes,
+                                        &access[static_cast<std::size_t>(device)], 1),
+                         "cuMemSetAccess");
+        }
+    } catch (...) {
+        throw;
+    }
+    return mapping;
+}
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const { return device_data(handle, 0); }
 
 void* MaterializedArtifact::device_data(ObjectHandle handle, int device) const {
@@ -149,13 +264,16 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (int index = 0; index < device_count; ++index) {
         const auto slot              = static_cast<std::size_t>(index);
         out.physical_devices_[slot]  = devices[slot]->device;
-        const std::uint64_t capacity = plan.device_capacity_bytes[slot];
-        if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
+        const std::uint64_t capacity = plan.device_arena_capacity_bytes[slot];
+        if (capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
             throw ArtifactError("artifact tensor backing size is invalid");
         }
         CUDA_CHECK(cudaSetDevice(devices[slot]->device));
-        out.device_arena_[slot] = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
-        if (device_count > 1) {
+        if (capacity != 0) {
+            out.device_arena_[slot] =
+                std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+        }
+        if (device_count > 1 && out.device_arena_[slot] != nullptr) {
             // A shard's plane offsets are recomputed for its own row/column count, so the
             // alignment gaps between its planes are not covered by any copy. The layouts define
             // those gap bytes as zero; make them so rather than leaving allocator residue.
@@ -169,15 +287,17 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                                        static_cast<std::size_t>(capacity),
                                        devices[slot]->load_stream));
         }
-        out.stats_.per_device_capacity_bytes[slot] = capacity;
+        out.stats_.per_device_capacity_bytes[slot] = plan.device_capacity_bytes[slot];
         out.stats_.device_capacity_bytes =
-            checked_add(out.stats_.device_capacity_bytes, capacity, "device capacity overflows u64");
+            checked_add(out.stats_.device_capacity_bytes, plan.device_capacity_bytes[slot],
+                        "device capacity overflows u64");
     }
     // One placement per (object, device); every device tensor has a device-0 placement, so
     // counting those keeps `tensor_count` the number of distinct tensors at any tp.
     out.stats_.tensor_count = static_cast<std::size_t>(
         std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
                       [](const DeviceMaterialization& placement) { return placement.device == 0; }));
+    out.stats_.tensor_count += plan.virtual_objects.size();
     out.stats_.resource_count = plan.host_objects.size();
 
     for (const HostMaterialization& placement : plan.host_objects) {
@@ -189,15 +309,71 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
     }
 
-    std::size_t range_count = 0;
-    for (const DeviceMaterialization& placement : plan.device_objects) {
-        range_count += placement.copies.empty() ? 1 : placement.copies.size();
-    }
     std::vector<CopyRange> ranges;
-    ranges.reserve(range_count);
     std::uint64_t copied         = 0;
     std::uint64_t last_published = 0;
     std::uint64_t total          = 0;
+
+    // Virtual expert banks are mapped before any H2D ranges are built. The primary device sees
+    // one full-shape pointer with the original plane offsets; each physical plane slice is fed by
+    // its own device load stream, so the normal direct-I/O pipeline below remains unchanged.
+    if (!plan.virtual_objects.empty()) {
+        CUDA_CHECK(cudaSetDevice(devices[0]->device));
+    }
+    for (const VirtualDeviceMaterialization& placement : plan.virtual_objects) {
+        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        auto mapping = create_virtual_mapping(placement, devices);
+        const CUdeviceptr base = mapping->base;
+        auto& object = out.objects_.at(placement.object.index);
+        object.device[0]       = reinterpret_cast<void*>(base);
+        object.device_bytes[0] = placement.virtual_bytes;
+        object.device[1]       = reinterpret_cast<void*>(base);
+        object.device_bytes[1] = placement.virtual_bytes;
+        for (const VirtualDeviceSegment& segment : placement.segments) {
+            if (segment.device < 0 || segment.device >= static_cast<int>(kVirtualStorageDevices) ||
+                segment.bytes == 0 || segment.virtual_offset > placement.virtual_bytes ||
+                segment.bytes > placement.virtual_bytes - segment.virtual_offset) {
+                throw ArtifactError("virtual materialization segment exceeds its payload");
+            }
+            const auto slot = static_cast<std::size_t>(segment.device);
+            auto* const destination_base =
+                reinterpret_cast<std::byte*>(base + segment.virtual_offset);
+            if (!segment.prefix.empty()) {
+                if (segment.prefix.size() > segment.bytes) {
+                    throw ArtifactError("virtual materialization prefix exceeds its allocation");
+                }
+                CUDA_CHECK(cudaSetDevice(devices[slot]->device));
+                CUDA_CHECK(cudaMemcpyAsync(destination_base, segment.prefix.data(),
+                                            segment.prefix.size(), cudaMemcpyHostToDevice,
+                                            devices[slot]->load_stream));
+            }
+            for (const PlaneCopy& copy : segment.copies) {
+                if (copy.source_offset > payload.data.size() ||
+                    payload.data.size() - copy.source_offset < copy.bytes ||
+                    copy.dest_offset > segment.bytes ||
+                    segment.bytes - copy.dest_offset < copy.bytes) {
+                    throw ArtifactError("virtual materialization range exceeds its payload");
+                }
+                ranges.push_back(CopyRange{
+                    .source_begin = checked_add(payload.absolute_offset, copy.source_offset,
+                                                "artifact tensor source range overflows u64"),
+                    .source_end = checked_add(payload.absolute_offset + copy.source_offset,
+                                              copy.bytes,
+                                              "artifact tensor source range overflows u64"),
+                    .destination = destination_base + copy.dest_offset,
+                    .device = segment.device,
+                });
+                total = checked_add(total, copy.bytes, "artifact tensor byte count overflows u64");
+            }
+        }
+        out.virtual_mappings_.push_back(std::move(mapping));
+    }
+
+    std::size_t range_count = ranges.size();
+    for (const DeviceMaterialization& placement : plan.device_objects) {
+        range_count += placement.copies.empty() ? 1 : placement.copies.size();
+    }
+    ranges.reserve(range_count);
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         const auto slot           = static_cast<std::size_t>(placement.device);
@@ -407,8 +583,17 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                                  ExecutionContext& execution, LoadProgress* progress) {
     std::array<DeviceContext*, kMaximumDevices> devices{};
     std::size_t count = 0;
-    for (auto& slot : execution.dev) {
-        if (slot.has_value()) { devices[count++] = &slot.value(); }
+    for (int rank = 0; rank < execution.tp; ++rank) {
+        if (count >= kMaximumDevices) {
+            throw ArtifactError("artifact materialization supports at most two execution devices");
+        }
+        devices[count++] = &*execution.dev[static_cast<std::size_t>(rank)];
+    }
+    if (execution.has_storage()) {
+        if (count >= kMaximumDevices) {
+            throw ArtifactError("artifact materialization supports at most two devices");
+        }
+        devices[count++] = &*execution.storage;
     }
     return materialize(reader, plan, std::span<DeviceContext* const>(devices.data(), count),
                        progress);

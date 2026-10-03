@@ -3,6 +3,7 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/yarn_rope.h"
+#include "targets/qwen3_6/impl/runtime/ram_kv_selection.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
@@ -225,8 +226,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 } // namespace
 
 PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
-                         const SequencePlanImpl& plan)
-    : device(peer_device), model(peer_model), persistent(plan.persistent.bytes),
+                         const SequencePlanImpl& plan, int rank_in)
+    : rank(rank_in), device(peer_device), model(peer_model), persistent(plan.persistent.bytes),
       workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}) {
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
@@ -241,12 +242,12 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
 }
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
-                                 const LoadedModelData* peer_model, const SequencePlanImpl& plan,
+                                 std::span<const LoadedModelData* const> peer_models, const SequencePlanImpl& plan,
                                  ExecutionContext& execution_in)
     : model(model_in), execution(execution_in), device(execution_in.primary()), tp(execution_in.tp),
       capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      draft_window(plan.draft_window), ram_kv(plan.ram_kv), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -289,32 +290,24 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (model.dflash.has_value() && model.vision.has_value()) {
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
-    if ((tp == 2) != (peer_model != nullptr) || (tp == 2) != (plan.tp == 2)) {
+    if (tp != plan.tp || peer_models.size() != static_cast<std::size_t>(tp - 1)) {
         throw std::invalid_argument("Qwen3.6 program tensor-parallel width is inconsistent");
     }
-    if (tp == 2) {
-        if (!execution.dev[1].has_value()) {
-            throw std::invalid_argument("tensor-parallel program requires two device contexts");
+    peers.reserve(tp - 1);
+    for (int rank = 1; rank < tp; ++rank) {
+        if (!execution.dev[rank] || peer_models[rank - 1] == nullptr) {
+            throw std::invalid_argument("tensor-parallel program requires every rank's model and device");
         }
-        // Peer arenas must be allocated with the peer device current. cudaMalloc is not
-        // stream-ordered and not capturable, so this happens once, here, and never in a hot path.
-        int previous = 0;
-        CUDA_CHECK(cudaGetDevice(&previous));
-        CUDA_CHECK(cudaSetDevice(execution.dev[1]->device));
-        try {
-            peer.emplace(*execution.dev[1], *peer_model, plan);
-        } catch (...) {
-            (void)cudaSetDevice(previous);
-            throw;
-        }
-        CUDA_CHECK(cudaSetDevice(previous));
-        (void)ops::enable_peer_access(execution);
-        peer_events.emplace(execution);
+        const ScopedDevice scope(execution.dev[rank]->device);
+        peers.push_back(std::make_unique<PeerRuntime>(
+            *execution.dev[rank], *peer_models[rank - 1], plan, rank));
         if (plan.use_cuda_graph) {
-            // Created once, here, for the same reason PeerEvents is: cudaEventCreate is not
-            // capturable, and the fork/join pair must outlive every capture.
-            graph_bridge.emplace(execution.dev[0]->device, execution.dev[1]->device);
+            peers.back()->graph_bridge.emplace(device.device, execution.dev[rank]->device);
         }
+    }
+    if (tp > 1) {
+        const bool direct_peer_access = ops::enable_peer_access(execution);
+        peer_events.emplace(execution, direct_peer_access);
     }
     if (rope_mode == RopeMode::Yarn) {
         // ONE resident 32-float corrected inverse-frequency table PER DEVICE, uploaded once, here.
@@ -399,11 +392,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             sizeof(qwen3_6::OrdinaryDecodeIngress));
         *ordinary_host_ingress = {};
         *ordinary_host_egress  = {};
-        if (peer) {
-            ordinary_peer_host.emplace(sizeof(qwen3_6::OrdinaryDecodeIngress));
-            ordinary_peer_host_ingress =
-                static_cast<qwen3_6::OrdinaryDecodeIngress*>(ordinary_peer_host->data());
-            *ordinary_peer_host_ingress = {};
+        for (auto& peer : peers) {
+            peer->ordinary_host.emplace(sizeof(qwen3_6::OrdinaryDecodeIngress));
+            peer->ordinary_host_ingress =
+                static_cast<qwen3_6::OrdinaryDecodeIngress*>(peer->ordinary_host->data());
+            *peer->ordinary_host_ingress = {};
         }
     }
     if (mtp_host) {
@@ -412,11 +405,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             static_cast<unsigned char*>(mtp_host->data()) + sizeof(qwen3_6::MtpDecodeIngress));
         *mtp_host_ingress = {};
         *mtp_host_egress  = {};
-        if (peer) {
-            mtp_peer_host.emplace(sizeof(qwen3_6::MtpDecodeIngress));
-            mtp_peer_host_ingress =
-                static_cast<qwen3_6::MtpDecodeIngress*>(mtp_peer_host->data());
-            *mtp_peer_host_ingress = {};
+        for (auto& peer : peers) {
+            peer->mtp_host.emplace(sizeof(qwen3_6::MtpDecodeIngress));
+            peer->mtp_host_ingress =
+                static_cast<qwen3_6::MtpDecodeIngress*>(peer->mtp_host->data());
+            *peer->mtp_host_ingress = {};
         }
     }
     if (dflash_host) {
@@ -426,11 +419,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             sizeof(qwen3_6::DFlashDecodeIngress));
         *dflash_host_ingress = {};
         *dflash_host_egress  = {};
-        if (peer) {
-            dflash_peer_host.emplace(sizeof(qwen3_6::DFlashDecodeIngress));
-            dflash_peer_host_ingress =
-                static_cast<qwen3_6::DFlashDecodeIngress*>(dflash_peer_host->data());
-            *dflash_peer_host_ingress = {};
+        for (auto& peer : peers) {
+            peer->dflash_host.emplace(sizeof(qwen3_6::DFlashDecodeIngress));
+            peer->dflash_host_ingress =
+                static_cast<qwen3_6::DFlashDecodeIngress*>(peer->dflash_host->data());
+            *peer->dflash_host_ingress = {};
         }
     }
     if (io.dflash_prefill) {
@@ -444,7 +437,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
-    if (peer) {
+    for (auto& peer : peers) {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(peer->device.device));
@@ -456,10 +449,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         }
         CUDA_CHECK(cudaMemsetAsync(peer->token_counts.data, 0, peer->token_counts.bytes(),
                                    peer->device.stream));
-        set_peer_i32(peer->io.text_kv_table_row, 0);
-        set_peer_i32(peer->io.backend_kv_table_row, 0);
+        set_peer_i32(peer->io.text_kv_table_row, 0, peer->device);
+        set_peer_i32(peer->io.backend_kv_table_row, 0, peer->device);
         CUDA_CHECK(cudaSetDevice(previous));
-        peer_core.emplace(schedule::TpPeerCore{.execution        = &execution,
+        peer_cores[peer->rank - 1] = schedule::TpPeerCore{.execution        = &execution,
                                                .events           = &*peer_events,
                                                .device           = &peer->device,
                                                .model            = &peer->model,
@@ -472,10 +465,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                                .replay_records   = peer->replay_records
                                                                        ? &*peer->replay_records
                                                                        : nullptr,
-                                               .mtp_host_ingress = mtp_peer_host_ingress,
-                                               .dflash_host_ingress = dflash_peer_host_ingress,
-                                               .graph_bridge = graph_bridge ? &*graph_bridge
-                                                                            : nullptr});
+                                               .ordinary_host_ingress = peer->ordinary_host_ingress,
+                                               .mtp_host_ingress = peer->mtp_host_ingress,
+                                               .dflash_host_ingress = peer->dflash_host_ingress,
+                                               .graph_bridge = peer->graph_bridge ? &*peer->graph_bridge : nullptr};
         if (peer->replay_records.has_value() != replay_records.has_value()) {
             throw std::logic_error("peer ReplaySSM records do not match rank 0's");
         }
@@ -499,8 +492,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
 
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
-    if (peer && peer->device.stream != nullptr) {
-        (void)cudaStreamSynchronize(peer->device.stream);
+    for (auto& peer : peers) {
+        if (peer->device.stream != nullptr) { (void)cudaStreamSynchronize(peer->device.stream); }
     }
 }
 
@@ -738,7 +731,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
-            if (peer) {
+            for (auto& peer : peers) {
                 const ScopedDevice scope(peer->device.device);
                 peer->decoder->linear_attention.copy_slot(
                     LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
@@ -758,13 +751,27 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : backend_kv_cache() != nullptr ? prompt_tokens : 0U;
-        materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        if (ram_kv.gpu_tokens != 0) {
+            const auto ranking = qwen3_6::detail::rank_ram_kv_pages(prompt.token_ids,
+                                                                  prompt.retrieval_tokens);
+            sequence.kv->text.prefer_pages(ranking);
+            if (sequence.kv->backend) { sequence.kv->backend->prefer_pages(ranking); }
+            for (auto& peer : peers) {
+                sequence.kv->text_peers[peer->rank - 1]->prefer_pages(ranking);
+                if (sequence.kv->backend_peers[peer->rank - 1]) {
+                    sequence.kv->backend_peers[peer->rank - 1]->prefer_pages(ranking);
+                }
+            }
+            // Cold prefill materializes one execution unit at a time. A retained prefix may
+            // need cold pages reloaded when the query ranking changes, even without growth.
+            materialize_sequence_kv(sequence, base, backend_kv_valid(sequence));
+        } else { materialize_sequence_kv(sequence, prompt_tokens, backend_materialized); }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
-        if (peer) {
+        for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
-            set_peer_i32(peer->io.rope_delta, sequence.rope_delta);
+            set_peer_i32(peer->io.rope_delta, sequence.rope_delta, peer->device);
         }
 
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
@@ -934,7 +941,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         // the two records differ only in which heads and conv channels they cover. The shard
         // geometry FoldGeometry<48, 8, 24, 5120> this call resolves to is registered explicitly;
         // without that registration the fold would reject the peer's record shape outright.
-        if (peer) {
+        for (auto& peer : peers) {
             if (!peer->replay_records) {
                 throw std::logic_error("peer speculative round has no ReplaySSM records");
             }
@@ -997,17 +1004,17 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
         // Peer first, then rank 0 -- the same order every other tp2 handler uses, so that
         // `clear_lane` below cannot release KV pages rank 1's fold still references.
-        if (peer) { peer->device.synchronize(); }
+        for (auto& peer : peers) { peer->device.synchronize(); }
         device.synchronize();
         work.reset();
-        if (peer) { peer->work.reset(); }
+        for (auto& peer : peers) { peer->work.reset(); }
     } catch (...) {
         try {
-            if (peer) { peer->device.synchronize(); }
+            for (auto& peer : peers) { peer->device.synchronize(); }
             device.synchronize();
         } catch (...) {}
         work.reset();
-        if (peer) { peer->work.reset(); }
+        for (auto& peer : peers) { peer->work.reset(); }
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
@@ -1164,7 +1171,7 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
     SequenceKVBundle bundle;
     bundle.text = std::move(allocations[0]);
     if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
-    if (peer) {
+    for (auto& peer : peers) {
         // Same pool geometry, same call order, same entitlement: rank 1's reservation takes the
         // same page ids, so the two block tables agree without ever being compared. The MTP pool
         // rides the SAME bundle call as the text pool, so its page ids match rank 0's too.
@@ -1185,8 +1192,8 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         }
         std::vector<PagedKVAllocation> peer_allocations = reserve_paged_kv_bundle(
             std::span<const PagedKVReservation>(peer_reservations.data(), peer_count));
-        bundle.text_peer.emplace(std::move(peer_allocations[0]));
-        if (peer_count == 2) { bundle.backend_peer.emplace(std::move(peer_allocations[1])); }
+        bundle.text_peers[peer->rank - 1].emplace(std::move(peer_allocations[0]));
+        if (peer_count == 2) { bundle.backend_peers[peer->rank - 1].emplace(std::move(peer_allocations[1])); }
     }
     sequence.kv.emplace(std::move(bundle));
 }
@@ -1213,17 +1220,17 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
         };
     }
     resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
-    if (sequence.kv->text_peer) {
+    for (auto& peer : peers) {
         std::array<PagedKVResize, 2> peer_changes{};
         std::size_t peer_count = 0;
         peer_changes[peer_count++] =
-            PagedKVResize{.allocation       = &*sequence.kv->text_peer,
-                          .mapped_pages     = sequence.kv->text_peer->mapped_page_count(),
+            PagedKVResize{.allocation       = &*sequence.kv->text_peers[peer->rank - 1],
+                          .mapped_pages     = sequence.kv->text_peers[peer->rank - 1]->mapped_page_count(),
                           .page_entitlement = text_pages};
-        if (sequence.kv->backend_peer) {
+        if (sequence.kv->backend_peers[peer->rank - 1]) {
             peer_changes[peer_count++] =
-                PagedKVResize{.allocation   = &*sequence.kv->backend_peer,
-                              .mapped_pages = sequence.kv->backend_peer->mapped_page_count(),
+                PagedKVResize{.allocation   = &*sequence.kv->backend_peers[peer->rank - 1],
+                              .mapped_pages = sequence.kv->backend_peers[peer->rank - 1]->mapped_page_count(),
                               .page_entitlement = backend_pages};
         }
         resize_paged_kv_bundle(std::span<PagedKVResize>(peer_changes.data(), peer_count));
@@ -1239,25 +1246,25 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     sequence.kv->text.bind_row(row, device.stream);
     try {
         if (sequence.kv->backend) { sequence.kv->backend->bind_row(row, device.stream); }
-        if (sequence.kv->text_peer) {
+        for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
-            sequence.kv->text_peer->bind_row(row, peer->device.stream);
-            set_peer_i32(peer->io.text_kv_table_row, sequence.kv->text_peer->bound_row());
-            if (sequence.kv->backend_peer) {
-                sequence.kv->backend_peer->bind_row(row, peer->device.stream);
+            sequence.kv->text_peers[peer->rank - 1]->bind_row(row, peer->device.stream);
+            set_peer_i32(peer->io.text_kv_table_row, sequence.kv->text_peers[peer->rank - 1]->bound_row(), peer->device);
+            if (sequence.kv->backend_peers[peer->rank - 1]) {
+                sequence.kv->backend_peers[peer->rank - 1]->bind_row(row, peer->device.stream);
             }
             set_peer_i32(peer->io.backend_kv_table_row,
-                         sequence.kv->backend_peer ? sequence.kv->backend_peer->bound_row() : 0);
+                         sequence.kv->backend_peers[peer->rank - 1] ? sequence.kv->backend_peers[peer->rank - 1]->bound_row() : 0, peer->device);
         }
         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
     } catch (...) {
-        if (sequence.kv->backend_peer && sequence.kv->backend_peer->bound_row() >= 0) {
-            sequence.kv->backend_peer->unbind_row();
-        }
-        if (sequence.kv->text_peer && sequence.kv->text_peer->bound_row() >= 0) {
-            sequence.kv->text_peer->unbind_row();
+        for (auto& peer : peers) {
+            auto& backend = sequence.kv->backend_peers[peer->rank - 1];
+            auto& text = sequence.kv->text_peers[peer->rank - 1];
+            if (backend && backend->bound_row() >= 0) { backend->unbind_row(); }
+            if (text && text->bound_row() >= 0) { text->unbind_row(); }
         }
         if (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) {
             sequence.kv->backend->unbind_row();
@@ -1269,8 +1276,11 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
 
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
-    if (sequence.kv->backend_peer) { sequence.kv->backend_peer->unbind_row(); }
-    if (sequence.kv->text_peer) { sequence.kv->text_peer->unbind_row(); }
+    for (auto& peer : peers) {
+        auto& backend = sequence.kv->backend_peers[peer->rank - 1];
+        if (backend) { backend->unbind_row(); }
+    }
+    for (auto& peer : peers) { sequence.kv->text_peers[peer->rank - 1]->unbind_row(); }
     if (sequence.kv->backend) { sequence.kv->backend->unbind_row(); }
     sequence.kv->text.unbind_row();
 }
@@ -1283,18 +1293,24 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    if (main_tokens > sequence.kv->text.mapped_token_capacity()) {
-        sequence.kv->text.materialize_tokens(main_tokens, device.stream);
-        if (sequence.kv->text_peer) {
+    if (ram_kv.gpu_tokens != 0 || main_tokens > sequence.kv->text.mapped_token_capacity()) {
+        sequence.kv->text.materialize_tokens(std::min(capacity,
+            std::max(main_tokens, sequence.kv->text.mapped_token_capacity())), device.stream);
+        for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
-            sequence.kv->text_peer->materialize_tokens(main_tokens, peer->device.stream);
+            sequence.kv->text_peers[peer->rank - 1]->materialize_tokens(
+                std::min(capacity, std::max(main_tokens,
+                    sequence.kv->text_peers[peer->rank - 1]->mapped_token_capacity())), peer->device.stream);
         }
     }
-    if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
-        sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
-        if (sequence.kv->backend_peer) {
+    if (backend_tokens != 0 && (ram_kv.gpu_tokens != 0 ||
+                               backend_tokens > sequence.kv->backend->mapped_token_capacity())) {
+        sequence.kv->backend->materialize_tokens(std::min(capacity, std::max(backend_tokens,
+            sequence.kv->backend->mapped_token_capacity())), device.stream);
+        for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
-            sequence.kv->backend_peer->materialize_tokens(backend_tokens, peer->device.stream);
+            sequence.kv->backend_peers[peer->rank - 1]->materialize_tokens(std::min(capacity,
+                std::max(backend_tokens, sequence.kv->backend_peers[peer->rank - 1]->mapped_token_capacity())), peer->device.stream);
         }
     }
 }
@@ -1308,17 +1324,23 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
         throw std::logic_error("backend KV trim requested without an allocation");
     }
     sequence.kv->text.trim_tokens(main_tokens);
-    if (sequence.kv->text_peer) { sequence.kv->text_peer->trim_tokens(main_tokens); }
+    for (auto& peer : peers) { sequence.kv->text_peers[peer->rank - 1]->trim_tokens(main_tokens); }
     if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
-    if (sequence.kv->backend_peer) { sequence.kv->backend_peer->trim_tokens(backend_tokens); }
+    for (auto& peer : peers) {
+        auto& backend = sequence.kv->backend_peers[peer->rank - 1];
+        if (backend) { backend->trim_tokens(backend_tokens); }
+    }
 }
 
 void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     sequence.kv->text.cancel_unmapped_entitlement();
-    if (sequence.kv->text_peer) { sequence.kv->text_peer->cancel_unmapped_entitlement(); }
+    for (auto& peer : peers) { sequence.kv->text_peers[peer->rank - 1]->cancel_unmapped_entitlement(); }
     if (sequence.kv->backend) { sequence.kv->backend->cancel_unmapped_entitlement(); }
-    if (sequence.kv->backend_peer) { sequence.kv->backend_peer->cancel_unmapped_entitlement(); }
+    for (auto& peer : peers) {
+        auto& backend = sequence.kv->backend_peers[peer->rank - 1];
+        if (backend) { backend->cancel_unmapped_entitlement(); }
+    }
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequence) const {
@@ -1334,13 +1356,19 @@ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequ
     return decoder->mtp_cache()->execution_view(*sequence.kv->backend);
 }
 
-qwen3_6::PagedKVCacheView
-ProgramImplCore::mtp_kv_view_peer(const SequenceState& sequence) const {
-    if (speculative_backend != SpeculativeBackend::Mtp || !peer) { return {}; }
-    if (peer->decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend_peer) {
-        throw std::logic_error("sequence has no peer MTP KV allocation");
+std::array<qwen3_6::PagedKVCacheView, kMaximumExecutionDevices - 1>
+ProgramImplCore::mtp_kv_views_peer(const SequenceState& sequence) const {
+    std::array<qwen3_6::PagedKVCacheView, kMaximumExecutionDevices - 1> out{};
+    if (speculative_backend != SpeculativeBackend::Mtp) { return out; }
+    for (const auto& peer : peers) {
+        const auto index = peer->rank - 1;
+        if (peer->decoder->mtp_cache() == nullptr || !sequence.kv ||
+            !sequence.kv->backend_peers[index]) {
+            throw std::logic_error("sequence has no peer MTP KV allocation");
+        }
+        out[index] = peer->decoder->mtp_cache()->execution_view(*sequence.kv->backend_peers[index]);
     }
-    return peer->decoder->mtp_cache()->execution_view(*sequence.kv->backend_peer);
+    return out;
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -1348,23 +1376,23 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
         cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
 }
 
-void ProgramImplCore::set_peer_i32(Tensor& tensor, std::int32_t value) {
+void ProgramImplCore::set_peer_i32(Tensor& tensor, std::int32_t value, DeviceContext& rank_device) {
     CUDA_CHECK(cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice,
-                               peer->device.stream));
+                               rank_device.stream));
 }
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     decoder->linear_attention.zero_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
-    if (peer) {
+    for (auto& peer : peers) {
         const ScopedDevice scope(peer->device.device);
         peer->decoder->linear_attention.zero_slot(
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
             peer->device.stream);
         peer->work.reset();
-        set_peer_i32(peer->io.pos, 0);
-        set_peer_i32(peer->io.rope_pos, 0);
-        set_peer_i32(peer->io.rope_delta, 0);
+        set_peer_i32(peer->io.pos, 0, peer->device);
+        set_peer_i32(peer->io.rope_pos, 0, peer->device);
+        set_peer_i32(peer->io.rope_delta, 0, peer->device);
     }
     work.reset();
     set_device_i32(io.pos, 0);
@@ -1385,19 +1413,20 @@ void ProgramImplCore::prepare_graphs() {
     // tables, same zeroed state. `on_peer` is the one place that establishes the peer device as
     // current; the mirrors below never touch the current device themselves.
     const auto on_peer = [&](auto&& body) {
-        if (!peer) { return; }
-        const ScopedDevice scope(peer->device.device);
-        body(*peer);
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            body(*peer);
+        }
     };
     const auto synchronize_all = [&] {
-        if (peer) { peer->device.synchronize(); }
+        for (auto& peer : peers) { peer->device.synchronize(); }
         device.synchronize();
     };
 
     std::vector<PagedKVAllocation> text_capture_allocations;
-    std::vector<PagedKVAllocation> peer_text_capture_allocations;
+    std::array<std::vector<PagedKVAllocation>, kMaximumExecutionDevices - 1> peer_text_capture_allocations;
     std::vector<PagedKVAllocation> mtp_capture_allocations;
-    std::vector<PagedKVAllocation> peer_mtp_capture_allocations;
+    std::array<std::vector<PagedKVAllocation>, kMaximumExecutionDevices - 1> peer_mtp_capture_allocations;
     std::vector<PagedKVAllocation> dflash_capture_allocations;
     const auto reserve_rows_in = [&](qwen3_6::PagedKVCache& cache,
                                      std::vector<PagedKVAllocation>& allocations,
@@ -1422,6 +1451,16 @@ void ProgramImplCore::prepare_graphs() {
             Tensor table = pool.block_table_row(static_cast<std::int32_t>(row));
             CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
                                        cudaMemcpyHostToDevice, stream));
+            if (pool.ram_enabled()) {
+                std::vector<std::int32_t> indices(pool.logical_page_capacity());
+                for (std::size_t p = 0; p < indices.size(); ++p) {
+                    indices[p] = static_cast<std::int32_t>(p % pool.page_group_count());
+                }
+                CUDA_CHECK(cudaMemcpyAsync(pool.read_indices().data, indices.data(),
+                                           indices.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(pool.read_tables().data, repeated.data(),
+                                           repeated.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+            }
         }
     };
     const auto reserve_capture_rows = [&](qwen3_6::PagedKVCache& cache,
@@ -1434,13 +1473,13 @@ void ProgramImplCore::prepare_graphs() {
     // the two allocations take the same page ids and publish identical block tables -- the same
     // by-construction lockstep the live KV bundle relies on.
     on_peer([&](PeerRuntime& p) {
-        reserve_rows_in(p.decoder->text_kv, peer_text_capture_allocations, p.device.stream,
+        reserve_rows_in(p.decoder->text_kv, peer_text_capture_allocations[p.rank - 1], p.device.stream,
                         "peer target KV cache");
     });
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
         on_peer([&](PeerRuntime& p) {
-            reserve_rows_in(*p.decoder->mtp_cache(), peer_mtp_capture_allocations, p.device.stream,
+            reserve_rows_in(*p.decoder->mtp_cache(), peer_mtp_capture_allocations[p.rank - 1], p.device.stream,
                             "peer MTP KV cache");
         });
     } else if (speculative_backend == SpeculativeBackend::DFlash && dflash->full) {
@@ -1458,9 +1497,9 @@ void ProgramImplCore::prepare_graphs() {
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         return free;
     };
-    std::array<std::size_t, 2> free_before{0, 0};
+    std::array<std::size_t, kMaximumExecutionDevices> free_before{0, 0};
     free_before[0] = free_device_bytes();
-    on_peer([&](PeerRuntime&) { free_before[1] = free_device_bytes(); });
+    on_peer([&](PeerRuntime& p) { free_before[p.rank] = free_device_bytes(); });
 
     const auto clear_stable_controls = [&] {
         std::vector<Tensor> controls{
@@ -1514,9 +1553,9 @@ void ProgramImplCore::prepare_graphs() {
                 }
                 cache.pool().zero_pages(pages, p.device.stream);
             };
-            zero_pool(p.decoder->text_kv, peer_text_capture_allocations);
+            zero_pool(p.decoder->text_kv, peer_text_capture_allocations[p.rank - 1]);
             if (p.decoder->mtp_cache() != nullptr) {
-                zero_pool(*p.decoder->mtp_cache(), peer_mtp_capture_allocations);
+                zero_pool(*p.decoder->mtp_cache(), peer_mtp_capture_allocations[p.rank - 1]);
             }
         });
     };
@@ -1564,9 +1603,9 @@ void ProgramImplCore::prepare_graphs() {
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
         on_peer([&](PeerRuntime& p) {
-            set_peer_i32(p.io.pos, checked_i32(frontier, "peer graph representative position"));
+            set_peer_i32(p.io.pos, checked_i32(frontier, "peer graph representative position"), p.device);
             set_peer_i32(p.io.rope_pos,
-                         checked_i32(frontier, "peer graph representative rope position"));
+                         checked_i32(frontier, "peer graph representative rope position"), p.device);
         });
         if (io.mtp) {
             set_device_i32(io.mtp->position,
@@ -1575,7 +1614,7 @@ void ProgramImplCore::prepare_graphs() {
         on_peer([&](PeerRuntime& p) {
             if (p.io.mtp) {
                 set_peer_i32(p.io.mtp->position,
-                             checked_i32(frontier, "peer graph representative MTP position"));
+                             checked_i32(frontier, "peer graph representative MTP position"), p.device);
             }
         });
         if (io.dflash_decode) {
@@ -1596,9 +1635,9 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(row);
                 dflash_host_ingress->sampling[row]             = {};
             }
-            if (dflash_peer_host_ingress != nullptr) {
-                *dflash_peer_host_ingress = *dflash_host_ingress;
-            }
+            for (auto& peer : peers) { if (peer->dflash_host_ingress != nullptr) {
+                *peer->dflash_host_ingress = *dflash_host_ingress;
+            } }
         }
         if (io.mtp_decode) {
             *mtp_host_ingress          = {};
@@ -1631,7 +1670,7 @@ void ProgramImplCore::prepare_graphs() {
             // The representative's sampling configs are zeroed, so its counter pointers are null
             // and the peer copy is a plain mirror -- but it still has to exist, because the
             // captured graph bakes in the peer ingress's host ADDRESS and reads it at replay.
-            if (mtp_peer_host_ingress != nullptr) { *mtp_peer_host_ingress = *mtp_host_ingress; }
+            for (auto& peer : peers) { if (peer->mtp_host_ingress != nullptr) { *peer->mtp_host_ingress = *mtp_host_ingress; } }
         }
         if (io.ordinary) {
             *ordinary_host_ingress = {};
@@ -1663,7 +1702,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_chunk,
                                        proposal_head,
                                        rope_frequency,
-                                       peer_core ? &*peer_core : nullptr};
+                                       peer_views()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1675,8 +1714,7 @@ void ProgramImplCore::prepare_graphs() {
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
                                                       *ordinary_host_egress,
-                                                      tail_hidden_store,
-                                                      ordinary_peer_host_ingress};
+                                                      tail_hidden_store};
         // One eager pass first, so every kernel's module is already loaded when capture runs: a
         // lazily loaded module inside a capture region is not capturable, and at tp2 that surface
         // exists on BOTH devices.
@@ -1687,7 +1725,7 @@ void ProgramImplCore::prepare_graphs() {
                                         nullptr);
         synchronize_all();
 
-        if (tp == 2) {
+        if (tp > 1) {
             // Batch shape selects kernels, and a module first touched INSIDE a capture region
             // cannot be loaded there. At tp1 the code-warm pass above has always been enough in
             // practice (with one observed allowance flake, documented, consistent with a late
@@ -1729,18 +1767,12 @@ void ProgramImplCore::prepare_graphs() {
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
             *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = planned_profiles.front();
-        prepare_representative(code_warm.min, 1);
-        synchronize_all();
-        schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                   nullptr);
-        synchronize_all();
-        if (tp == 2) {
-            // Same reason as the ordinary family's tp2 warm loop: batch shape selects kernels and
-            // a module first touched inside a capture region cannot be loaded there, and at tp2
-            // that surface exists on two devices, both checked against the same per-device
-            // graph allowance.
-            for (std::uint32_t batch_size = 2; batch_size <= max_concurrency; ++batch_size) {
+        // Greedy verification exchanges shard winners; sampling exchanges full logits. Warm
+        // both topologies, including TP2 batch-shape module selection, before capturing either.
+        for (bool greedy_target : {false, true}) {
+            mtp_state.greedy_target = greedy_target;
+            const std::uint32_t warm_batches = tp > 1 ? max_concurrency : 1U;
+            for (std::uint32_t batch_size = 1; batch_size <= warm_batches; ++batch_size) {
                 prepare_representative(code_warm.min, batch_size);
                 synchronize_all();
                 schedule::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
@@ -1752,19 +1784,25 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                mtp_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                schedule::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency * 2U);
+        for (bool greedy_target : {false, true}) {
+            mtp_state.greedy_target = greedy_target;
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    mtp_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.greedy_target          = greedy_target;
+                    profile.topology_class =
+                        (planned.topology_class * 2U + (greedy_target ? 1U : 0U)) *
+                            max_concurrency +
+                        (batch_size - 1U);
+                    schedule::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+                }
             }
         }
     }
@@ -1892,12 +1930,12 @@ void ProgramImplCore::prepare_graphs() {
     });
     synchronize_all();
 
-    std::array<std::size_t, 2> free_after{0, 0};
+    std::array<std::size_t, kMaximumExecutionDevices> free_after{0, 0};
     free_after[0] = free_device_bytes();
-    on_peer([&](PeerRuntime&) { free_after[1] = free_device_bytes(); });
+    on_peer([&](PeerRuntime& p) { free_after[p.rank] = free_device_bytes(); });
     // The allowance is a per-device budget, so each device is checked against it separately
     // rather than against a doubled or summed figure.
-    const int ranks = peer ? 2 : 1;
+    const int ranks = tp;
     for (int rank = 0; rank < ranks; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         const std::size_t consumed =
@@ -1906,7 +1944,7 @@ void ProgramImplCore::prepare_graphs() {
         if (consumed > graph_allowance_bytes) {
             throw std::runtime_error(
                 "CUDA Graph preparation consumed " + std::to_string(consumed) +
-                " bytes on device " + std::to_string(rank == 0 ? device.device : peer->device.device) +
+                " bytes on device " + std::to_string(execution.dev[rank]->device) +
                 ", exceeding the planned per-device allowance of " +
                 std::to_string(graph_allowance_bytes) + " bytes");
         }
@@ -1915,16 +1953,20 @@ void ProgramImplCore::prepare_graphs() {
     dflash_capture_allocations.clear();
     for (PagedKVAllocation& allocation : mtp_capture_allocations) { allocation.unbind_row(); }
     mtp_capture_allocations.clear();
-    on_peer([&](PeerRuntime&) {
-        for (PagedKVAllocation& allocation : peer_mtp_capture_allocations) {
+    on_peer([&](PeerRuntime& p) {
+        for (PagedKVAllocation& allocation : peer_mtp_capture_allocations[p.rank - 1]) {
             allocation.unbind_row();
         }
-        peer_mtp_capture_allocations.clear();
+        peer_mtp_capture_allocations[p.rank - 1].clear();
     });
     for (PagedKVAllocation& allocation : text_capture_allocations) { allocation.unbind_row(); }
     text_capture_allocations.clear();
-    for (PagedKVAllocation& allocation : peer_text_capture_allocations) { allocation.unbind_row(); }
-    peer_text_capture_allocations.clear();
+    on_peer([&](PeerRuntime& p) {
+        for (PagedKVAllocation& allocation : peer_text_capture_allocations[p.rank - 1]) {
+            allocation.unbind_row();
+        }
+        peer_text_capture_allocations[p.rank - 1].clear();
+    });
 }
 
 Tensor ProgramImplCore::token_counts_lane(const Tensor& storage, std::uint32_t lane) {
@@ -1932,12 +1974,13 @@ Tensor ProgramImplCore::token_counts_lane(const Tensor& storage, std::uint32_t l
 }
 
 void ProgramImplCore::publish_peer_token_counts(const SequenceState& sequence) {
-    if (!peer) { return; }
+    if (peers.empty()) { return; }
     // With penalties off the lane is never read on either rank (install_sampling leaves every
     // row's `token_counts` null), so the ~0.95 MiB peer copy per prefill is pure cost. Both lanes
     // were zeroed together in install_sampling, so skipping keeps them equal either way.
     if (requests[sequence.lane].sampling_host.token_counts == nullptr) { return; }
     const Tensor source = token_counts_lane(token_counts, sequence.lane);
+    for (auto& peer : peers) {
     const Tensor target = token_counts_lane(peer->token_counts, sequence.lane);
     // The one increment rank 0 performs and rank 1 does not: prefill's bonus token is sampled on
     // rank 0 alone (the output head is vocabulary-split and sampling belongs to rank 0).
@@ -1953,41 +1996,48 @@ void ProgramImplCore::publish_peer_token_counts(const SequenceState& sequence) {
     // means no future move of this code into a captured region reintroduces that failure.
     CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, source.bytes(), cudaMemcpyDeviceToDevice,
                                device.stream));
+    }
 }
 
 void ProgramImplCore::publish_peer_mtp_ingress(std::span<const std::uint32_t> lanes) {
-    if (mtp_peer_host_ingress == nullptr || mtp_host_ingress == nullptr) { return; }
-    *mtp_peer_host_ingress = *mtp_host_ingress;
+    for (auto& peer : peers) {
+    if (peer->mtp_host_ingress == nullptr || mtp_host_ingress == nullptr) { continue; }
+    *peer->mtp_host_ingress = *mtp_host_ingress;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
-        ops::SamplingConfig& sampling = mtp_peer_host_ingress->sampling[row];
+        ops::SamplingConfig& sampling = peer->mtp_host_ingress->sampling[row];
         if (sampling.token_counts == nullptr) { continue; }
         sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_lane(peer->token_counts, lanes[row]).data);
+    }
     }
 }
 
 void ProgramImplCore::publish_peer_dflash_ingress(std::span<const std::uint32_t> lanes) {
-    if (dflash_peer_host_ingress == nullptr || dflash_host_ingress == nullptr) { return; }
-    *dflash_peer_host_ingress = *dflash_host_ingress;
+    for (auto& peer : peers) {
+    if (peer->dflash_host_ingress == nullptr || dflash_host_ingress == nullptr) { continue; }
+    *peer->dflash_host_ingress = *dflash_host_ingress;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
-        ops::SamplingConfig& sampling = dflash_peer_host_ingress->sampling[row];
+        ops::SamplingConfig& sampling = peer->dflash_host_ingress->sampling[row];
         if (sampling.token_counts == nullptr) { continue; }
         sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_lane(peer->token_counts, lanes[row]).data);
     }
+    }
 }
 
 void ProgramImplCore::publish_peer_ordinary_ingress() {
-    if (ordinary_peer_host_ingress == nullptr || ordinary_host_ingress == nullptr) { return; }
-    *ordinary_peer_host_ingress = *ordinary_host_ingress;
+    for (auto& peer : peers) {
+    if (peer->ordinary_host_ingress == nullptr || ordinary_host_ingress == nullptr) { continue; }
+    *peer->ordinary_host_ingress = *ordinary_host_ingress;
     // Rank 1 mirrors the round for its half of the weights and never samples, so its copy of the
     // sampling configs is inert. The counter pointer is the one field that is a rank-0 DEVICE
     // address; it is nulled rather than repointed at rank 1's lane (as the MTP ingress does)
     // because nothing on rank 1 advances an ordinary-round counter -- a repointed lane would be a
     // counter that never moves, which is worse than an absent one. If a future change makes rank 1
     // sample in the ordinary round, repoint here exactly as publish_peer_mtp_ingress does.
-    for (ops::SamplingConfig& sampling : ordinary_peer_host_ingress->sampling) {
+    for (ops::SamplingConfig& sampling : peer->ordinary_host_ingress->sampling) {
         sampling.token_counts = nullptr;
+    }
     }
 }
 
@@ -1996,7 +2046,8 @@ void ProgramImplCore::enable_peer_egress_check(bool enabled) noexcept {
 }
 
 void ProgramImplCore::check_peer_mtp_egress(std::size_t rows) {
-    if (!peer_egress_check_enabled || !peer || mtp_host_egress == nullptr) { return; }
+    if (!peer_egress_check_enabled || peers.empty() || mtp_host_egress == nullptr) { return; }
+    for (auto& peer : peers) {
     if (!peer->io.mtp_decode.has_value()) { return; }
     qwen3_6::MtpDecodeEgress peer_egress{};
     {
@@ -2032,13 +2083,14 @@ void ProgramImplCore::check_peer_mtp_egress(std::size_t rows) {
     }
     peer_egress_rounds += 1;
     peer_egress_mismatches += mismatches;
+    }
 }
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts_lane(token_counts, sequence.lane);
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
-    if (peer) {
+    for (auto& peer : peers) {
         const ScopedDevice scope(peer->device.device);
         const Tensor peer_counts = token_counts_lane(peer->token_counts, sequence.lane);
         CUDA_CHECK(cudaMemsetAsync(peer_counts.data, 0, peer_counts.bytes(), peer->device.stream));
@@ -2189,13 +2241,20 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        if (ram_kv.gpu_tokens != 0 && staged.cursor < staged.prompt_tokens) {
+            const auto end = std::min(staged.prompt_tokens, staged.cursor + prefill_chunk);
+            const auto backend_end = staged.prepare_mtp ? std::min(capacity, end +
+                (end == staged.prompt_tokens && staged.initial_mtp_extent != 0
+                    ? staged.initial_mtp_extent - 1 : 0U)) : 0U;
+            materialize_sequence_kv(sequence, end, backend_end);
+        }
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_core ? &*peer_core : nullptr},
+             proposal_head, rope_frequency, peer_views()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
-            mtp_kv_view_peer(sequence),
+            mtp_kv_views_peer(sequence),
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
@@ -2393,7 +2452,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             // Retire BOTH devices before tearing the lane down: rank 1 may still have enqueued
             // work referencing the KV pages and GDN slots clear_lane is about to release. Same
             // order as the decode path's handler.
-            if (peer) { peer->device.synchronize(); }
+            for (auto& peer : peers) { peer->device.synchronize(); }
             device.synchronize();
         } catch (...) {}
         clear_lane(sequence, request);
@@ -2463,18 +2522,17 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_core ? &*peer_core : nullptr},
+             proposal_head, rope_frequency, peer_views()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            tail_hidden_store,
-            ordinary_peer_host_ingress};
+            tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
-        if (peer) { peer->device.synchronize(); }
+        for (auto& peer : peers) { peer->device.synchronize(); }
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -2502,7 +2560,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                lanes.size())};
     } catch (...) {
         try {
-            if (peer) { peer->device.synchronize(); }
+            for (auto& peer : peers) { peer->device.synchronize(); }
             device.synchronize();
         } catch (...) {}
         for (const std::uint32_t lane : lanes) {
@@ -2550,13 +2608,17 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const auto started = Clock::now();
     try {
+        const bool greedy_target = std::all_of(
+            lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+                return !(requests[lane].sampling_host.temperature > 0.0F);
+            });
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "MTP batch");
+                                     maximum_frontier, "MTP batch", greedy_target);
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
             envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
         }
@@ -2600,13 +2662,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
                                                   rope_frequency,
-                                                  peer_core ? &*peer_core : nullptr},
+                                                  peer_views()},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 tail_hidden_store};
+                                                 tail_hidden_store,
+                                                 greedy_target};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -2614,7 +2677,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         // Peer first, then rank 0: rank 1's stream carries the round's own work eagerly and the
         // graph's rank-1 nodes when captured, and the egress read below must not observe a round
         // rank 1 has not finished contributing to.
-        if (peer) { peer->device.synchronize(); }
+        for (auto& peer : peers) { peer->device.synchronize(); }
         device.synchronize();
         check_peer_mtp_egress(lanes.size());
 
@@ -2670,7 +2733,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             .row_stride = width};
     } catch (...) {
         try {
-            if (peer) { peer->device.synchronize(); }
+            for (auto& peer : peers) { peer->device.synchronize(); }
             device.synchronize();
         } catch (...) {}
         for (const std::uint32_t lane : lanes) {
@@ -2778,7 +2841,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head, rope_frequency,
-                                                     peer_core ? &*peer_core : nullptr},
+                                                     peer_views()},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -2843,7 +2906,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             .row_stride = width};
     } catch (...) {
         try {
-            if (peer) { peer->device.synchronize(); }
+            for (auto& peer : peers) { peer->device.synchronize(); }
             device.synchronize();
         } catch (...) {}
         for (const std::uint32_t lane : lanes) {
@@ -2923,8 +2986,26 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes     = graph_allowance_bytes;
     out.cuda_graph_observed_bytes      = graph_observed_bytes[0];
     out.cuda_graph_peer_observed_bytes = graph_observed_bytes[1];
+    out.cuda_graph_rank_observed_bytes = graph_observed_bytes;
     out.cuda_graph_node_count          = graph_node_count;
     out.kv_payload_bytes               = kv_payload_bytes;
+    out.ram_kv_gpu_tokens              = ram_kv.gpu_tokens;
+    if (ram_kv.gpu_tokens != 0) {
+        out.ram_kv_archive_bytes = decoder->text_kv.pool().ram_archive_bytes();
+        if (decoder->mtp_cache()) { out.ram_kv_archive_bytes += decoder->mtp_cache()->pool().ram_archive_bytes(); }
+        out.ram_kv_archive_bytes *= tp;
+        for (const auto& sequence : sequences) {
+            if (!sequence.kv) { continue; }
+            out.ram_kv_transfer_bytes += sequence.kv->text.ram_transfer_bytes();
+            if (sequence.kv->backend) { out.ram_kv_transfer_bytes += sequence.kv->backend->ram_transfer_bytes(); }
+            for (const auto& peer : peers) {
+                out.ram_kv_transfer_bytes += sequence.kv->text_peers[peer->rank - 1]->ram_transfer_bytes();
+                if (sequence.kv->backend_peers[peer->rank - 1]) {
+                    out.ram_kv_transfer_bytes += sequence.kv->backend_peers[peer->rank - 1]->ram_transfer_bytes();
+                }
+            }
+        }
+    }
     out.gdn_state_bytes                = gdn_state_bytes;
     return out;
 }

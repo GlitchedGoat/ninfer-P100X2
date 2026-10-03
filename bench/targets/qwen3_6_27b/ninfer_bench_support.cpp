@@ -79,11 +79,15 @@ std::vector<int> parse_devices(std::string_view value) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (devices.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    if (devices.size() != 1 && devices.size() != 2 && devices.size() != 4) {
+        throw std::invalid_argument("--devices must list 1, 2 or 4 device ids");
     }
-    if (devices.size() == 2 && devices[0] == devices[1]) {
-        throw std::invalid_argument("--devices must list distinct device ids");
+    for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+        for (std::size_t previous = 0; previous < rank; ++previous) {
+            if (devices[previous] == devices[rank]) {
+                throw std::invalid_argument("--devices must list distinct device ids");
+            }
+        }
     }
     return devices;
 }
@@ -306,8 +310,8 @@ std::string usage_text(std::string_view program) {
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires speculation\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
-        << "  --tp <1|2>                  tensor-parallel width (default: 1)\n"
-        << "  --devices <id[,id]>         one CUDA device per rank; required for --tp 2\n"
+        << "  --tp <1|2|4>                tensor-parallel width (default: 1)\n"
+        << "  --devices <id,...>          one CUDA device per rank; required for parallel execution\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  --capture-generation        retain measured output IDs/text in JSON reports\n"
@@ -389,8 +393,8 @@ BenchOptions parse_args(int argc, char** argv) {
             device_explicit = true;
         } else if (arg == "--tp") {
             options.tp = parse_positive(value("--tp"), "tp");
-            if (options.tp != 1 && options.tp != 2) {
-                throw std::invalid_argument("--tp must be 1 or 2");
+            if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
+                throw std::invalid_argument("--tp must be 1, 2 or 4");
             }
         } else if (arg == "--devices") {
             options.devices = parse_devices(value("--devices"));
@@ -433,7 +437,7 @@ BenchOptions parse_args(int argc, char** argv) {
     } else if (options.tp == 1) {
         options.devices = {options.device};
     } else {
-        throw std::invalid_argument("--tp 2 requires --devices");
+        throw std::invalid_argument("parallel execution requires --devices");
     }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
@@ -784,6 +788,12 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
         << "    \"cuda_graph_observed_bytes\": " << env.memory.cuda_graph_observed_bytes << ",\n"
+        << "    \"cuda_graph_rank_observed_bytes\": [";
+    for (int rank = 0; rank < env.tp; ++rank) {
+        if (rank != 0) { out << ','; }
+        out << env.memory.cuda_graph_rank_observed_bytes[rank];
+    }
+    out << "],\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"

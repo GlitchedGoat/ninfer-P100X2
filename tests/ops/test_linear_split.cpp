@@ -613,6 +613,10 @@ int verify_registry() {
         {QType::W8G32_F16S, 5120, 8704, kA8},
         // BF16 control.
         {QType::BF16_CTRL, 7168, 5120, kA16},    {QType::BF16_CTRL, 5120, 3072, kA16},
+#ifdef NINFER_VOLTA_BUILD
+        // SM70's registered BF16 entry also admits its general CUTLASS projection route.
+        {QType::BF16_CTRL, 8192, 5120, kA16},
+#endif
     };
 
     int failures = 0;
@@ -635,7 +639,9 @@ int verify_registry() {
         {QType::NVFP4, 5120, 5120, kA16},
         {QType::NVFP4, 3584, 5120, kA16},
         {QType::Q5G64_F16S, 4096, 5120, kA16},
+#ifndef NINFER_VOLTA_BUILD
         {QType::BF16_CTRL, 8192, 5120, kA16},
+#endif
         // FP8's residual/gdn_input shards are not vocabulary problems, so AllowA4 (a policy FP8
         // never admits outside the vocabulary escape hatch) must still be rejected here.
         {QType::FP8_E4M3FN_ROW_BF16S, 5120, 3072, kA4},
@@ -698,7 +704,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 2}),
                                         Tensor(out1.p, DType::BF16, {kN, 1})};
-        ops::linear_column_parallel(x, {fake, fake}, out, ec);
+        ops::linear_column_parallel(x, std::array<Weight, 2>{fake, fake}, out, ec);
     });
 
     // Column-parallel with disagreeing K.
@@ -709,7 +715,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                       Tensor(x1.p, DType::BF16, {kK / 2, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 1}),
                                         Tensor(out1.p, DType::BF16, {kN, 1})};
-        ops::linear_column_parallel(x, {fake, other}, out, ec);
+        ops::linear_column_parallel(x, std::array<Weight, 2>{fake, other}, out, ec);
     });
 
     // Row-parallel with disagreeing N.
@@ -724,7 +730,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
         // violation and would leave it ambiguous which one the Op actually rejected.
         const std::array<Tensor, 2> staging{Tensor(stage0.p, DType::BF16, {kN, 1}),
                                             Tensor(stage1.p, DType::BF16, {kN / 2, 1})};
-        ops::linear_row_parallel(x, {fake, other}, out, staging, ec, events);
+        ops::linear_row_parallel(x, std::array<Weight, 2>{fake, other}, out, staging, ec, events);
     });
 
     // A single-device context is not a split context.
@@ -734,7 +740,7 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
                                       Tensor(x1.p, DType::BF16, {kK, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kN, 1}),
                                         Tensor(out1.p, DType::BF16, {kN, 1})};
-        ops::linear_column_parallel(x, {fake, fake}, out, single);
+        ops::linear_column_parallel(x, std::array<Weight, 2>{fake, fake}, out, single);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";
@@ -772,7 +778,7 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, peer_access);
 
     failures += verify_split_rejections(ec, events);
 
@@ -832,7 +838,16 @@ int main() {
          {1, 8, 24, 25, 48, 128, 1024}, {kA16, kA8}},
     };
 
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec, events); }
+    const int compute_major = std::min(ec.dev[0]->sm(), ec.dev[1]->sm()) / 10;
+    for (Case test_case : cases) {
+        // Match the hardware profiles used by the other split suites. Volta keeps every
+        // supported A16 case; newer-device activation formats are not executable there.
+        std::erase_if(test_case.policies, [compute_major](ops::LinearPolicy policy) {
+            return (policy == ops::LinearPolicy::AllowA4 && compute_major < 12) ||
+                   (policy == ops::LinearPolicy::AllowA8 && compute_major < 10);
+        });
+        if (!test_case.policies.empty()) { failures += run_case(test_case, ec, events); }
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " linear split\n";
     return failures ? 1 : 0;

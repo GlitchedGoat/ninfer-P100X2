@@ -107,8 +107,17 @@ void check_documented() {
 } // namespace
 
 int main() {
+    const auto tp4 = parse_cli(with({"--tp", "4", "--devices", "3,1,0,2"}));
+    check(tp4.tp == 4 && tp4.devices == std::vector<int>({3, 1, 0, 2}),
+          "TP4 CLI lost the four-rank device order");
     check_ignore_eos();
     check_documented();
+    const auto ram = parse_cli(with({"--max-context", "262144", "--ram-kv-window", "98304",
+                                    "--ram-kv-budget-bytes", "32000000000"}));
+    check(ram.ram_kv.gpu_tokens == 98304 && ram.kv_capacity.explicit_tokens == 98304 &&
+              ram.ram_kv.budget_bytes == 32000000000ULL,
+          "RAM KV did not separate logical and resident capacity");
+    check(parse_cli(base()).ram_kv.gpu_tokens == 0, "RAM KV unexpectedly enabled by default");
     if (failures != 0) {
         std::cerr << failures << " CLI option check(s) failed\n";
         return 1;

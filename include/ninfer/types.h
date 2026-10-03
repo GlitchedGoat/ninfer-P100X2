@@ -86,20 +86,29 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+// Experimental, approximate RAM-KV retrieval. Zero disables it. The window bounds GPU KV
+// residency; the archive retains the original packed KV bytes, not a second quantization.
+struct RamKvOptions {
+    std::uint32_t gpu_tokens = 0;
+    std::uint64_t budget_bytes = 32000000000ULL;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device = 0;
-    // Tensor-parallel degree: 1 (default, single device) or 2. `tp == 2` splits the resident
-    // model across two CUDA devices and requires `devices` to name exactly two distinct ids of
-    // the same compute capability. It is supported by the 27B execution package (`qwen3.6-27b`,
-    // `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`; `qwen3.6-35b-a3b`,
-    // `SpeculativeBackend::DFlash`, and `enable_vision` are rejected at construction. `tp == 1`
-    // is bit-identical to the single-device path.
+    // Tensor-parallel degree: 1, 2 or 4. Parallel execution requires `devices` to name exactly
+    // tp distinct ids of the same compute capability. The 27B package supports TP2 Text/MTP
+    // and its optional DFlash2 backend. TP4 supports SM70 Qwen3.8 NVFP4/native FP8 Text/MTP. Vision requires TP1;
+    // the 35B-A3B package also requires TP1.
     int tp = 1;
     // Explicit device ids, one per tp rank. Empty means "derive from `device`" (i.e. {device});
     // this lets callers that construct EngineOptions directly (tests, embedders) omit it. When
     // non-empty its size must equal tp.
     std::vector<int> devices;
+    // Optional second GPU used only as a VMM-backed expert-weight store. This keeps tp == 1:
+    // attention, KV, and all scheduling remain on `device`; only supported MoE artifacts may use
+    // the storage pages. -1 disables the mode.
+    int storage_device = -1;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     // Rotary regime. `RopeMode::Yarn` raises the ceiling `max_context` is validated against from
     // the variant's registered native capacity to `yarn_origin * yarn_factor` (capped at
@@ -114,6 +123,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -475,14 +485,16 @@ struct MemorySummary {
     // single cross-device graph, but instantiating it materializes driver and module state on both
     // devices, so the second device carries its own cost against the same allowance.
     std::size_t cuda_graph_peer_observed_bytes    = 0;
-    // Node count of one captured decode graph, 0 when graphs are disabled. At tp 2 a single graph
-    // holds BOTH devices' nodes plus the collectives' cross-device copies (the event edges between
-    // them are edges, not nodes), so this is roughly twice the tp 1 count and is the direct
-    // measurement of whether the peer's half of the schedule was captured.
+    // Each active rank's measured residency; inactive rows are zero.
+    std::array<std::size_t, 4> cuda_graph_rank_observed_bytes{};
+    // Node count of one captured decode graph, 0 when graphs are disabled. A parallel graph holds
+    // all active ranks' nodes and the collectives' cross-device copies; event edges are not nodes.
     std::size_t cuda_graph_node_count             = 0;
     std::size_t kv_payload_bytes                  = 0;
-    // GDN (linear-attention) recurrent + convolution state for THIS device. At tp 2 the head split
-    // halves it, so it is reported separately from the rest of the sequence arena.
+    std::uint32_t ram_kv_gpu_tokens = 0;
+    std::uint64_t ram_kv_archive_bytes = 0; // Maximum packed archive, summed across ranks.
+    std::uint64_t ram_kv_transfer_bytes = 0; // Actual H2D+D2H payload, summed across ranks.
+    // GDN (linear-attention) recurrent + convolution state for THIS device, head-sharded by tp.
     std::size_t gdn_state_bytes = 0;
 };
 
@@ -520,7 +532,7 @@ struct RuntimeStats {
 
 struct LoadSummary {
     int tp = 1;
-    std::array<DeviceMemoryReport, 2> devices{};
+    std::array<DeviceMemoryReport, 4> devices{};
     // Rotary regime resolved at construction. `effective_max_context` is the ceiling `max_context`
     // was validated against (the variant's native capacity under `RopeMode::Native`,
     // `yarn_origin * yarn_factor` under `RopeMode::Yarn`); `yarn_mscale` is the rotary cos/sin

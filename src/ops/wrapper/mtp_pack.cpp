@@ -59,12 +59,13 @@ void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate
     // heads, and its tp == 2 shard [7168,T] with 12 and 2 -- see kMtpAttnRowsTp2 in
     // src/ops/kernel/mtp_pack.cuh for how the ShardPlan produces that section layout, and
     // include/ninfer/ops/mtp_pack.h for the head-locality contract.
-    const bool shard = attn_in.ne[0] == 7168;
-    if (attn_in.ne[0] != 14336 && !shard) {
+    const int rows = attn_in.ne[0];
+    if (rows != 14336 && rows != 7168 && rows != 3584) {
         throw std::invalid_argument("mtp_split_attn_in: unregistered attn_in row geometry");
     }
-    const std::int32_t q_heads  = shard ? 12 : 24;
-    const std::int32_t kv_heads = shard ? 2 : 4;
+    const int tp = 14336 / rows;
+    const std::int32_t q_heads  = 24 / tp;
+    const std::int32_t kv_heads = 4 / tp;
     require_shape(attn_in, attn_in.ne[0], tokens, op, "attn_in");
     if (q.ne[0] != 256 || q.ne[1] != q_heads || q.ne[2] != tokens || q.ne[3] != 1) {
         throw std::invalid_argument("mtp_split_attn_in: invalid shape for q");

@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 
@@ -42,9 +43,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * Computes the single-parent Q/K/output-gate/V projection.
  *
  * The parent stores rows in physical order query, key, output gate, value while the public output
- * argument order is q, gate, k, v. Every route writes the four independently contiguous final
- * allocations directly; no packed parent output is materialized. The NVFP4 A4 and FP8 A8
- * profiles may use caller-owned transient storage for their private quantized activation.
+ * argument order is q, gate, k, v. The four final allocations are independently contiguous.
+ * Narrow routes write them directly; wide SM70 routes may materialize the rounded parent in
+ * caller-owned scratch before distributing its rows. NVFP4 A4 and FP8 A8 profiles may also use
+ * transient storage for their private quantized activation.
  *
  * Registered parent forms are:
  *
@@ -52,7 +54,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
  * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
- * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
+ * - NVFP4 BlockScaleK16M128x4 or SM70 VoltaQpnPrepacked `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL.
  * - FP8_E4M3FN_ROW_BF16S RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16_CTRL.
@@ -177,7 +179,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
  * the groupwise split-storage form uses a caller-owned projected plane.
  */
 [[nodiscard]] std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(
-    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens, int tp);
 
 /**
  * @brief Column-parallel (head-aligned, output-split) fused-parent attn_input_proj across two
@@ -195,22 +197,22 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
  * @param[in,out] workspace Per-rank caller-owned transient arena; A16Only routes need none.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> query_key_gate_value_weight,
+                                     std::span<const Tensor> q, std::span<const Tensor> gate,
+                                     std::span<const Tensor> k, std::span<const Tensor> v,
                                      LinearPolicy policy,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec);
 
 /**
  * A16-only column-parallel convenience form. Passes a null workspace per rank for routes that do
  * not need one (including GGML_K and NVFP4 A16).
  */
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> query_key_gate_value_weight,
+                                     std::span<const Tensor> q, std::span<const Tensor> gate,
+                                     std::span<const Tensor> k, std::span<const Tensor> v,
                                      const ExecutionContext& ec);
 
 /**
@@ -228,12 +230,12 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
  * @param[out] q,gate Per-rank BF16 `[3072,T]`. @param[out] k,v Per-rank BF16 `[512,T]`.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_weight,
-                                     const std::array<Weight, 2>& gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+void attn_input_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> query_key_weight,
+                                     std::span<const Weight> gate_value_weight,
+                                     std::span<const Tensor> q, std::span<const Tensor> gate,
+                                     std::span<const Tensor> k, std::span<const Tensor> v,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec);
 
 } // namespace ninfer::ops

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <sys/mman.h>
 
 namespace ninfer {
 namespace {
@@ -75,6 +76,15 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     }
     layout.block_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                              "Paged KV block tables");
+    if (spec.ram_enabled) {
+        if (spec.table_rows != 1 || spec.plane_order != PagedKVPlaneOrder::PageMajor) {
+            throw std::invalid_argument("RAM KV requires one PageMajor table row");
+        }
+        layout.read_indices = builder.add_tensor(DType::I32, {logical_pages, 1}, 256,
+                                                 "RAM KV read indices");
+        layout.read_tables = builder.add_tensor(DType::I32, {logical_pages, 1}, 256,
+                                                "RAM KV chronological read table");
+    }
     return layout;
 }
 
@@ -84,11 +94,17 @@ std::size_t PagedKVPoolLayout::payload_bytes() const noexcept {
     return total;
 }
 
-std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept { return block_tables.region.bytes; }
+std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept {
+    return block_tables.region.bytes + read_indices.region.bytes + read_tables.region.bytes;
+}
 
 PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
+    if (spec_.ram_enabled) {
+        read_indices_ = layout.read_indices.bind(backing);
+        read_tables_ = layout.read_tables.bind(backing);
+    }
     if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV layout plane inventory is inconsistent");
     }
@@ -129,6 +145,12 @@ std::size_t PagedKVPool::plane_count() const noexcept { return planes_.size(); }
 const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(index); }
 
 const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_; }
+
+std::size_t PagedKVPool::ram_archive_bytes() const noexcept {
+    std::size_t page_bytes = 0;
+    for (const Tensor& plane : planes_) { page_bytes += plane.nb[3]; }
+    return page_bytes * logical_page_capacity();
+}
 
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
     if (row < 0 || row >= table_row_count()) {
@@ -279,16 +301,47 @@ void PagedKVPool::release_row(std::int32_t row) noexcept {
     row_in_use_[static_cast<std::size_t>(row)] = false;
 }
 
+struct PagedKVAllocation::RamState {
+    void* archive = MAP_FAILED;
+    std::size_t bytes = 0;
+    std::vector<std::size_t> plane_offsets;
+    std::vector<bool> archived;
+    std::vector<std::int32_t> preferred;
+    mutable std::vector<std::int32_t> indices;
+    mutable std::vector<std::int32_t> table;
+    std::uint32_t resident = 0;
+    std::uint64_t transfers = 0;
+    bool dirty = true;
+
+    explicit RamState(const PagedKVPool& pool) : bytes(pool.ram_archive_bytes()),
+        archived(pool.logical_page_capacity(), false),
+        indices(pool.logical_page_capacity(), -1), table(pool.logical_page_capacity(), 0) {
+        std::size_t offset = 0;
+        for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+            plane_offsets.push_back(offset);
+            offset += pool.plane(p).nb[3] * pool.logical_page_capacity();
+        }
+        archive = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (archive == MAP_FAILED) { throw std::bad_alloc(); }
+    }
+    ~RamState() { if (archive != MAP_FAILED) { munmap(archive, bytes); } }
+};
+
+PagedKVAllocation::PagedKVAllocation() noexcept = default;
+
 PagedKVAllocation::PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entitlement)
     : pool_(&pool), page_entitlement_(page_entitlement) {
-    page_ids_.reserve(page_entitlement);
+    page_ids_.reserve(pool.ram_enabled() ? pool.logical_page_capacity() : page_entitlement);
+    if (pool.ram_enabled()) { ram_ = std::make_unique<RamState>(pool); }
 }
 
 PagedKVAllocation::~PagedKVAllocation() { release(); }
 
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
     : pool_(other.pool_), page_ids_(std::move(other.page_ids_)),
-      page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_) {
+      page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_),
+      ram_(std::move(other.ram_)) {
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
     other.bound_row_        = -1;
@@ -301,6 +354,7 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     page_ids_               = std::move(other.page_ids_);
     page_entitlement_       = other.page_entitlement_;
     bound_row_              = other.bound_row_;
+    ram_                    = std::move(other.ram_);
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
     other.bound_row_        = -1;
@@ -312,11 +366,11 @@ bool PagedKVAllocation::valid() const noexcept { return pool_ != nullptr; }
 std::uint32_t PagedKVAllocation::page_entitlement() const noexcept { return page_entitlement_; }
 
 std::uint32_t PagedKVAllocation::mapped_page_count() const noexcept {
-    return static_cast<std::uint32_t>(page_ids_.size());
+    return ram_ ? ram_->resident : static_cast<std::uint32_t>(page_ids_.size());
 }
 
 std::uint32_t PagedKVAllocation::mapped_token_capacity() const noexcept {
-    return mapped_page_count() * static_cast<std::uint32_t>(kPagedKVPageSize);
+    return static_cast<std::uint32_t>(page_ids_.size()) * kPagedKVPageSize;
 }
 
 std::int32_t PagedKVAllocation::bound_row() const noexcept { return bound_row_; }
@@ -339,12 +393,14 @@ void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
 
 void PagedKVAllocation::cancel_unmapped_entitlement() noexcept {
     if (!valid()) { return; }
+    if (ram_) { return; } // The fixed resident budget is also the retained-prefix growth claim.
     const std::uint32_t mapped = mapped_page_count();
     pool_->replace_entitlement(page_entitlement_, mapped);
     page_entitlement_ = mapped;
 }
 
 void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stream) {
+    if (ram_) { materialize_ram_pages(pages, stream); return; }
     if (!valid() || pages < mapped_page_count() || pages > page_entitlement_) {
         throw std::invalid_argument("Paged KV materialize extent is outside entitlement");
     }
@@ -364,6 +420,19 @@ void PagedKVAllocation::materialize_tokens(std::uint32_t tokens, cudaStream_t st
 
 void PagedKVAllocation::trim_pages(std::uint32_t pages) {
     if (!valid()) { throw std::logic_error("Cannot trim an empty Paged KV allocation"); }
+    if (ram_) {
+        if (pages > page_ids_.size()) { throw std::invalid_argument("RAM KV trim exceeds extent"); }
+        std::vector<std::int32_t> returned;
+        for (std::size_t p = pages; p < page_ids_.size(); ++p) {
+            if (page_ids_[p] >= 0) { returned.push_back(page_ids_[p]); }
+            ram_->archived[p] = false;
+        }
+        pool_->return_pages(returned);
+        ram_->resident -= static_cast<std::uint32_t>(returned.size());
+        if (pages != page_ids_.size()) { ram_->dirty = true; }
+        page_ids_.resize(pages);
+        return;
+    }
     if (pages > mapped_page_count()) {
         throw std::invalid_argument("Paged KV trim extent exceeds mapped pages");
     }
@@ -385,6 +454,7 @@ void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
 
 void PagedKVAllocation::publish_mapping(cudaStream_t stream) const {
     if (bound_row_ < 0) { throw std::logic_error("Paged KV allocation is not bound"); }
+    if (ram_) { publish_ram_mapping(stream); return; }
     publish_range(0, mapped_page_count(), stream);
 }
 
@@ -413,11 +483,120 @@ Tensor PagedKVAllocation::block_table() const {
 void PagedKVAllocation::release() noexcept {
     if (!valid()) { return; }
     unbind_row();
-    pool_->return_pages(page_ids_);
+    if (ram_) {
+        std::vector<std::int32_t> returned;
+        for (auto id : page_ids_) { if (id >= 0) { returned.push_back(id); } }
+        pool_->return_pages(returned);
+        ram_.reset();
+    } else { pool_->return_pages(page_ids_); }
     pool_->replace_entitlement(page_entitlement_, 0);
     page_ids_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
+}
+
+void PagedKVAllocation::prefer_pages(std::span<const std::int32_t> ranked_pages) {
+    if (!ram_) { throw std::logic_error("page ranking requires RAM KV"); }
+    ram_->preferred.assign(ranked_pages.begin(), ranked_pages.end());
+    ram_->dirty = true;
+}
+
+std::uint64_t PagedKVAllocation::ram_transfer_bytes() const noexcept {
+    return ram_ ? ram_->transfers : 0;
+}
+
+void PagedKVAllocation::materialize_ram_pages(std::uint32_t pages, cudaStream_t stream) {
+    if (pages < page_ids_.size() || pages > pool_->logical_page_capacity()) {
+        throw std::invalid_argument("RAM KV materialize extent is invalid");
+    }
+    const auto old_pages = static_cast<std::uint32_t>(page_ids_.size());
+    if (pages == old_pages && !ram_->dirty) { return; }
+    // A previous eager prefill unit may still be consuming this allocation's host-to-device
+    // metadata upload. Do not mutate its stable host source until the stream boundary settles.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (pages - old_pages > page_entitlement_) {
+        throw std::invalid_argument("RAM KV append exceeds resident window");
+    }
+    page_ids_.resize(pages, -1);
+    std::vector<bool> wanted(pages, false);
+    std::uint32_t count = 0;
+    const auto add = [&](std::uint32_t p) {
+        if (p < pages && !wanted[p] && count < page_entitlement_) {
+            wanted[p] = true; ++count;
+        }
+    };
+    // Every append page is mandatory, then a 4K recent band and a 512-token sink.
+    // Existing selected pages stay physically in place. Original order is restored only in
+    // the read table, never by moving resident payloads.
+    for (auto p = old_pages; p < pages; ++p) { add(p); }
+    for (auto p = pages; p > (pages > 64 ? pages - 64 : 0);) { add(--p); }
+    for (std::uint32_t p = 0; p < std::min(8U, pages); ++p) { add(p); }
+    for (auto p : ram_->preferred) { if (p >= 0) { add(static_cast<std::uint32_t>(p)); } }
+    for (auto p = pages; p != 0;) { add(--p); }
+
+    const auto copy_page = [&](std::uint32_t logical, std::int32_t physical, bool to_ram) {
+        for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
+            const Tensor& plane = pool_->plane(p);
+            const auto bytes = static_cast<std::size_t>(plane.nb[3]);
+            auto* host = static_cast<unsigned char*>(ram_->archive) + ram_->plane_offsets[p] +
+                         static_cast<std::size_t>(logical) * bytes;
+            auto* gpu = static_cast<unsigned char*>(plane.data) + physical * bytes;
+            CUDA_CHECK(cudaMemcpyAsync(to_ram ? static_cast<void*>(host) : gpu,
+                                       to_ram ? static_cast<const void*>(gpu) : host, bytes,
+                                       to_ram ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice,
+                                       stream));
+            ram_->transfers += bytes;
+        }
+    };
+    std::vector<std::int32_t> evicted;
+    for (std::uint32_t p = 0; p < pages; ++p) {
+        if (page_ids_[p] < 0 || wanted[p]) { continue; }
+        copy_page(p, page_ids_[p], true);
+        ram_->archived[p] = true;
+        evicted.push_back(page_ids_[p]);
+        page_ids_[p] = -1;
+    }
+    // The host archive must be ready before a subsequent load or allocator reuse. Boundaries
+    // run outside graph capture; no host payload pointer is embedded in a decode graph.
+    if (!evicted.empty()) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+    pool_->return_pages(evicted);
+    ram_->resident -= static_cast<std::uint32_t>(evicted.size());
+    std::vector<std::int32_t> fresh;
+    for (std::uint32_t p = 0; p < pages; ++p) {
+        if (!wanted[p] || page_ids_[p] >= 0) { continue; }
+        auto acquired = pool_->take_pages(1, -1);
+        page_ids_[p] = acquired.front(); ++ram_->resident;
+        if (ram_->archived[p]) { copy_page(p, page_ids_[p], false); }
+        else { fresh.push_back(page_ids_[p]); }
+    }
+    // Flash staging can gather page-rounded future rows before applying its causal mask.
+    // Keep their codes/scales finite (0), so a masked uninitialized FP16 NaN cannot contaminate
+    // softmax. Coalesce fresh physical runs; never clear restored or already-resident pages.
+    pool_->zero_pages(fresh, stream);
+    if (bound_row_ >= 0) { publish_ram_mapping(stream); }
+}
+
+void PagedKVAllocation::publish_ram_mapping(cudaStream_t stream) const {
+    auto& indices = ram_->indices;
+    auto& table = ram_->table;
+    std::fill(indices.begin(), indices.end(), -1);
+    std::int32_t count = 0;
+    for (std::size_t p = 0; p < page_ids_.size(); ++p) {
+        if (page_ids_[p] >= 0) { indices[p] = count; table[count++] = page_ids_[p]; }
+    }
+    // Padding is a valid resident address, but always causally masked by remapped positions.
+    std::fill(table.begin() + count, table.end(), count == 0 ? 0 : table[count - 1]);
+    Tensor original = pool_->block_table_row(bound_row_);
+    CUDA_CHECK(cudaMemsetAsync(original.data, 0xff, original.bytes(), stream));
+    if (!page_ids_.empty()) {
+        CUDA_CHECK(cudaMemcpyAsync(original.data, page_ids_.data(), page_ids_.size() * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(pool_->read_indices().data, indices.data(),
+                               indices.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pool_->read_tables().data, table.data(), table.size() * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    ram_->dirty = false;
 }
 
 std::vector<PagedKVAllocation>
@@ -447,6 +626,10 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
             change.mapped_pages > change.page_entitlement) {
             throw std::invalid_argument("Paged KV resize extents are inconsistent");
         }
+        if (change.allocation->ram_ &&
+            change.mapped_pages != change.allocation->mapped_page_count()) {
+            throw std::invalid_argument("RAM KV resize changes only resident entitlement; trim logical tokens first");
+        }
         for (std::size_t j = 0; j < i; ++j) {
             if (change.allocation == changes[j].allocation ||
                 change.allocation->pool_ == changes[j].allocation->pool_) {
@@ -463,7 +646,7 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
         change.allocation->page_ids_.reserve(change.page_entitlement);
     }
     for (const PagedKVResize& change : changes) {
-        change.allocation->trim_pages(change.mapped_pages);
+        if (!change.allocation->ram_) { change.allocation->trim_pages(change.mapped_pages); }
         change.allocation->set_page_entitlement(change.page_entitlement);
     }
 }

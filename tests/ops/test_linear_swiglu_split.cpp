@@ -312,7 +312,7 @@ int compare(const std::string& label, const std::vector<double>& got,
 
 std::size_t swiglu_workspace_bytes(QType qtype, ops::LinearPolicy policy, std::int32_t tokens) {
     return ops::linear_swiglu_column_parallel_workspace_capacity_bytes(qtype, policy, tokens,
-                                                                       tokens);
+                                                                       tokens, 2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -698,7 +698,7 @@ int verify_registry() {
     for (const std::int32_t tokens : {1, 2, 16, 48, 1024}) {
         try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
-                QType::FP8_E4M3FN_ROW_BF16S, kA16, tokens, tokens);
+                QType::FP8_E4M3FN_ROW_BF16S, kA16, tokens, tokens, 2);
         } catch (const std::exception& error) {
             std::cerr << "registry: fp8 A16Only T=" << tokens << " rejected: " << error.what()
                       << '\n';
@@ -706,7 +706,7 @@ int verify_registry() {
         }
         try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
-                QType::FP8_E4M3FN_ROW_BF16S, kA8, tokens, tokens);
+                QType::FP8_E4M3FN_ROW_BF16S, kA8, tokens, tokens, 2);
         } catch (const std::exception& error) {
             std::cerr << "registry: fp8 AllowA8 T=" << tokens << " rejected: " << error.what()
                       << '\n';
@@ -714,7 +714,7 @@ int verify_registry() {
         }
         try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::NVFP4, kA16,
-                                                                              tokens, tokens);
+                                                                              tokens, tokens, 2);
         } catch (const std::exception& error) {
             if (tokens > 16) { continue; } // NVFP4 A16 registered only through T=16, like tp1
             std::cerr << "registry: nvfp4 A16Only T=" << tokens << " rejected: " << error.what()
@@ -723,7 +723,7 @@ int verify_registry() {
         }
         try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::NVFP4, kA4,
-                                                                              tokens, tokens);
+                                                                              tokens, tokens, 2);
         } catch (const std::exception& error) {
             std::cerr << "registry: nvfp4 AllowA4 T=" << tokens << " rejected: " << error.what()
                       << '\n';
@@ -731,7 +731,7 @@ int verify_registry() {
         }
         try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::Q4G64_F16S,
-                                                                              kA16, tokens, tokens);
+                                                                              kA16, tokens, tokens, 2);
         } catch (const std::exception& error) {
             std::cerr << "registry: q4 A16Only T=" << tokens << " rejected: " << error.what()
                       << '\n';
@@ -744,7 +744,7 @@ int verify_registry() {
     bool threw = false;
     try {
         (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::NVFP4, kA16, 17,
-                                                                          17);
+                                                                          17, 2);
     } catch (const std::exception&) { threw = true; }
 #ifdef NINFER_VOLTA_BUILD
     if (threw) {
@@ -762,7 +762,7 @@ int verify_registry() {
     threw = false;
     try {
         (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::Q4G64_F16S, kA4,
-                                                                          1, 1);
+                                                                          1, 1, 2);
     } catch (const std::exception&) { threw = true; }
     if (!threw) {
         std::cerr << "registry: q4 AllowA4 was admitted but must not be\n";
@@ -773,7 +773,7 @@ int verify_registry() {
     threw = false;
     try {
         (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, kA4, 1, 1);
+            QType::FP8_E4M3FN_ROW_BF16S, kA4, 1, 1, 2);
     } catch (const std::exception&) { threw = true; }
     if (!threw) {
         std::cerr << "registry: fp8 AllowA4 was admitted but must not be\n";
@@ -785,7 +785,7 @@ int verify_registry() {
     threw = false;
     try {
         (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::W8G32_F16S, kA16,
-                                                                          1, 1);
+                                                                          1, 1, 2);
     } catch (const std::exception&) { threw = true; }
     if (!threw) {
         std::cerr << "registry: w8 was admitted but must not be\n";
@@ -833,7 +833,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 2}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {fake, fake}, out, ec);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, 2>{fake, fake}, out, ec);
     });
 
     expect_throw("column K", [&] {
@@ -843,7 +843,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(x1.p, DType::BF16, {kInputRows / 2, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {fake, other}, out, ec);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, 2>{fake, other}, out, ec);
     });
 
     expect_throw("tp1 context", [&] {
@@ -852,7 +852,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {fake, fake}, out, single);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, 2>{fake, fake}, out, single);
     });
 
     expect_throw("unsupported format", [&] {
@@ -862,7 +862,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(x1.p, DType::BF16, {kInputRows, 1})};
         const std::array<Tensor, 2> out{Tensor(out0.p, DType::BF16, {kShardHalf, 1}),
                                         Tensor(out1.p, DType::BF16, {kShardHalf, 1})};
-        ops::linear_swiglu_column_parallel(x, {w8, w8}, out, ec);
+        ops::linear_swiglu_column_parallel(x, std::array<Weight, 2>{w8, w8}, out, ec);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";
@@ -902,7 +902,7 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, peer_access);
 
     failures += verify_split_rejections(ec);
 

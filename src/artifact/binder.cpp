@@ -20,9 +20,9 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 
 } // namespace
 
-Binder::Binder(const Reader& reader, int device_count)
+Binder::Binder(const Reader& reader, int device_count, bool storage_only)
     : reader_(reader), consumed_(reader.objects().size(), false),
-      planned_(reader.objects().size(), false) {
+      planned_(reader.objects().size(), false), storage_only_(storage_only) {
     if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices)) {
         throw ArtifactError("materialization device count must be 1 or 2");
     }
@@ -95,7 +95,7 @@ PayloadSpan Binder::payload(ObjectHandle handle) const {
 void Binder::place(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
                    std::vector<PlaneCopy> copies) {
     std::uint64_t& capacity =
-        materialization_.device_capacity_bytes[static_cast<std::size_t>(device)];
+        materialization_.device_arena_capacity_bytes[static_cast<std::size_t>(device)];
     const std::uint64_t offset = align_up(capacity, alignment);
     if (bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
         throw ArtifactError("materialization plan size overflows u64");
@@ -117,6 +117,12 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     const std::uint64_t alignment = tensor_alignment(tensor->layout);
     const ShardPlacement placement =
         shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
+
+    if (storage_only_ && placement.axis == ShardAxis::Replicated) {
+        place_on_device(handle, 0);
+        planned_[handle.index] = true;
+        return;
+    }
 
     for (int device = 0; device < materialization_.device_count; ++device) {
         const std::vector<SliceRange>& ranges =
@@ -184,6 +190,126 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::place_on_device(ObjectHandle handle, int device) {
+    if (device < 0 || device >= materialization_.device_count) {
+        throw ArtifactError("artifact materialization device is outside the plan");
+    }
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) { throw ArtifactError("resource cannot be materialized as a device tensor"); }
+    place(handle, device, tensor->bytes, tensor_alignment(tensor->layout), {});
+}
+
+void Binder::materialize_on_device(ObjectHandle handle, int device) {
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(object_name(descriptor(handle))));
+    }
+    place_on_device(handle, device);
+    planned_[handle.index] = true;
+}
+
+void Binder::materialize_virtual_rows(ObjectHandle handle,
+                                       std::array<SliceRange, kVirtualStorageDevices> ranges) {
+    if (materialization_.device_count != static_cast<int>(kVirtualStorageDevices)) {
+        throw ArtifactError("virtual row placement requires exactly two materialization devices");
+    }
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(object_name(descriptor(handle))));
+    }
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) { throw ArtifactError("resource cannot be materialized as a device tensor"); }
+    if (tensor->layout != StorageLayout::RowSplitK128V1 || tensor->shape.size() != 2) {
+        throw ArtifactError("virtual row placement requires row-split rank-two tensors");
+    }
+    const auto payload_span = payload(handle).data;
+    const auto parent = row_split_geometry(tensor->format, tensor->shape);
+    VirtualDeviceMaterialization placement;
+    placement.object       = handle;
+    placement.virtual_bytes = tensor->bytes;
+    for (int device = 0; device < static_cast<int>(kVirtualStorageDevices); ++device) {
+        const auto range = ranges[static_cast<std::size_t>(device)];
+        if (range.count == 0) {
+            throw ArtifactError("virtual row placement names an empty device range");
+        }
+        if (range.begin > tensor->shape[0] || tensor->shape[0] - range.begin < range.count) {
+            throw ArtifactError("virtual row placement range exceeds the tensor");
+        }
+        const std::array<std::uint64_t, 2> shard_shape = {range.count, tensor->shape[1]};
+        const auto shard = row_split_geometry(tensor->format, shard_shape);
+        const auto slice = tensor_row_slice(
+            tensor->layout, tensor->format, tensor->shape,
+            std::span<const SliceRange>(&ranges[static_cast<std::size_t>(device)], 1),
+            payload_span);
+        if (slice.encoded_bytes == 0) {
+            throw ArtifactError("virtual row placement produced an empty slice");
+        }
+
+        struct Plane {
+            std::uint64_t parent_offset;
+            std::uint64_t parent_row_bytes;
+            std::uint64_t shard_offset;
+            std::uint64_t shard_bytes;
+        };
+        const std::array<Plane, 3> planes = {
+            Plane{0, parent.low_bytes_per_group * parent.groups_per_row,
+                  0, shard.low_plane_bytes},
+            Plane{parent.high_plane_offset,
+                  parent.high_bytes_per_group * parent.groups_per_row,
+                  shard.high_plane_offset, shard.high_plane_bytes},
+            Plane{parent.scale_plane_offset, 2 * parent.groups_per_row,
+                  shard.scale_plane_offset, shard.scale_plane_bytes},
+        };
+        for (const Plane& plane : planes) {
+            if (plane.shard_bytes == 0) { continue; }
+            if (plane.parent_row_bytes == 0 ||
+                range.count > std::numeric_limits<std::uint64_t>::max() /
+                                   plane.parent_row_bytes) {
+                throw ArtifactError("virtual row placement plane size overflows u64");
+            }
+            const auto bytes = range.count * plane.parent_row_bytes;
+            if (bytes != plane.shard_bytes) {
+                throw ArtifactError("virtual row placement plane geometry mismatch");
+            }
+            if (range.begin > std::numeric_limits<std::uint64_t>::max() /
+                                  plane.parent_row_bytes) {
+                throw ArtifactError("virtual row placement offset overflows u64");
+            }
+            const auto row_offset = range.begin * plane.parent_row_bytes;
+            if (plane.parent_offset > std::numeric_limits<std::uint64_t>::max() - row_offset) {
+                throw ArtifactError("virtual row placement offset overflows u64");
+            }
+            VirtualDeviceSegment segment;
+            segment.device         = device;
+            segment.virtual_offset = plane.parent_offset + row_offset;
+            segment.bytes          = bytes;
+            for (const PlaneCopy& copy : slice.copies) {
+                if (copy.dest_offset < plane.shard_offset ||
+                    copy.dest_offset - plane.shard_offset >= plane.shard_bytes) {
+                    continue;
+                }
+                const auto local = copy.dest_offset - plane.shard_offset;
+                if (copy.bytes > plane.shard_bytes - local) {
+                    throw ArtifactError("virtual row placement copy exceeds its plane");
+                }
+                segment.copies.push_back(
+                    PlaneCopy{copy.source_offset, local, copy.bytes});
+            }
+            if (segment.copies.empty()) {
+                throw ArtifactError("virtual row placement plane has no source copies");
+            }
+            placement.segments.push_back(std::move(segment));
+            auto& capacity = materialization_.virtual_capacity_bytes[static_cast<std::size_t>(device)];
+            if (bytes > std::numeric_limits<std::uint64_t>::max() - capacity) {
+                throw ArtifactError("virtual row placement capacity overflows u64");
+            }
+            capacity += bytes;
+        }
+    }
+    materialization_.virtual_objects.push_back(std::move(placement));
+    planned_[handle.index] = true;
+}
+
 void Binder::retain_on_host(ObjectHandle handle) {
     const auto* resource = std::get_if<ResourceDescriptor>(&descriptor(handle));
     if (resource == nullptr) {
@@ -231,6 +357,15 @@ MaterializationPlan Binder::finish() {
         const auto index = static_cast<std::size_t>(unplanned - planned_.begin());
         throw ArtifactError("artifact object has no materialization placement: " +
                             std::string(object_name(reader_.objects()[index])));
+    }
+    for (int device = 0; device < materialization_.device_count; ++device) {
+        auto& total = materialization_.device_capacity_bytes[static_cast<std::size_t>(device)];
+        const auto arena = materialization_.device_arena_capacity_bytes[static_cast<std::size_t>(device)];
+        const auto virtual_bytes = materialization_.virtual_capacity_bytes[static_cast<std::size_t>(device)];
+        if (virtual_bytes > std::numeric_limits<std::uint64_t>::max() - arena) {
+            throw ArtifactError("materialization device capacity overflows u64");
+        }
+        total = arena + virtual_bytes;
     }
     return std::move(materialization_);
 }

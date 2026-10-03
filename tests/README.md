@@ -1,11 +1,24 @@
 # Tests
 
+Native RAM-KV checks: `ninfer_ram_kv_test` covers exact packed page eviction/reload and sparse
+GQA against the independent FP64 oracle (TP2 geometry, BF16/INT8, decode/cached/Volta prefill).
+`NINFER_RAM_KV_REAL_WEIGHTS=/absolute/model.ninfer ctest -R '^ninfer_ram_kv_real_test$'`
+is opt-in: default/full-window token parity, real 29.8K eviction, MTP partial commit, complete
+checkpoint replay, and appended-query reuse on two V100s. It does not qualify general quality
+equivalence of approximate retrieval. `tools/v100/bench_ram_kv.py` evaluates existing long-input
+fixtures through HTTP/public Engine with a whole-server 32 GB cgroup cap.
+
 The retained tests protect current `.ninfer`, numerical operator, target, runtime-transaction,
 benchmark-report, and external protocol behavior. Repository verification principles are defined in
 [`../AGENTS.md`](../AGENTS.md); Op contract and CUDA implementation guidance is in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
 ## Organization
+
+SM70 NVFP4 input checks use independent host QPN encoding and FP64 logical projection oracles
+at TP1/TP2 shapes, including QPN/wide-CUTLASS boundaries and graph replay. Run
+`ctest -R '^ninfer_nvfp4_(input_sm70|gdn_.*)_test$'` for projection, snapshot-state, masked
+record and public TP2 split checks.
 
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
@@ -16,7 +29,19 @@ benchmark-report, and external protocol behavior. Repository verification princi
   weight/activation profile, each evaluating its complete formula rather than composing production
   Ops;
 - `ops/test_allreduce.cpp` — the two-device `allreduce_sum`/`allgather_rows` collectives; it needs
-  two CUDA devices visible to one process and reports the shared skip code when fewer are present;
+  two CUDA devices visible to one process and reports the shared skip code when fewer are present.
+  It checks eager/captured sums, small-message route boundaries and skewed 64-round chains.
+  `NINFER_TEST_PEER_OFF=1` disables peer access only inside the test process to qualify the DMA
+  fallback; it does not change the system's IOMMU or driver configuration;
+- `ops/test_allreduce_tp4.cpp` — four-rank FP64 summation/byte-relocation oracles, uneven
+  gathers, repeated broadcasts and source reuse, and production multi-stream graph capture/replay
+  gates. Both staged DMA and qualified direct-P2P paths are exercised; needs four CUDA devices;
+- `ops/test_linear_tp4.cpp` — four-rank column/row projection and exactly-once residual addition
+  at 27B quarter-shard geometries,
+  eager and graph replay, against complete-dot FP64 oracles with represented BF16 operands.
+  The oracle does not round intermediate partials; row routes use the existing two-BF16-ulp
+  tensor-scale criterion. This is not qualification
+  of a new FP8/NVFP4 codec or a four-rank Engine route. Needs four CUDA devices;
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
@@ -128,12 +153,19 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
 Without the corresponding variable CTest marks each C++ integration test as skipped. Neither test
 uses another numerical/execution path's generated tokens as a golden.
 
-The V100X2 gates accept the registered Qwen3.8 Q4_K_M or NVFP4 artifact, always on TP2.
+The V100X2-named gates accept registered Qwen3.8 Q4_K_M/NVFP4 at TP2 (default), or
+Qwen3.8 NVFP4/native block-FP8 on four SM70 cards with `NINFER_TEST_TP=4`.
 `NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `dflash` selects DFlash7 and requires an
 artifact with the optional drafter. `NINFER_V100X2_PROPOSAL_HEAD=optimized` is MTP-only.
-The real gate checks exact graph/eager commits plus strict non-speculative teacher-forced
-argmax at all 64 output positions; the prefix gate checks checkpoint, append, partial-stop
-and exact-frontier state replay. DFlash does not use the MTP-only peer-egress diagnostic.
+The real gate checks exact graph/eager commits, sampled routing and B=2 state. Q4_K_M/NVFP4
+require strict non-speculative teacher-forced argmax at all 64 output positions. Native FP8
+additionally measures ordinary decode's re-prefill discrepancy: each prompt's speculative
+worst emitted-logit deficit must not exceed its ordinary control, within the established
+0.5-logit BF16 grouping bound. This is not a bit-identical-trajectory or quality-score claim.
+The prefix gate checks checkpoint, append, partial-stop and exact-frontier replay, including
+an exact stop-vs-budget truncation control. Cold re-prefill can change BF16 grouping; its
+first differing choice is checked separately against fresh target logits. DFlash does not
+use the MTP-only peer-egress diagnostic and is unavailable at TP4.
 
 ```bash
 NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \

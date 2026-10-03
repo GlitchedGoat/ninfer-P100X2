@@ -137,14 +137,30 @@ __launch_bounds__(kArgmaxBlock) __global__ void argmax_with_value_kernel(
 
 __global__ void merge_argmax_shards_kernel(const float* values, const std::int32_t* indices,
                                            std::int32_t* out, std::int32_t first_shard_rows,
-                                           std::int32_t columns) {
+                                           std::int32_t columns, std::int32_t ranks) {
     const std::int32_t t = static_cast<std::int32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= columns) { return; }
-    const float v0 = values[t * 2];
-    const float v1 = values[t * 2 + 1];
-    const std::int32_t i0 = indices[t * 2];
-    const std::int32_t i1 = indices[t * 2 + 1] + first_shard_rows;
-    out[t] = argmax_better(v1, i1, v0, i0) ? i1 : i0;
+    float best = values[t * ranks];
+    std::int32_t index = indices[t * ranks];
+    for (std::int32_t rank = 1; rank < ranks; ++rank) {
+        const float value = values[t * ranks + rank];
+        const std::int32_t candidate = indices[t * ranks + rank] + rank * first_shard_rows;
+        if (argmax_better(value, candidate, best, index)) {
+            best = value;
+            index = candidate;
+        }
+    }
+    out[t] = index;
+}
+
+__global__ void argmax_selected_values_kernel(const __nv_bfloat16* logits,
+                                              const std::int32_t* indices, float* values,
+                                              std::int32_t physical_rows,
+                                              std::int32_t columns) {
+    const std::int32_t t = static_cast<std::int32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t < columns) {
+        values[t] = __bfloat162float(logits[static_cast<std::int64_t>(t) * physical_rows + indices[t]]);
+    }
 }
 
 __launch_bounds__(kArgmaxBlock) __global__

@@ -12,6 +12,12 @@
 
 namespace ninfer::ops {
 
+// SM70 additionally admits the registered 27B quarter-shard A16 profile: NVFP4 and
+// row-scaled FP8 [3584,5120], [4096,5120], [8704,5120], [5120,1536], [5120,4352], and
+// row-scaled FP8 vocabulary [62080,5120]. These use runtime-dimensioned Volta QPN/CUTLASS
+// leaves with native or exact-prepacked weights; no A4/A8 profile is admitted at these shapes.
+// This is not the separate 128x128 block-scaled FP8 checkpoint format.
+
 /**
  * @brief Permitted private activation-compute profiles for a linear projection.
  *
@@ -120,7 +126,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
-// --- Tensor-parallel split forms (tp == 2) ----------------------------------------------------
+// --- Tensor-parallel split forms (tp in {2,4}) ----------------------------------------------------
 //
 // Both forms are compositions of the single-device linear() above, not separate kernels: a shard
 // is a standalone `[N,K]` tensor of the same registered format with one axis narrowed -- exactly
@@ -130,8 +136,11 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 // agreement a single device cannot check, and (row-parallel only) the summing collective.
 //
 // Every requirement of linear() applies per rank. `x[r]`, `w[r]`, `out[r]`, and `workspace[r]`
-// must be resident on `ec.dev[r]`, and rank r's work is enqueued on `ec.dev[r]->stream`. The
-// CALLER OBLIGATION of include/ninfer/ops/allreduce.h therefore applies here too: inputs staged
+// must be resident on `ec.dev[r]`, and rank r's work is enqueued on `ec.dev[r]->stream`. They
+// are active-rank spans of exactly ec.tp entries, with ec.tp in {2,4}. The spans hold views,
+// not device allocations; graph recording performs no host or device allocation here. Per-format
+// shard-shape admission still applies; accepting four ranks does not register a new weight shape.
+// The CALLER OBLIGATION of include/ninfer/ops/allreduce.h applies here too: inputs staged
 // with the plain cudaMemcpy/cudaMemset/`<<<...>>>` forms land on a device's LEGACY DEFAULT stream,
 // which does not implicitly synchronize with `DeviceContext::stream`, and must be retired before
 // the call. Neither form synchronizes; on return the work is enqueued on both streams. The
@@ -142,7 +151,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 // rejected exactly as an unregistered whole shape is.
 
 /**
- * @brief Column-parallel (output-split) linear across two devices.
+ * @brief Column-parallel (output-split) linear across two or four devices.
  *
  * Rank r computes `out[r] = w[r] * x[r]`, where `w[r]` is rank r's contiguous block of the logical
  * weight's OUTPUT rows and `x[r]` holds the same replicated activation on both ranks. The two
@@ -159,19 +168,19 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * @param[in] policy Permitted private activation-compute profiles, applied identically per rank.
  * @param[in,out] workspace Per-rank caller-owned transient arena, or null when the resolved route
  * needs none (see linear_workspace_capacity_bytes(), which is evaluated at the SHARD shape).
- * @param[in] ec Execution context holding exactly two distinct devices.
+ * @param[in] ec Execution context holding two or four distinct devices.
  */
-void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                            const std::array<Tensor, 2>& out, LinearPolicy policy,
-                            const std::array<WorkspaceArena*, 2>& workspace,
+void linear_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                            std::span<const Tensor> out, LinearPolicy policy,
+                            std::span<WorkspaceArena* const> workspace,
                             const ExecutionContext& ec);
 
 /// A16-only column-parallel form; requires no transient workspace.
-void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                            const std::array<Tensor, 2>& out, const ExecutionContext& ec);
+void linear_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                            std::span<const Tensor> out, const ExecutionContext& ec);
 
 /**
- * @brief Row-parallel (input-split) linear across two devices, all-reduced.
+ * @brief Row-parallel (input-split) linear across two or four devices, all-reduced.
  *
  * Rank r computes the FULL-width partial `out[r] = w[r] * x[r]`, where `w[r]` is rank r's block of
  * the logical weight's INPUT columns and `x[r]` the matching block of the activation's rows. A
@@ -183,8 +192,8 @@ void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Wei
  * @f]
  *
  * `w[0].n` must equal `w[1].n` (both ranks produce every output row) and both ranks must agree on
- * the token count. `w[r].k` need not be equal across ranks. `staging[r]` is scratch of the output's
- * dtype and shape resident on `ec.dev[r]`, must not overlap `out[r]`, and its contents after the
+ * the token count. `w[r].k` need not be equal across ranks. `staging[r]` is BF16 scratch resident on `ec.dev[r]`, holding one output-sized
+ * contribution at TP2 or at least four output-sized contributions at TP4, must not overlap `out[r]`, and its contents after the
  * call are unspecified; `events` must be live. Consecutive calls sharing the same buffers, staging,
  * and events need no host synchronization between them.
  *
@@ -203,17 +212,17 @@ void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Wei
  * @param[in] policy Permitted private activation-compute profiles, applied identically per rank.
  * @param[in,out] workspace Per-rank caller-owned transient arena, or null when the resolved route
  * needs none. Sized at the SHARD shape.
- * @param[in] ec Execution context holding exactly two distinct devices.
+ * @param[in] ec Execution context holding two or four distinct devices.
  * @param[in] events Live cross-device ordering events, as for allreduce_sum().
  */
-void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
-                         LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                         std::span<const Tensor> out, std::span<const Tensor> staging,
+                         LinearPolicy policy, std::span<WorkspaceArena* const> workspace,
                          const ExecutionContext& ec, const PeerEvents& events);
 
 /// A16-only row-parallel form; requires no transient workspace.
-void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                         std::span<const Tensor> out, std::span<const Tensor> staging,
                          const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

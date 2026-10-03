@@ -1,5 +1,13 @@
 # NInfer CLI
 
+Experimental native RAM-KV: add `--ram-kv-window 98304` to a 27B SM70 TP1/TP2 Text/MTP command.
+This is approximate, training-free lexical retrieval, disabled by default. It keeps packed history
+in RAM but omits unselected pages from attention (including long prefill). `--max-context` remains
+the logical limit; omitted `--kv-capacity` follows the RAM window instead. If explicitly provided,
+KV capacity must equal that window. `--ram-kv-budget-bytes` defaults to 32000000000 and bounds the
+maximum archive across all ranks, not process RSS. Window must be a multiple of 64, at least
+prefill-chunk+8192, and no larger than max-context. Only one active request; no Vision/DFlash/TP4.
+
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
 
@@ -31,6 +39,13 @@ template's default. An artifact whose template does not expose effort rejects th
 `--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
 
 ## Startup memory profile
+
+`--tp 4 --devices 0,1,2,3` selects the new Qwen3.8-27B NVFP4/native FP8 Text/MTP route on
+SM70. NVFP4 four-card model/state and occupied-context results are recorded in
+[`performance.md`](performance.md); native FP8 TP4 qualification and the measured occupancy
+and capacity controls are complete.
+The native `qwen3.8-27b/fp8` identity requires TP4; neither TP4 profile supports Vision or
+DFlash. Existing TP2 qualification and results remain separate.
 
 GPU residency is frozen when the Engine starts:
 
@@ -223,6 +238,19 @@ Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6
 at `--tp 2`, including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.
+
+The 35B-A3B package also supports expert-storage mode on two GPUs without tensor parallelism. Keep
+`--tp 1`, select the compute GPU with `--device`, and pass the other GPU as `--storage-device`:
+
+```bash
+./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+  --device 0 --storage-device 1 --max-context 65536 \
+  --kv-dtype int8 --kv-capacity auto --prompt "Hello"
+```
+
+This maps the routed expert banks into one primary-device virtual address range; attention, KV,
+GDN, sampling, and scheduling remain single-device. The two GPUs must support peer access and
+share `sm_70`/`sm_86`/`sm_89` (the option is rejected with `--tp 2`).
 
 The load summary reports weights, KV pool, GDN state, sequence, workspace, CUDA Graph and reserved
 bytes per device, plus a free/total row for each. `--no-cuda-graph` runs decode eagerly; at `--tp 2`

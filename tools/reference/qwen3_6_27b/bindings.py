@@ -19,8 +19,8 @@ from tools.artifact import (
     ArtifactIdentity,
     ResourceObject,
     TensorObject,
-    decode_direct,
 )
+from tools.artifact.layouts import decode_direct
 
 
 MODEL_ID = "qwen3.6-27b"

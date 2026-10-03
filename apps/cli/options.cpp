@@ -43,8 +43,8 @@ int parse_device(const char* text) {
 
 int parse_tp(const char* text) {
     const std::uint64_t value = parse_u64(text, "tp");
-    if (value != 1 && value != 2) {
-        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    if (value != 1 && value != 2 && value != 4) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1, 2 or 4)");
     }
     return static_cast<int>(value);
 }
@@ -62,8 +62,8 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    if (result.size() != 1 && result.size() != 2 && result.size() != 4) {
+        throw std::invalid_argument("--devices must list 1, 2 or 4 device ids");
     }
     return result;
 }
@@ -121,8 +121,9 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
-           "       [--device N] [--tp 1|2] [--devices N,N]\n"
+           "       [--device N] [--tp 1|2|4] [--devices N,...] [--storage-device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--ram-kv-window N] [--ram-kv-budget-bytes N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -135,6 +136,8 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--ram-kv-window enables experimental approximate lexical RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2).\n"
+           "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -143,9 +146,13 @@ std::string usage_text(const char* argv0) {
            "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
            "two GPUs and requires --devices; it supports --spec mtp and --spec dflash, but "
            "not --vision.\n"
+           "--tp 4 supports SM70 Qwen3.8-27B NVFP4 and native FP8 Text/MTP; use --devices 0,1,2,3. Vision and DFlash "
+           "remain unsupported at this width.\n"
            "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
+           "--storage-device N enables 35B expert-storage mode: tp stays 1 and N is the second "
+           "GPU used for VMM-backed routed experts.\n"
            "--rope selects the rotary regime (default native, the checkpoint\'s own RoPE and its\n"
            "registered 262144-position ceiling). --rope yarn applies YaRN frequency correction and\n"
            "raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most 1048576);\n"
@@ -197,6 +204,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--ram-kv-window") {
+            options.ram_kv.gpu_tokens = parse_u32(value(arg), "ram-kv-window");
+        } else if (arg == "--ram-kv-budget-bytes") {
+            options.ram_kv.budget_bytes = parse_u64(value(arg), "ram-kv-budget-bytes");
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -207,6 +218,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--devices") {
             options.devices  = parse_devices(value(arg));
             devices_explicit = true;
+        } else if (arg == "--storage-device") {
+            options.storage_device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -272,7 +285,8 @@ Options parse_options(int argc, char** argv) {
     }
 
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(
+            options.ram_kv.gpu_tokens != 0 ? options.ram_kv.gpu_tokens : options.max_context);
     }
 
     if (devices_explicit) {
@@ -295,7 +309,7 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

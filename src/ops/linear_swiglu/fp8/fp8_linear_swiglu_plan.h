@@ -15,7 +15,7 @@ namespace ninfer::ops::detail {
                                                                      std::int32_t min_tokens,
                                                                      std::int32_t max_tokens);
 [[nodiscard]] std::size_t fp8_linear_swiglu_shard_workspace_capacity_bytes(
-    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens, int tp);
 
 void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      cudaStream_t stream);

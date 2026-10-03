@@ -919,6 +919,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    if (!has_media) {
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+            if (it->role != ChatRole::User) { continue; }
+            const std::string query = it->rendered_content();
+            // Retrieval does not require a second unbounded encoding of a long archive message.
+            if (query.size() <= 16384) { result.retrieval_tokens = impl_->tokenizer->encode(query); }
+            break;
+        }
+    }
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
@@ -962,6 +971,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         assign_text_positions(result);
+        if (result.retrieval_tokens.empty()) {
+            const auto count = std::min<std::size_t>(2048, result.token_ids.size());
+            result.retrieval_tokens.assign(result.token_ids.end() - count, result.token_ids.end());
+        }
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;

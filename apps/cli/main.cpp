@@ -221,6 +221,11 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    if (memory.ram_kv_gpu_tokens != 0) {
+        print_metric("RAM KV (approximate)", std::to_string(memory.ram_kv_gpu_tokens) + " GPU tokens");
+        print_metric("RAM KV archive limit", format_bytes(memory.ram_kv_archive_bytes));
+        print_metric("RAM KV transfers", format_bytes(memory.ram_kv_transfer_bytes));
+    }
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
@@ -295,6 +300,7 @@ int main(int argc, char** argv) {
         engine_options.device         = cli.device;
         engine_options.tp             = cli.tp;
         engine_options.devices        = cli.devices;
+        engine_options.storage_device = cli.storage_device;
         engine_options.max_context    = cli.max_context;
         engine_options.rope_mode      = cli.rope_mode;
         engine_options.yarn_factor    = cli.yarn_factor;
@@ -302,6 +308,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
+        engine_options.ram_kv         = cli.ram_kv;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;

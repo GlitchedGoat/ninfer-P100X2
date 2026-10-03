@@ -203,7 +203,7 @@ private:
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      const typename V::ModelView*,
+                                                      std::span<const typename V::ModelView* const>,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
                                                       ExecutionContext&);
 };
@@ -219,7 +219,7 @@ make_sequence_planner(DeviceContext& device, const EngineOptions& options,
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
-               const typename Variant::ModelView* peer_model,
+               std::span<const typename Variant::ModelView* const> peer_models,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                ExecutionContext& execution);
 

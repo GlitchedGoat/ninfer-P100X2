@@ -106,16 +106,15 @@ void join_peer(cudaStream_t stream, const DecodeGraphPeerCapture& peer) {
     CUDA_CHECK(cudaStreamWaitEvent(stream, peer.bridge->join_event(), 0));
 }
 
-void discard_capture(cudaStream_t stream, const DecodeGraphPeerCapture* peer,
-                     bool peer_forked) noexcept {
+void discard_capture(cudaStream_t stream, std::span<const DecodeGraphPeerCapture> peers) noexcept {
     // Best effort: rejoin the peer so the origin's EndCapture is well formed. If the capture was
     // already invalidated these calls fail harmlessly and EndCapture then returns a null graph and
     // clears BOTH streams' capture state, which is the outcome that matters. Hand-rolled rather
     // than ScopedDevice because this runs on an exception path and must not throw.
     int caller_device = 0;
-    const bool restore =
-        peer != nullptr && peer_forked && cudaGetDevice(&caller_device) == cudaSuccess;
-    if (peer != nullptr && peer_forked) {
+    const bool restore = !peers.empty() && cudaGetDevice(&caller_device) == cudaSuccess;
+    for (const auto& capture : peers) {
+        const auto* peer = &capture;
         log_cuda_error("cudaSetDevice(peer)", cudaSetDevice(peer->bridge->peer_device()));
         log_cuda_error("cudaEventRecord(join)",
                        cudaEventRecord(peer->bridge->join_event(), peer->stream));
@@ -126,7 +125,8 @@ void discard_capture(cudaStream_t stream, const DecodeGraphPeerCapture* peer,
     cudaGraph_t discard = nullptr;
     log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &discard));
     destroy_graph(discard);
-    if (peer != nullptr && peer_forked) {
+    for (const auto& capture : peers) {
+        const auto* peer = &capture;
         // A stream left in capture mode would poison every later launch on it, so say so loudly
         // rather than failing mysteriously later.
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
@@ -134,7 +134,7 @@ void discard_capture(cudaStream_t stream, const DecodeGraphPeerCapture* peer,
             status != cudaStreamCaptureStatusNone) {
             std::fprintf(stderr,
                          "CUDA cleanup failed: peer stream is still capturing after a discarded "
-                         "dual-device capture\n");
+                         "multi-device capture\n");
         }
     }
     if (restore) { log_cuda_error("cudaSetDevice(restore)", cudaSetDevice(caller_device)); }
@@ -229,32 +229,40 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
 }
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
-    capture(stream, body, DecodeGraphPeerCapture{});
+    capture(stream, body, std::span<const DecodeGraphPeerCapture>{});
 }
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body,
-                                    const DecodeGraphPeerCapture& peer) {
-    const bool dual = peer.bridge != nullptr;
-    if (dual) {
-        if (!peer.bridge->live() || peer.stream == nullptr) {
-            throw std::invalid_argument("dual-device capture requires a live peer bridge and "
-                                        "the peer device's stream");
+                                    std::span<const DecodeGraphPeerCapture> peers) {
+    if (peers.size() != 0 && peers.size() != 1 && peers.size() != 3) {
+        throw std::invalid_argument("decode graph capture requires one, two or four devices");
+    }
+    for (std::size_t i = 0; i < peers.size(); ++i) {
+        const auto& peer = peers[i];
+        if (peer.bridge == nullptr || !peer.bridge->live() || peer.stream == nullptr) {
+            throw std::invalid_argument("multi-device capture requires live peer bridges and streams");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (peers[j].bridge->origin_device() != peer.bridge->origin_device() ||
+                peers[j].bridge->peer_device() == peer.bridge->peer_device()) {
+                throw std::invalid_argument("decode graph peers require a common origin and distinct devices");
+            }
         }
     }
     reset();
 
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
 
-    bool peer_forked = false;
+    std::size_t forked = 0;
     try {
-        if (dual) {
+        for (const auto& peer : peers) {
             fork_peer(stream, peer);
-            peer_forked = true;
+            ++forked;
         }
         body();
-        if (dual) { join_peer(stream, peer); }
+        for (const auto& peer : peers) { join_peer(stream, peer); }
     } catch (...) {
-        discard_capture(stream, dual ? &peer : nullptr, peer_forked);
+        discard_capture(stream, peers.first(forked));
         throw;
     }
 

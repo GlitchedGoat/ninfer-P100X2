@@ -32,18 +32,23 @@ struct DeviceContext {
     void synchronize() const;
 };
 
-// One process, up to two CUDA devices. dev[0..tp-1] hold constructed DeviceContext instances;
-// the remaining slots stay empty. tp == 1 unless the caller opts into `--tp 2`, which runs the
-// tensor-parallel program across both devices.
+// One process, up to four CUDA devices. Only dev[0..tp-1] are constructed.
+inline constexpr std::size_t kMaximumExecutionDevices = 4;
 struct ExecutionContext {
-    std::array<std::optional<DeviceContext>, 2> dev;
+    std::array<std::optional<DeviceContext>, kMaximumExecutionDevices> dev;
+    // Optional device used only as a physical weight store. It is deliberately separate from
+    // `dev[1]`: tp remains the compute width, so family scheduling and KV geometry stay tp1.
+    std::optional<DeviceContext> storage;
     int tp = 1;
 
-    // device_ids.size() must be 1 or 2 and becomes tp. Every id is validated to exist by
-    // DeviceContext's own constructor; when two ids are given they must additionally share the
+    // device_ids.size() must be 1, 2 or 4 and becomes tp. Every id is validated to exist by
+    // DeviceContext's own constructor; multiple devices must additionally share the
     // same compute capability (sm major.minor), since nothing downstream can reconcile mismatched
     // architectures.
     explicit ExecutionContext(const std::vector<int>& device_ids);
+    ExecutionContext(const std::vector<int>& device_ids, int storage_device);
+
+    [[nodiscard]] bool has_storage() const noexcept { return storage.has_value(); }
 
     [[nodiscard]] DeviceContext& primary() noexcept { return *dev[0]; }
     [[nodiscard]] const DeviceContext& primary() const noexcept { return *dev[0]; }

@@ -56,6 +56,17 @@ function(ninfer_add_fused_linear_test name source common)
     LIBRARIES ninfer_ops)
 endfunction()
 
+ninfer_add_linear_test(ninfer_fp8_block_test ops/linear/test_fp8_block.cpp)
+ninfer_add_op_test(ninfer_fp8_block_composites_test
+  SOURCES ops/test_fp8_block_composites.cpp ops/linear_swiglu/linear_swiglu_test_common.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_fp8_load_plan_test
+  SOURCES targets/qwen3_8_27b/test_fp8_load_plan.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_fp8_load_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+
 # Artifact framing and model-independent runtime contracts.
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
@@ -214,6 +225,13 @@ target_include_directories(ninfer_qwen3_8_27b_dflash2_v3_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 set_tests_properties(ninfer_qwen3_8_27b_dflash2_v3_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_quasar_load_plan_test
+  SOURCES targets/qwen3_8_27b/test_quasar_load_plan.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_quasar_load_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_quasar_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_sharded_materialization_test
   SOURCES targets/qwen3_6_27b/test_sharded_materialization.cpp
   LIBRARIES ninfer_engine)
@@ -343,6 +361,12 @@ ninfer_add_op_test(ninfer_rope_yarn_test
 ninfer_add_op_test(ninfer_allreduce_test
   SOURCES ops/test_allreduce.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_allreduce_tp4_test
+  SOURCES ops/test_allreduce_tp4.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_tp4_test
+  SOURCES ops/test_linear_tp4.cpp
+  LIBRARIES ninfer_ops)
 
 # Tensor-parallel split forms. Same two-device requirement and skip code as the collectives above.
 ninfer_add_op_test(ninfer_linear_split_test
@@ -359,6 +383,9 @@ ninfer_add_op_test(ninfer_attn_input_proj_split_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_projections_split_test
   SOURCES ops/test_gdn_projections_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_nvfp4_input_sm70_test
+  SOURCES ops/test_nvfp4_input_sm70.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_output_head_split_test
   SOURCES ops/test_output_head_split.cpp
@@ -377,6 +404,16 @@ ninfer_add_op_test(ninfer_mtp_split_test
 # is one checkpoint/device.
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ram_kv_test
+  SOURCES ops/test_ram_kv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_ram_kv_real_test
+  SOURCES targets/qwen3_6_27b/test_ram_kv_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_ram_kv_real_test PROPERTIES TIMEOUT 1200 SKIP_RETURN_CODE 77)
+ninfer_add_op_test(ninfer_gdn_tp4_test
+  SOURCES ops/test_gdn_tp4.cpp
   LIBRARIES ninfer_ops)
 # The visible-key domain past the pre-YaRN 262144 bound: its own target because it needs multi-GiB
 # KV pools and a long FP64 oracle, and skips per case when the device cannot hold one.
@@ -419,6 +456,7 @@ ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_volta_tp4_a16_test ops/linear/test_volta_tp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
@@ -437,6 +475,17 @@ ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
   SOURCES ops/test_gdn_input_proj_conv_record.cpp
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_nvfp4_gdn_projections_split_test
+  COMMAND ninfer_gdn_projections_split_test --nvfp4)
+add_test(NAME ninfer_nvfp4_gdn_input_proj_conv_snapshot_test
+  COMMAND ninfer_gdn_input_proj_conv_snapshot_test --nvfp4)
+add_test(NAME ninfer_nvfp4_gdn_input_proj_conv_record_test
+  COMMAND ninfer_gdn_input_proj_conv_record_test --nvfp4)
+set_tests_properties(
+  ninfer_nvfp4_gdn_projections_split_test
+  ninfer_nvfp4_gdn_input_proj_conv_snapshot_test
+  ninfer_nvfp4_gdn_input_proj_conv_record_test
+  PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
   SOURCES ops/test_gated_delta_net_replay_record.cpp
   LIBRARIES ninfer_ops)
@@ -480,6 +529,10 @@ ninfer_add_fused_linear_test(
 ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_fp8_test
   ops/linear_swiglu/test_fp8.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_volta_tp4_test
+  ops/linear_swiglu/test_volta_tp4.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test

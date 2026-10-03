@@ -6,6 +6,7 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 deps_dir=${NINFER_DEPS_DIR:-"${repo_dir}/build/_deps"}
 prefix="${deps_dir}/install"
 sources="${deps_dir}/sources"
+build_jobs=${NINFER_BUILD_JOBS:-4}
 mkdir -p "${prefix}" "${sources}"
 
 fetch_source() {
@@ -22,14 +23,14 @@ if [[ ! -x "${prefix}/bin/nasm" ]]; then
     (
         cd "${sources}/nasm-2.16.03"
         ./configure --prefix="${prefix}"
-        make -j
+        make -j"${build_jobs}"
         make install
     )
 fi
 export PATH="${prefix}/bin:${PATH}"
 
 fetch_source ffmpeg-6.1.2 https://ffmpeg.org/releases/ffmpeg-6.1.2.tar.xz
-if [[ ! -f "${prefix}/lib/pkgconfig/libavformat.pc" ]]; then
+if [[ ! -f "${prefix}/lib/pkgconfig/libavformat.pc" || ! -f "${prefix}/include/libavformat/avformat.h" ]]; then
     (
         cd "${sources}/ffmpeg-6.1.2"
         ./configure --prefix="${prefix}" --enable-shared --disable-static \
@@ -37,19 +38,19 @@ if [[ ! -f "${prefix}/lib/pkgconfig/libavformat.pc" ]]; then
             --disable-encoders --disable-muxers --disable-filters \
             --disable-avdevice --disable-avfilter --disable-postproc \
             --disable-network --enable-zlib
-        make -j
+        make -j"${build_jobs}"
         make install
     )
 fi
 
 fetch_source curl-8.10.1 https://curl.se/download/curl-8.10.1.tar.xz
-if [[ ! -f "${prefix}/lib/pkgconfig/libcurl.pc" ]]; then
+if [[ ! -f "${prefix}/lib/pkgconfig/libcurl.pc" || ! -f "${prefix}/include/curl/curl.h" ]]; then
     cmake -S "${sources}/curl-8.10.1" -B "${deps_dir}/curl-build" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${prefix}" \
         -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF \
         -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF -DCURL_USE_OPENSSL=ON \
         -DCURL_USE_LIBPSL=OFF -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON
-    cmake --build "${deps_dir}/curl-build" -j
+    cmake --build "${deps_dir}/curl-build" -j"${build_jobs}"
     cmake --install "${deps_dir}/curl-build"
 fi
 

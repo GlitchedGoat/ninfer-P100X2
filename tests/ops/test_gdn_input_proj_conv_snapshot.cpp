@@ -29,6 +29,36 @@ constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 /
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
 
+int device_sm() {
+    int device = 0;
+    cudaDeviceProp props{};
+    cuda_check(cudaGetDevice(&device), "snapshot device");
+    cuda_check(cudaGetDeviceProperties(&props, device), "snapshot capability");
+    return props.major * 10 + props.minor;
+}
+
+int verify_nvfp4_capacity() {
+    const auto capacity = [](ops::LinearPolicy policy, int begin, int end) {
+        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, policy, 1, begin, end);
+    };
+    const auto a16 = capacity(ops::LinearPolicy::A16Only, 1, 16);
+    if (device_sm() == 70 ? (a16 == 0 || a16 != capacity(ops::LinearPolicy::A16Only, 16, 16))
+                          : a16 != 0) {
+        std::cerr << "NVFP4 snapshot A16 interval capacity mismatch\n";
+        return 1;
+    }
+    if (device_sm() >= 120) {
+        const auto a4 = capacity(ops::LinearPolicy::AllowA4, 4, 4);
+        if (capacity(ops::LinearPolicy::AllowA4, 1, 3) != 0 || a4 == 0 ||
+            capacity(ops::LinearPolicy::AllowA4, 1, 4) != a4) {
+            std::cerr << "NVFP4 snapshot A4 interval capacity mismatch\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
 std::int32_t snapshot_sample_count(std::int32_t tokens) { return tokens <= 4 ? 32 : 7; }
 
 double silu_fp64(double value) {
@@ -782,14 +812,22 @@ int run_nvfp4() {
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 823U, options));
+        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 823U, options),
+        device_sm() == 70);
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
-    failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
-    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+    const auto policy = device_sm() >= 120 ? ops::LinearPolicy::AllowA4
+                                         : ops::LinearPolicy::A16Only;
+    failures += run_nvfp4_case(parent, 3, policy, 4);
+    failures += run_nvfp4_case(parent, 4, policy, 5);
+    failures += run_nvfp4_case(parent, 17, policy, 0);
+    if (device_sm() == 70) {
+        for (const int tokens : {32, 33, 127, 128, 129}) {
+            failures += run_nvfp4_case(parent, tokens, policy, 0);
+        }
+    }
+    failures += run_nvfp4_case(parent, 1024, policy, 1025);
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     constexpr std::int32_t kChannels  = 10240;
@@ -798,10 +836,11 @@ int run_nvfp4() {
     const std::vector<std::int32_t> valid_columns{6, 3, 1};
     const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
+        QType::NVFP4, kRows, kHidden, policy, kBatch, kWidth, kWidth);
     failures += run_batched_case(
-        "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
+        "NVFP4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
+        conv_weight, workspace_bytes, policy == ops::LinearPolicy::AllowA4
+            ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance,
         [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
             return quantized_weight::dot_fp64(
                 parent.host, row,
@@ -816,7 +855,7 @@ int run_nvfp4() {
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
+                                              snapshot_base, q, k, v, z, policy,
                                               workspace, nullptr);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
@@ -987,12 +1026,17 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    if (argc == 2 && std::string_view(argv[1]) == "--nvfp4") {
+        const int failures = verify_nvfp4_capacity() + run_nvfp4();
+        std::cout << (failures ? "FAIL" : "OK") << " NVFP4 gdn_input_proj_conv_snapshot\n";
+        return failures ? 1 : 0;
+    }
     int failures = 0;
     const std::size_t q4_interval =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
@@ -1012,18 +1056,7 @@ int main() {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
-    const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
-        nvfp4_a4_4 == 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
-        std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
-        ++failures;
-    }
+    failures += verify_nvfp4_capacity();
     const auto fp8_snapshot_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                           std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(

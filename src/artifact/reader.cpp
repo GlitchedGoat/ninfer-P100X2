@@ -105,6 +105,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "FP8_E4M3FN_BLOCK128_BF16S") { return NumericFormat::FP8_E4M3FN_BLOCK128_BF16S; }
     if (name == "GGML_K") { return NumericFormat::GGML_K; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
@@ -114,6 +115,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
+    if (name == "blockscale-m128-k128-v1") { return StorageLayout::BlockScaleM128K128V1; }
     if (name == "ggml-k256-v1") { return StorageLayout::GgmlK256V1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
@@ -284,6 +286,14 @@ public:
     Qwen38Nvfp4V3Adapter(const Json& directory, const MappedFile& file,
                          std::uint64_t payload_start)
         : directory_(directory), file_(file), payload_start_(payload_start) {
+        // v3 has no weights-profile field. Register this published QUASAR artifact by its
+        // container identity, never by its filename or a representative tensor's format.
+        constexpr std::array<std::byte, 16> quasar_id = {
+            std::byte{0x39}, std::byte{0xbe}, std::byte{0x22}, std::byte{0x99},
+            std::byte{0xc2}, std::byte{0xb9}, std::byte{0x45}, std::byte{0x12},
+            std::byte{0xab}, std::byte{0xd5}, std::byte{0x1f}, std::byte{0xfe},
+            std::byte{0x07}, std::byte{0x98}, std::byte{0x30}, std::byte{0xf2}};
+        quasar_ = std::equal(quasar_id.begin(), quasar_id.end(), file_.data() + 16);
         if (!directory_.is_object() || !directory_.contains("metadata") ||
             !directory_.at("metadata").is_object() ||
             directory_.at("metadata").value("name", "") != "qwen3.8-27b") {
@@ -331,42 +341,49 @@ public:
         add("text/draft_head", {"proposal/head"});
         add("text/draft_head_token_ids", {"proposal/token_ids"});
 
-        std::size_t nvfp4_mlp_layers = 0;
+        std::size_t nvfp4_projections = 0;
+        const auto add_projection = [&](const std::string& name,
+                                        std::initializer_list<std::string> logical_names,
+                                        const std::string& divisor) {
+            const auto& weight = add(name, logical_names);
+            if (require_string(weight.at("format"), "v3 tensor format") == "nvfp4") {
+                ++nvfp4_projections;
+                add_input_divisor(divisor, logical_names);
+            }
+        };
         for (int layer = 0; layer < 64; ++layer) {
             const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
             add(prefix + "input_norm", {prefix + "input_norm"});
             if (layer >= 3 && (layer - 3) % 4 == 0) {
-                add(prefix + "attention/query_key_gate_value",
+                add_projection(prefix + "attention/query_key_gate_value",
                     {prefix + "attention/query", prefix + "attention/key",
-                     prefix + "attention/gate", prefix + "attention/value"});
-                for (const char* role : {"query_norm", "key_norm", "output"}) {
+                     prefix + "attention/gate", prefix + "attention/value"},
+                    prefix + "attention/input_projection/input_scale_divisor");
+                for (const char* role : {"query_norm", "key_norm"}) {
                     add(prefix + "attention/" + role, {prefix + "attention/" + role});
                 }
+                add_projection(prefix + "attention/output", {prefix + "attention/output"},
+                    prefix + "attention/output_projection/input_scale_divisor");
             } else {
                 for (const char* role : {"a_log", "dt_bias", "convolution"}) {
                     add(prefix + "gdn/" + role, {prefix + "gdn/" + role});
                 }
                 add(prefix + "gdn/a_b_projection",
                     {prefix + "gdn/a_projection", prefix + "gdn/b_projection"});
-                add(prefix + "gdn/query_key_value_z",
+                add_projection(prefix + "gdn/query_key_value_z",
                     {prefix + "gdn/query", prefix + "gdn/key", prefix + "gdn/value",
-                     prefix + "gdn/z"});
-                for (const char* role : {"norm", "output"}) {
-                    add(prefix + "gdn/" + role, {prefix + "gdn/" + role});
-                }
+                     prefix + "gdn/z"}, prefix + "gdn/input_projection/input_scale_divisor");
+                add(prefix + "gdn/norm", {prefix + "gdn/norm"});
+                add_projection(prefix + "gdn/output", {prefix + "gdn/output"},
+                    prefix + "gdn/output_projection/input_scale_divisor");
             }
             add(prefix + "post_attention_norm", {prefix + "post_attention_norm"});
             const std::string gate = prefix + "mlp/gate";
             const std::string up   = prefix + "mlp/up";
-            const auto& gate_up = add(prefix + "mlp/gate_up", {gate, up});
-            add(prefix + "mlp/down", {prefix + "mlp/down"});
-            if (require_string(gate_up.at("format"), "v3 tensor format") == "nvfp4") {
-                ++nvfp4_mlp_layers;
-                add_input_divisor(prefix + "mlp/gate_up_projection/input_scale_divisor",
-                                  {gate, up});
-                add_input_divisor(prefix + "mlp/down_projection/input_scale_divisor",
-                                  {prefix + "mlp/down"});
-            }
+            add_projection(prefix + "mlp/gate_up", {gate, up},
+                prefix + "mlp/gate_up_projection/input_scale_divisor");
+            add_projection(prefix + "mlp/down", {prefix + "mlp/down"},
+                prefix + "mlp/down_projection/input_scale_divisor");
         }
 
         for (const char* name : {"input_projection", "embedding_norm", "hidden_norm", "final_norm"}) {
@@ -420,7 +437,7 @@ public:
         if (has_dflash2) { add_dflash2(); }
 
         constexpr std::size_t kStructuralObjects = 1012;
-        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers +
+        const std::size_t expected = kStructuralObjects + nvfp4_projections +
                                      (has_dflash2 ? 66 : 0);
         if (selected_.size() != expected) {
             throw ArtifactError("qwen3.8-27b v3 projection produced " +
@@ -486,7 +503,8 @@ public:
         }
         (*template_it)["bytes"] = template_bytes.size();
         V3CompatibilityDirectory result;
-        result.directory = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
+        result.directory = {{"identity", {{"model_id", "qwen3.8-27b"},
+                                           {"weights_id", quasar_ ? "quasar-nvfp4" : "nvfp4"}}},
                             {"objects", std::move(objects)}};
         result.payload_overrides.emplace("frontend/chat_template.jinja", template_bytes);
         return result;
@@ -673,7 +691,14 @@ private:
         const auto id = require_string(
             components.at("text").at("resources").at("tokenizer_config.json"),
             "tokenizer_config.json resource");
-        const auto bytes = object_payload(object(id));
+        const auto& physical = object(id);
+        const auto offset = require_v3_unsigned(physical.at("offset"), "v3 object offset", false);
+        const auto size = require_v3_unsigned(physical.at("bytes"), "v3 object bytes", true);
+        const auto begin_offset = checked_add(payload_start_, offset, "v3 object payload");
+        const auto end_offset = checked_add(begin_offset, size, "v3 object payload");
+        if (end_offset > file_.size()) { throw ArtifactError("v3 object extends beyond the file"); }
+        const std::span<const std::byte> bytes(file_.data() + begin_offset,
+                                                static_cast<std::size_t>(size));
         Json config;
         try {
             const auto* begin = reinterpret_cast<const char*>(bytes.data());
@@ -689,9 +714,394 @@ private:
     const Json& directory_;
     const MappedFile& file_;
     std::uint64_t payload_start_;
+    bool quasar_ = false;
     std::map<std::string, const Json*, std::less<>> objects_;
     std::map<std::string, const Json*, std::less<>> selected_;
     std::map<std::string, std::string, std::less<>> physical_names_;
+};
+
+// The official 35B v3 artifact stores a compact physical inventory under
+// weight/xxxxx names. Its bindings describe how those physical tensors are
+// partitioned into the target's fused tensors and expert banks. Lower the
+// directory to native descriptors without touching payload bytes.
+class Qwen36_35BGroupwiseV3Adapter {
+public:
+    Qwen36_35BGroupwiseV3Adapter(const Json& directory, const MappedFile& file,
+                                 std::uint64_t payload_start)
+        : directory_(directory), file_(file), payload_start_(payload_start) {
+        if (!directory_.is_object() || !directory_.contains("metadata") ||
+            !directory_.at("metadata").is_object() ||
+            directory_.at("metadata").value("name", "") != "qwen3.6-35b-a3b") {
+            throw ArtifactError("NInfer v3 compatibility is limited to qwen3.6-35b-a3b");
+        }
+        if (!directory_.contains("files") || !directory_.at("files").is_array() ||
+            directory_.at("files").size() != 1 ||
+            !directory_.at("files")[0].at("path").is_null()) {
+            throw ArtifactError("qwen3.6-35b-a3b v3 compatibility requires a single-file artifact");
+        }
+        const auto payload_bytes = require_v3_unsigned(
+            directory_.at("files")[0].at("payload_bytes"), "payload_bytes", true);
+        if (checked_add(payload_start_, payload_bytes, "v3 artifact length") != file_.size()) {
+            throw ArtifactError("v3 artifact length differs from its directory");
+        }
+        if (!directory_.contains("objects") || !directory_.at("objects").is_array() ||
+            directory_.at("objects").empty() || !directory_.contains("bindings") ||
+            !directory_.at("bindings").is_object()) {
+            throw ArtifactError("qwen3.6-35b-a3b v3 directory has no objects");
+        }
+        for (const auto& object : directory_.at("objects")) {
+            const auto& id = require_string(object.at("id"), "v3 object id");
+            if (!objects_.emplace(id, &object).second) {
+                throw ArtifactError("duplicate v3 object id: " + id);
+            }
+        }
+    }
+
+    V3CompatibilityDirectory build() {
+        add_resource("frontend/tokenizer.json", "resource/text/tokenizer.json");
+        add_resource("frontend/tokenizer_config.json", "resource/text/tokenizer_config.json");
+        add_resource("frontend/chat_template.jinja", "resource/text/chat_template.jinja");
+        add_resource("frontend/generation_config.json", "resource/text/generation_config.json");
+        add_resource("frontend/preprocessor_config.json", "resource/vision/preprocessor_config.json");
+        add_resource("frontend/video_preprocessor_config.json",
+                     "resource/vision/video_preprocessor_config.json");
+
+        add("text/token_embedding", {"text/token_embedding"});
+        add("text/output_head", {"text/output_head"});
+        add("text/final_norm", {"text/final_norm"});
+        add("text/draft_head", {"proposal/head"});
+        add("text/draft_head_token_ids", {"proposal/token_ids"});
+
+        const std::array full_attention_layers = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39};
+        const auto is_full = [&](int layer) {
+            return std::find(full_attention_layers.begin(), full_attention_layers.end(), layer) !=
+                   full_attention_layers.end();
+        };
+        for (int layer = 0; layer < 40; ++layer) {
+            const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+            add(prefix + "input_norm", {prefix + "input_norm"});
+            if (is_full(layer)) {
+                add(prefix + "attention/query_key_gate_value",
+                    {prefix + "attention/query", prefix + "attention/key",
+                     prefix + "attention/gate", prefix + "attention/value"});
+                for (const char* role : {"query_norm", "key_norm", "output"}) {
+                    add(prefix + "attention/" + role, {prefix + "attention/" + role});
+                }
+            } else {
+                for (const char* role : {"a_log", "dt_bias", "convolution", "norm", "output"}) {
+                    add(prefix + "gdn/" + role, {prefix + "gdn/" + role});
+                }
+                add(prefix + "gdn/a_b_projection",
+                    {prefix + "gdn/a_projection", prefix + "gdn/b_projection"});
+                add(prefix + "gdn/query_key_value_z",
+                    {prefix + "gdn/query", prefix + "gdn/key", prefix + "gdn/value",
+                     prefix + "gdn/z"});
+            }
+            add(prefix + "post_attention_norm", {prefix + "post_attention_norm"});
+            add_moe(prefix + "moe/", prefix + "moe/");
+        }
+
+        add("mtp/input_projection", {"mtp/input_projection"});
+        add("mtp/embedding_norm", {"mtp/embedding_norm"});
+        add("mtp/hidden_norm", {"mtp/hidden_norm"});
+        add("mtp/final_norm", {"mtp/final_norm"});
+        const std::string mtp_source = "mtp/layers/0/";
+        const std::string mtp_target = "mtp/layer/";
+        add(mtp_target + "input_norm", {mtp_source + "input_norm"});
+        add(mtp_target + "attention/query_key_gate_value",
+            {mtp_source + "attention/query", mtp_source + "attention/key",
+             mtp_source + "attention/gate", mtp_source + "attention/value"});
+        for (const char* role : {"query_norm", "key_norm", "output"}) {
+            add(mtp_target + "attention/" + role, {mtp_source + "attention/" + role});
+        }
+        add(mtp_target + "post_attention_norm", {mtp_source + "post_attention_norm"});
+        add_moe(mtp_target + "moe/", mtp_source + "moe/");
+
+        add("vision/patch_embedding", {"vision/patch_embedding"});
+        add("vision/patch_embedding_bias", {"vision/patch_embedding_bias"});
+        add("vision/position_embedding", {"vision/position_embedding"});
+        for (int layer = 0; layer < 27; ++layer) {
+            const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
+            add(prefix + "attention/qkv",
+                {prefix + "attention/query", prefix + "attention/key",
+                 prefix + "attention/value"});
+            add(prefix + "attention/qkv_bias",
+                {prefix + "attention/query_bias", prefix + "attention/key_bias",
+                 prefix + "attention/value_bias"});
+            for (const char* role : {"output", "output_bias"}) {
+                add(prefix + "attention/" + role, {prefix + "attention/" + role});
+            }
+            for (const char* role : {"fc1", "fc1_bias", "fc2", "fc2_bias"}) {
+                add(prefix + "mlp/" + role, {prefix + "mlp/" + role});
+            }
+            for (const char* norm : {"norm1", "norm2"}) {
+                for (const char* part : {"weight", "bias"}) {
+                    add(prefix + norm + "/" + part, {prefix + norm + "_" + part});
+                }
+            }
+        }
+        for (const char* role : {"fc1", "fc1_bias", "fc2", "fc2_bias"}) {
+            add("vision/merger/" + std::string(role),
+                {"vision/merger/" + std::string(role)});
+        }
+        for (const char* part : {"weight", "bias"}) {
+            add("vision/merger/norm/" + std::string(part),
+                {"vision/merger/norm_" + std::string(part)});
+        }
+
+        add("dflash/feature_projection", {"dflash/feature_projection"});
+        add("dflash/context_norm", {"dflash/context_norm"});
+        for (int layer = 0; layer < 6; ++layer) {
+            const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
+            add(prefix + "input_norm", {prefix + "input_norm"});
+            add(prefix + "attention/query_key_value",
+                {prefix + "attention/query", prefix + "attention/key",
+                 prefix + "attention/value"});
+            for (const char* role : {"query_norm", "key_norm", "output"}) {
+                add(prefix + "attention/" + role, {prefix + "attention/" + role});
+            }
+            add(prefix + "post_attention_norm", {prefix + "post_attention_norm"});
+            add(prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
+            add(prefix + "mlp/down", {prefix + "mlp/down"});
+        }
+        add("dflash/final_norm", {"dflash/final_norm"});
+
+        static const std::map<std::string_view, std::string, std::less<>> formats = {
+            {"bf16", "BF16"}, {"fp32", "FP32"}, {"int32", "I32"},
+            {"q4_g64_fp16", "Q4G64_F16S"}, {"q5_g64_fp16", "Q5G64_F16S"},
+            {"q6_g64_fp16", "Q6G64_F16S"}, {"q8_g32_fp16", "W8G32_F16S"},
+        };
+        static const std::map<std::string_view, std::string, std::less<>> layouts = {
+            {"contiguous_le_v1", "contiguous-le-v1"},
+            {"row_split_k128_v1", "row-split-k128-v1"},
+            {"block_scale_k16_m128x4_v1", "blockscale-k16-m128x4-v1"},
+            {"row_scale_v1", "row-scale-v1"},
+        };
+
+        if (selected_.size() != directory_.at("objects").size()) {
+            throw ArtifactError("qwen3.6-35b-a3b v3 projection selected " +
+                                std::to_string(selected_.size()) + " of " +
+                                std::to_string(directory_.at("objects").size()) +
+                                " physical objects");
+        }
+        Json objects = Json::array();
+        std::vector<const Json*> ordered;
+        ordered.reserve(directory_.at("objects").size());
+        for (const auto& raw : directory_.at("objects")) { ordered.push_back(&raw); }
+        std::sort(ordered.begin(), ordered.end(), [](const Json* a, const Json* b) {
+            return a->at("offset").get<std::uint64_t>() < b->at("offset").get<std::uint64_t>();
+        });
+        for (const Json* raw_ptr : ordered) {
+            const auto& raw = *raw_ptr;
+            const auto source_id = require_string(raw.at("id"), "v3 object id");
+            const auto selected = selected_.find(source_id);
+            if (selected == selected_.end()) {
+                throw ArtifactError("unprojected qwen3.6-35b-a3b object: " + source_id);
+            }
+            const auto& id = selected->second;
+            const auto kind = require_string(raw.at("kind"), "v3 object kind");
+            Json converted{{"name", id},
+                           {"kind", kind},
+                           {"offset", require_v3_unsigned(raw.at("offset"),
+                                                            "v3 object offset", false)},
+                           {"bytes", require_v3_unsigned(raw.at("bytes"),
+                                                          "v3 object bytes", true)}};
+            if (kind == "tensor") {
+                const auto format = require_string(raw.at("format"), "v3 tensor format");
+                const auto layout = require_string(raw.at("layout"), "v3 tensor layout");
+                const auto format_it = formats.find(format);
+                const auto layout_it = layouts.find(layout);
+                if (format_it == formats.end() || layout_it == layouts.end()) {
+                    throw ArtifactError("unsupported qwen3.6-35b-a3b v3 tensor representation");
+                }
+                if (!raw.at("shape").is_array() || raw.at("shape").empty()) {
+                    throw ArtifactError(id + ": invalid v3 tensor shape");
+                }
+                converted["shape"] = Json::array();
+                for (const auto& dimension : raw.at("shape")) {
+                    converted["shape"].push_back(
+                        require_v3_unsigned(dimension, "v3 shape dimension", true));
+                }
+                converted["format"] = format_it->second;
+                converted["layout"] = layout_it->second;
+            } else if (kind == "resource") {
+                if (require_string(raw.at("encoding"), "v3 resource encoding") !=
+                    "raw_bytes_v1") {
+                    throw ArtifactError("unsupported qwen3.6-35b-a3b v3 resource representation");
+                }
+                converted["encoding"] = "raw-bytes-v1";
+            } else {
+                throw ArtifactError("unsupported qwen3.6-35b-a3b v3 object kind");
+            }
+            objects.push_back(std::move(converted));
+        }
+        std::sort(objects.begin(), objects.end(), [](const Json& a, const Json& b) {
+            return a.at("offset").get<std::uint64_t>() < b.at("offset").get<std::uint64_t>();
+        });
+        // The official v3 package carries a legacy 8.5-KiB chat-template object while its
+        // tokenizer_config contains the pinned Qwen3.6 7.8-KiB template.  The frontend contract
+        // requires those two resources to be byte-identical; retain the tokenizer-config value
+        // as an in-memory resource override without changing any artifact payload bytes.
+        const auto template_bytes = embedded_chat_template();
+        auto template_it = std::find_if(objects.begin(), objects.end(), [](const Json& object) {
+            return object.at("name") == "frontend/chat_template.jinja";
+        });
+        if (template_it == objects.end() || template_bytes.size() >
+                                                template_it->at("bytes").get<std::uint64_t>()) {
+            throw ArtifactError("embedded chat template does not fit its resource allocation");
+        }
+        (*template_it)["bytes"] = template_bytes.size();
+        V3CompatibilityDirectory result;
+        result.directory = {
+            {"identity", {{"model_id", "qwen3.6-35b-a3b"}, {"weights_id", "groupwise-int"}}},
+            {"objects", std::move(objects)},
+        };
+        result.payload_overrides.emplace("frontend/chat_template.jinja", template_bytes);
+        return result;
+    }
+
+private:
+    std::vector<std::byte> embedded_chat_template() const {
+        const auto& components = directory_.at("components");
+        const auto id = require_string(
+            components.at("text").at("resources").at("tokenizer_config.json"),
+            "tokenizer_config.json resource");
+        const auto& physical = object(id);
+        const auto offset = require_v3_unsigned(physical.at("offset"), "v3 object offset", false);
+        const auto size = require_v3_unsigned(physical.at("bytes"), "v3 object bytes", true);
+        const auto begin_offset = checked_add(payload_start_, offset, "v3 object payload");
+        const auto end_offset = checked_add(begin_offset, size, "v3 object payload");
+        if (end_offset > file_.size()) {
+            throw ArtifactError("v3 object extends beyond the file");
+        }
+        const std::span<const std::byte> bytes(
+            file_.data() + begin_offset,
+            static_cast<std::size_t>(size));
+        Json config;
+        try {
+            const auto* begin = reinterpret_cast<const char*>(bytes.data());
+            config = Json::parse(begin, begin + bytes.size());
+        } catch (const Json::exception& error) {
+            throw ArtifactError(std::string("invalid tokenizer_config.json: ") + error.what());
+        }
+        const auto& value = require_string(config.at("chat_template"), "chat_template");
+        const auto raw = std::as_bytes(std::span(value.data(), value.size()));
+        return {raw.begin(), raw.end()};
+    }
+
+    const Json& object(std::string_view id) const {
+        const auto found = objects_.find(id);
+        if (found == objects_.end()) {
+            throw ArtifactError("missing qwen3.6-35b-a3b v3 object: " + std::string(id));
+        }
+        return *found->second;
+    }
+
+    std::uint64_t element_count(const Json& value) const {
+        std::uint64_t elements = 1;
+        for (const auto& dimension : value.at("shape")) {
+            const auto dim = require_v3_unsigned(dimension, "v3 shape dimension", true);
+            if (elements > std::numeric_limits<std::uint64_t>::max() / dim) {
+                throw ArtifactError("v3 tensor shape overflows u64");
+            }
+            elements *= dim;
+        }
+        return elements;
+    }
+
+    std::vector<Json> binding_parts(std::string_view logical) const {
+        const auto& bindings = directory_.at("bindings");
+        if (!bindings.contains(logical)) {
+            throw ArtifactError("missing qwen3.6-35b-a3b v3 binding: " + std::string(logical));
+        }
+        const auto& binding = bindings.at(logical);
+        if (binding.contains("object")) {
+            const auto id = require_string(binding.at("object"), "v3 binding object");
+            return {Json{{"object", id}, {"range", {0, element_count(object(id))}}}};
+        }
+        if (!binding.contains("parts") || !binding.at("parts").is_array()) {
+            throw ArtifactError("invalid qwen3.6-35b-a3b v3 binding: " + std::string(logical));
+        }
+        return binding.at("parts").get<std::vector<Json>>();
+    }
+
+    void select(std::string_view native, std::string_view source) {
+        const auto [it, inserted] = selected_.emplace(std::string(source), std::string(native));
+        if (!inserted) {
+            throw ArtifactError("qwen3.6-35b-a3b v3 physical object is selected twice: " +
+                                std::string(source) + " (" + it->second + ", " +
+                                std::string(native) + ")");
+        }
+    }
+
+    void add_resource(std::string_view native, std::string_view source) {
+        if (require_string(object(source).at("kind"), "v3 object kind") != "resource") {
+            throw ArtifactError(std::string(source) + " is not a resource");
+        }
+        select(native, source);
+    }
+
+    void add_many(std::string_view native, const std::vector<std::string>& logicals) {
+        std::string source;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto& logical : logicals) {
+            for (const auto& part : binding_parts(logical)) {
+                const auto id = require_string(part.at("object"), "v3 binding object");
+                if (source.empty()) { source = id; }
+                if (id != source) {
+                    throw ArtifactError(std::string(native) + ": binding spans physical objects");
+                }
+                const auto& range = part.at("range");
+                if (!range.is_array() || range.size() != 2) {
+                    throw ArtifactError(std::string(native) + ": invalid v3 binding range");
+                }
+                ranges.emplace_back(require_v3_unsigned(range[0], "v3 binding range", false),
+                                    require_v3_unsigned(range[1], "v3 binding range", true));
+            }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        std::uint64_t cursor = 0;
+        for (const auto [begin, end] : ranges) {
+            if (begin != cursor || end <= begin) {
+                throw ArtifactError(std::string(native) + ": binding ranges are not contiguous");
+            }
+            cursor = end;
+        }
+        if (cursor != element_count(object(source))) {
+            throw ArtifactError(std::string(native) + ": binding coverage is incomplete");
+        }
+        select(native, source);
+    }
+
+    void add(std::string_view native, std::initializer_list<std::string> logicals) {
+        add_many(native, std::vector<std::string>(logicals));
+    }
+
+    void add_moe(std::string_view native_prefix, std::string_view source_prefix) {
+        const std::string target(native_prefix);
+        const std::string source(source_prefix);
+        add(target + "router_shared_gate", {source + "router", source + "shared_score"});
+        std::vector<std::string> gate_up;
+        std::vector<std::string> down;
+        gate_up.reserve(512);
+        down.reserve(256);
+        for (int expert = 0; expert < 256; ++expert) {
+            const std::string expert_prefix = source + "experts/" + std::to_string(expert) + "/";
+            gate_up.push_back(expert_prefix + "gate");
+            gate_up.push_back(expert_prefix + "up");
+            down.push_back(expert_prefix + "down");
+        }
+        add_many(target + "routed_gate_up", gate_up);
+        add_many(target + "routed_down", down);
+        add(target + "shared_gate_up", {source + "shared/gate", source + "shared/up"});
+        add(target + "shared_down", {source + "shared/down"});
+    }
+
+    const Json& directory_;
+    const MappedFile& file_;
+    std::uint64_t payload_start_;
+    std::map<std::string, const Json*, std::less<>> objects_;
+    std::map<std::string, std::string, std::less<>> selected_;
 };
 
 } // namespace
@@ -741,7 +1151,10 @@ struct Reader::Impl {
 
         std::map<std::string, std::vector<std::byte>, std::less<>> named_overrides;
         if (v3) {
-            auto compatible = Qwen38Nvfp4V3Adapter(directory, file, payload_start).build();
+            const auto v3_name = directory.at("metadata").value("name", "");
+            auto compatible = v3_name == "qwen3.6-35b-a3b"
+                                  ? Qwen36_35BGroupwiseV3Adapter(directory, file, payload_start).build()
+                                  : Qwen38Nvfp4V3Adapter(directory, file, payload_start).build();
             directory       = std::move(compatible.directory);
             named_overrides = std::move(compatible.payload_overrides);
         }

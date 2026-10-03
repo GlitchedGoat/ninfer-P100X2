@@ -21,6 +21,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <type_traits>
 #include <span>
 #include <vector>
 
@@ -72,21 +74,6 @@ struct ModelConfig {
 
 inline constexpr ModelConfig kCfg{};
 
-// Per-device extents at tp == 2: each one is a model extent divided along an axis the ShardPlan
-// splits, so it names what THIS device actually holds. The query/KV head counts give the
-// head-local attention geometry (12 Q : 2 KV, the same 6:1 group ratio as 24:4); the GDN head
-// counts give the head-split recurrent state; `kShardVocab` is one half of the row-split output
-// head. Nothing here divides the hidden/residual axis, which is replicated.
-inline constexpr int kTensorParallelWidth = 2;
-inline constexpr int kShardQHeads         = ModelConfig::n_q / kTensorParallelWidth;
-inline constexpr int kShardKvHeads        = ModelConfig::n_kv / kTensorParallelWidth;
-inline constexpr int kShardQSize          = ModelConfig::q_size / kTensorParallelWidth;
-inline constexpr int kShardKvSize         = ModelConfig::kv_size / kTensorParallelWidth;
-inline constexpr int kShardKeyDim         = ModelConfig::key_dim / kTensorParallelWidth;
-inline constexpr int kShardValueDim       = ModelConfig::value_dim / kTensorParallelWidth;
-inline constexpr int kShardGdnVHeads      = ModelConfig::gdn_v_heads / kTensorParallelWidth;
-inline constexpr int kShardGdnKHeads      = ModelConfig::gdn_k_heads / kTensorParallelWidth;
-inline constexpr int kShardVocab          = ModelConfig::vocab / kTensorParallelWidth;
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
@@ -207,14 +194,14 @@ public:
     // silently-defaulted null descriptor is a correct-looking native run at extended positions.
     // `ExecutionCore::rope_frequency` is what every production caller passes.
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                const std::array<ops::RopeFrequencyOverride, kTensorParallelWidth>& rope_frequency,
+                const std::array<ops::RopeFrequencyOverride, kMaximumExecutionDevices>& rope_frequency,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
-                const TpExecution* tp                      = nullptr);
+                std::span<const TpExecution> tp = {});
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -229,8 +216,8 @@ public:
         proposal_head_ids_ = ids;
         proposal_head_n_   = count;
         if (weight == nullptr) {
-            proposal_head_peer_     = nullptr;
-            proposal_head_ids_peer_ = nullptr;
+            proposal_head_peer_.fill(nullptr);
+            proposal_head_ids_peer_.fill(nullptr);
         }
     }
 
@@ -310,55 +297,55 @@ public:
     // token, and the proposal leaves through rank 0's egress.
     // Computes the full target vocabulary on both ranks from replicated final-normalized hidden.
     // The caller owns the hidden replicas, output storage, and subsequent sampling.
-    void target_logits(const std::array<Tensor, 2>& hidden,
-                        const std::array<Tensor, 2>& logits);
-    void target_verify_batch(const std::array<Tensor, 2>& ids,
-                             const std::array<Tensor, 2>& cache_positions,
-                             const std::array<Tensor, 2>& rope_positions,
-                             const std::array<Tensor, 2>& valid_columns,
-                             const std::array<Tensor, 2>& kv_table_rows,
-                             const std::array<Tensor, 2>& linear_state_slots,
+    void target_logits(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                        const std::array<Tensor, kMaximumExecutionDevices>& logits);
+    void target_verify_batch(const std::array<Tensor, kMaximumExecutionDevices>& ids,
+                             const std::array<Tensor, kMaximumExecutionDevices>& cache_positions,
+                             const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
+                             const std::array<Tensor, kMaximumExecutionDevices>& valid_columns,
+                             const std::array<Tensor, kMaximumExecutionDevices>& kv_table_rows,
+                             const std::array<Tensor, kMaximumExecutionDevices>& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope,
-                             const std::array<Tensor, 2>& hidden,
-                             const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens,
+                             const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                             const std::array<Tensor, kMaximumExecutionDevices>& logits,
+                             const std::array<Tensor, kMaximumExecutionDevices>& target_tokens,
                              bool greedy_target = false);
-    void target_verify_batch(const std::array<Tensor, 2>& ids,
-                             const std::array<Tensor, 2>& cache_positions,
-                             const std::array<Tensor, 2>& rope_positions,
-                             const std::array<Tensor, 2>& valid_columns,
-                             const std::array<Tensor, 2>& kv_table_rows,
-                             const std::array<Tensor, 2>& linear_state_slots,
+    void target_verify_batch(const std::array<Tensor, kMaximumExecutionDevices>& ids,
+                             const std::array<Tensor, kMaximumExecutionDevices>& cache_positions,
+                             const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
+                             const std::array<Tensor, kMaximumExecutionDevices>& valid_columns,
+                             const std::array<Tensor, kMaximumExecutionDevices>& kv_table_rows,
+                             const std::array<Tensor, kMaximumExecutionDevices>& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope,
-                             const std::array<Tensor, 2>& hidden,
-                             const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens,
+                             const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                             const std::array<Tensor, kMaximumExecutionDevices>& logits,
+                             const std::array<Tensor, kMaximumExecutionDevices>& target_tokens,
                              DFlashFeatureSink& sink, bool greedy_target = false);
     // Greedy TP2 verification can reduce each vocabulary shard to one exact (value, id) winner,
     // exchange two tiny [1,T] tensors, and merge them. This avoids the full [V,T] all-gather; the
     // full-logit overload above remains the route for temperature/penalty sampling.
-    void target_argmax_tp2(const std::array<Tensor, 2>& hidden,
-                           const std::array<Tensor, 2>& target_tokens);
-    void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                                  const std::array<Tensor, 2>& cache_positions,
-                                  const std::array<Tensor, 2>& rope_positions,
-                                  const std::array<Tensor, 2>& valid_columns,
-                                  const std::array<Tensor, 2>& kv_table_rows,
+    void target_argmax_tp2(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                           const std::array<Tensor, kMaximumExecutionDevices>& target_tokens);
+    void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                                  const std::array<Tensor, kMaximumExecutionDevices>& cache_positions,
+                                  const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
+                                  const std::array<Tensor, kMaximumExecutionDevices>& valid_columns,
+                                  const std::array<Tensor, kMaximumExecutionDevices>& kv_table_rows,
                                   ops::GqaExecutionEnvelope envelope,
-                                  const std::array<Tensor, 2>& mtp_hidden);
-    void mtp_propose_batch(const std::array<Tensor, 2>& hidden,
-                           const std::array<Tensor, 2>& logits, Tensor& draft_tokens);
-    void mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                           const std::array<Tensor, 2>& positions,
-                           const std::array<Tensor, 2>& rope_positions,
+                                  const std::array<Tensor, kMaximumExecutionDevices>& mtp_hidden);
+    void mtp_propose_batch(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                           const std::array<Tensor, kMaximumExecutionDevices>& logits, Tensor& draft_tokens);
+    void mtp_forward_batch(const Tensor& ids, const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                           const std::array<Tensor, kMaximumExecutionDevices>& positions,
+                           const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
                            ops::GqaExecutionEnvelope envelope,
-                           const std::array<Tensor, 2>& mtp_hidden, int logits_column,
-                           const std::array<Tensor, 2>* logits, Tensor* draft_token);
-    void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
-                             const std::array<Tensor, 2>& position,
+                           const std::array<Tensor, kMaximumExecutionDevices>& mtp_hidden, int logits_column,
+                           const std::array<Tensor, kMaximumExecutionDevices>* logits, Tensor* draft_token);
+    void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, kMaximumExecutionDevices>& previous_hidden,
+                             const std::array<Tensor, kMaximumExecutionDevices>& position,
                              ops::GqaExecutionEnvelope envelope,
-                             const std::array<Tensor, 2>& mtp_hidden,
-                             const std::array<Tensor, 2>& logits, Tensor& draft_token);
+                             const std::array<Tensor, kMaximumExecutionDevices>& mtp_hidden,
+                             const std::array<Tensor, kMaximumExecutionDevices>& logits, Tensor& draft_token);
 private:
     void bind();
 
@@ -378,17 +365,42 @@ private:
     // residual `x` is REPLICATED (bitwise identical on both ranks -- the reduce sums the same two
     // BF16 partials on both sides and IEEE addition is commutative), which is what keeps every
     // per-device GDN state and KV page in lockstep without any extra synchronization.
-    [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }
+    [[nodiscard]] bool tp2() const noexcept { return !tp_.empty(); }
     [[nodiscard]] const ExecutionContext& ec() const;
-    [[nodiscard]] std::array<WorkspaceArena*, 2> workspaces() const;
+    [[nodiscard]] std::array<WorkspaceArena*, kMaximumExecutionDevices> workspaces() const;
+    [[nodiscard]] std::array<std::optional<WorkspaceArena::Scope>, kMaximumExecutionDevices>
+    workspace_scopes() const;
+    template <class Body>
+    auto rank_map(Body&& body) const {
+        using Value = std::decay_t<decltype(body(0))>;
+        std::array<Value, kMaximumExecutionDevices> out{};
+        for (int rank = 0; rank < ec().tp; ++rank) { out[rank] = body(rank); }
+        return out;
+    }
+    template <class T, std::size_t N>
+    auto active(const std::array<T, N>& values) const {
+        return std::span(values).first(ec().tp);
+    }
+    [[nodiscard]] std::array<const Tensor*, kMaximumExecutionDevices - 1>
+    peer_positions(const std::array<Tensor, kMaximumExecutionDevices>& tensors) const {
+        std::array<const Tensor*, kMaximumExecutionDevices - 1> out{};
+        for (std::size_t index = 0; index < tp_.size(); ++index) { out[index] = &tensors[index + 1]; }
+        return out;
+    }
+    [[nodiscard]] const Weight& embedding_for(int rank) const {
+        return rank == 0 ? *embed_ : *embed_peer_[rank - 1];
+    }
+    [[nodiscard]] const Tensor& final_norm_for(int rank) const {
+        return rank == 0 ? *final_norm_ : *final_norm_peer_[rank - 1];
+    }
     [[nodiscard]] cudaStream_t stream_for(int rank) const noexcept {
-        return rank == 0 ? ctx_.stream : tp_->device->stream;
+        return rank == 0 ? ctx_.stream : tp_[rank - 1].device->stream;
     }
     [[nodiscard]] qwen3_6::RoundState& io_for(int rank) const noexcept {
-        return rank == 0 ? io_ : *tp_->io;
+        return rank == 0 ? io_ : *tp_[rank - 1].io;
     }
     [[nodiscard]] LinearAttentionStatePool& state_for(int rank) const noexcept {
-        return rank == 0 ? state_ : *tp_->state;
+        return rank == 0 ? state_ : *tp_[rank - 1].state;
     }
     // Rank 1's own device copies of the per-call I32 control tensors. Rank 0 keeps using the
     // existing `active_*` bindings unchanged; these are their mirrors, set by the same call that
@@ -401,20 +413,24 @@ private:
     [[nodiscard]] Tensor rank_valid_columns(int rank) const;
     [[nodiscard]] const Tensor& rank_linear_state_slots(int rank) const;
     void synchronize_all() const;
-    void attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::array<Tensor, 2>& x,
-                      int index, Phase phase, const std::array<Tensor, 2>& staging);
-    void gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::array<Tensor, 2>& x, int index,
-                     Phase phase, const std::array<Tensor, 2>& staging);
-    void mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_norm_1, const MlpW& m0,
-                      const MlpW& m1, std::array<Tensor, 2>& x, Phase phase,
-                      const std::array<Tensor, 2>& staging);
-    void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
-                        const std::array<Tensor, 2>& staging,
+    void attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecutionDevices>& w, std::array<Tensor, kMaximumExecutionDevices>& x,
+                      int index, Phase phase, const std::array<Tensor, kMaximumExecutionDevices>& staging);
+    void gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecutionDevices>& w, std::array<Tensor, kMaximumExecutionDevices>& x, int index,
+                     Phase phase, const std::array<Tensor, kMaximumExecutionDevices>& staging);
+    void mlp_tail_tp2(const std::array<const Tensor*, kMaximumExecutionDevices>& norm,
+                      const std::array<const MlpW*, kMaximumExecutionDevices>& mlp, std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
+                      const std::array<Tensor, kMaximumExecutionDevices>& staging);
+    void run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
+                        const std::array<Tensor, kMaximumExecutionDevices>& staging,
                         DFlashFeatureSink* dflash_sink = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
-    void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
-                    Tensor& peer_logits);
+    void logits_tp2(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                    const std::array<Tensor, kMaximumExecutionDevices>& logits);
+    void head_argmax_tp(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                        const std::array<Weight, kMaximumExecutionDevices>& heads,
+                        std::int32_t valid_rows,
+                        const std::array<Tensor, kMaximumExecutionDevices>& tokens);
     void ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cache_positions,
                                    const Tensor& rope_positions, const Tensor& kv_table_rows,
                                    const Tensor& linear_state_slots,
@@ -430,26 +446,26 @@ private:
     // call's reduces exactly as the text layer loop reuses its own.
     // `ids` is rank 0's alone: rank 0's fc shard contracts the NORMALIZED EMBEDDING half and
     // rank 1's the NORMALIZED HIDDEN half, so device 1 never embeds a token in the MTP stem.
-    void mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                              std::array<Tensor, 2>& x, std::array<Tensor, 2>& ah,
-                              const std::array<Tensor, 2>& staging);
-    void mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& ah,
-                              const std::array<Tensor, 2>& positions,
-                              const std::array<Tensor, 2>& rope_positions,
+    void mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                              std::array<Tensor, kMaximumExecutionDevices>& x, std::array<Tensor, kMaximumExecutionDevices>& ah,
+                              const std::array<Tensor, kMaximumExecutionDevices>& staging);
+    void mtp_forward_tail_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, const std::array<Tensor, kMaximumExecutionDevices>& ah,
+                              const std::array<Tensor, kMaximumExecutionDevices>& positions,
+                              const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const std::array<Tensor, 2>& mtp_hidden,
-                              const std::array<Tensor, 2>& staging);
-    void mtp_forward_core_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                              const std::array<Tensor, 2>& positions,
-                              const std::array<Tensor, 2>& rope_positions,
+                              const std::array<Tensor, kMaximumExecutionDevices>& mtp_hidden,
+                              const std::array<Tensor, kMaximumExecutionDevices>& staging);
+    void mtp_forward_core_tp2(const Tensor& ids, const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                              const std::array<Tensor, kMaximumExecutionDevices>& positions,
+                              const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const std::array<Tensor, 2>& mtp_hidden);
-    void mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
-                               const std::array<Tensor, 2>& positions,
-                               const std::array<Tensor, 2>& rope_positions,
+                              const std::array<Tensor, kMaximumExecutionDevices>& mtp_hidden);
+    void mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                               const std::array<Tensor, kMaximumExecutionDevices>& positions,
+                               const std::array<Tensor, kMaximumExecutionDevices>& rope_positions,
                                ops::GqaExecutionEnvelope envelope, bool final_chunk,
-                               const std::array<Tensor, 2>* final_hidden,
-                               const std::array<Tensor, 2>* logits, Tensor* draft_token);
+                               const std::array<Tensor, kMaximumExecutionDevices>* final_hidden,
+                               const std::array<Tensor, kMaximumExecutionDevices>* logits, Tensor* draft_token);
     // Vocabulary-split proposal head: each rank computes its own half of the proposal logits and
     // one allgather leaves the FULL vector on both, because the winning row is a GLOBAL argmax
     // that can land in either half and `draft_head_token_ids` is replicated for exactly that
@@ -460,8 +476,8 @@ private:
     // AR proposal steps, feeds only rank 0's MTP stem (rank 1's stem contracts the hidden half
     // and never embeds a token). The gather still lands on both ranks because `allgather_rows`
     // writes both destinations; rank 1's copy is simply not read.
-    void proposal_argmax_tp2(const std::array<Tensor, 2>& hidden,
-                             const std::array<Tensor, 2>& logits, Tensor& proposal_tokens);
+    void proposal_argmax_tp2(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
+                             const std::array<Tensor, kMaximumExecutionDevices>& logits, Tensor& proposal_tokens);
     [[nodiscard]] const MtpW& mtp_weights_for(int rank) const;
     [[nodiscard]] const GdnReplayRecords* replay_records_for(int rank) const;
     template <class Tap>
@@ -555,16 +571,16 @@ private:
     // yarn's mscale is entirely a rope-path effect (`ops::RopeFrequencyOverride::mscale`) and
     // there is no attention-side factor, so `kAttnScale` never depends on `rope_frequency_`. See
     // `src/targets/qwen3_6/impl/runtime/yarn_rope.h` for the full account.
-    std::array<ops::RopeFrequencyOverride, kTensorParallelWidth> rope_frequency_{};
+    std::array<ops::RopeFrequencyOverride, kMaximumExecutionDevices> rope_frequency_{};
 
-    const TpExecution* tp_                       = nullptr;
-    const Tensor* peer_cache_positions_          = nullptr;
-    const Tensor* peer_rope_positions_           = nullptr;
-    const Tensor* peer_kv_table_rows_            = nullptr;
-    const Tensor* peer_linear_state_slots_       = nullptr;
-    const Tensor* peer_valid_columns_            = nullptr;
+    std::span<const TpExecution> tp_;
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_cache_positions_{};
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_rope_positions_{};
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_kv_table_rows_{};
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_linear_state_slots_{};
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_valid_columns_{};
 
-    const Tensor* peer_backend_kv_table_rows_    = nullptr;
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_backend_kv_table_rows_{};
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
@@ -577,17 +593,17 @@ private:
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
     std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};
     // Rank 1's own shard bindings; populated only at tp == 2.
-    const Weight* embed_peer_      = nullptr;
-    const Tensor* final_norm_peer_ = nullptr;
-    const Weight* lm_head_peer_    = nullptr;
-    std::array<FullLayerW, TextConfig::full_attention_layers()> full_peer_{};
-    std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_peer_{};
-    MtpW mtp_peer_{};
+    std::array<const Weight*, kMaximumExecutionDevices - 1> embed_peer_{};
+    std::array<const Tensor*, kMaximumExecutionDevices - 1> final_norm_peer_{};
+    std::array<const Weight*, kMaximumExecutionDevices - 1> lm_head_peer_{};
+    std::array<std::array<FullLayerW, TextConfig::full_attention_layers()>, kMaximumExecutionDevices - 1> full_peer_{};
+    std::array<std::array<GdnLayerW, TextConfig::gdn_layers()>, kMaximumExecutionDevices - 1> gdn_peer_{};
+    std::array<MtpW, kMaximumExecutionDevices - 1> mtp_peer_{};
     // Rank 1's own vocabulary half of the draft head plus its own device copy of the REPLICATED
     // [131072] id map. Both are cleared together with rank 0's when the request runs on the full
     // LM head instead (`set_proposal_head(nullptr, ...)`).
-    const Weight* proposal_head_peer_             = nullptr;
-    const std::int32_t* proposal_head_ids_peer_   = nullptr;
+    std::array<const Weight*, kMaximumExecutionDevices - 1> proposal_head_peer_{};
+    std::array<const std::int32_t*, kMaximumExecutionDevices - 1> proposal_head_ids_peer_{};
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_a_{};
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_b_{};
     std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};

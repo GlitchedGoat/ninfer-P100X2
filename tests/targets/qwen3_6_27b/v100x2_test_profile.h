@@ -8,6 +8,19 @@
 
 namespace v100x2_test {
 
+inline int tp() {
+    const char* width=std::getenv("NINFER_TEST_TP");
+    if(!width || std::strcmp(width,"2")==0) {return 2;}
+    if(std::strcmp(width,"4")==0) {return 4;}
+    throw std::runtime_error("NINFER_TEST_TP must be 2 or 4");
+}
+
+inline std::vector<int> devices() {
+    std::vector<int> result;
+    for(int rank=0;rank<tp();++rank) {result.push_back(rank);}
+    return result;
+}
+
 // The two real-artifact gates exercise the same state contracts for either
 // registered Qwen3.8 weight profile and its explicitly selected draft backend.
 inline ninfer::SpeculativeOptions profile(ninfer::ProposalHead default_mtp_head) {
@@ -40,9 +53,11 @@ inline ninfer::SpeculativeOptions profile(ninfer::ProposalHead default_mtp_head)
 
 inline void check_identity(const ninfer::Engine& engine) {
     const auto summary = engine.load_summary();
-    if (summary.tp != 2 || summary.model_id != "qwen3.8-27b" ||
-        (summary.weights_id != "gguf-q4-k-m" && summary.weights_id != "nvfp4")) {
-        throw std::runtime_error("this gate requires TP2 Qwen3.8-27B Q4_K_M or NVFP4");
+    if (summary.tp != tp() || summary.model_id != "qwen3.8-27b" ||
+        (summary.weights_id != "gguf-q4-k-m" && summary.weights_id != "nvfp4" &&
+         summary.weights_id != "quasar-nvfp4" &&
+         summary.weights_id != "fp8")) {
+        throw std::runtime_error("this gate requires a registered parallel Qwen3.8-27B artifact");
     }
 }
 
@@ -52,7 +67,7 @@ inline void check_peer_egress(ninfer::Engine& engine, ninfer::SpeculativeBackend
     if (backend == ninfer::SpeculativeBackend::Mtp) {
         const auto [rounds, mismatches] = engine.debug_peer_egress_check_counts();
         if (rounds == 0 || mismatches != 0) {
-            throw std::runtime_error("TP2 ranks disagree on speculative egress");
+            throw std::runtime_error("parallel ranks disagree on speculative egress");
         }
     }
 }

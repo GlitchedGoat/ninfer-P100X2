@@ -21,7 +21,8 @@ namespace ninfer::ops::detail {
 namespace {
 
 __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
-                                        bool prepacked, cutlass::half_t* __restrict__ out) {
+                                        bool prepacked, const __nv_bfloat16* scales,
+                                        bool block_scaled, cutlass::half_t* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
     const int pair_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= n || pair_idx >= k / 2) { return; }
@@ -32,9 +33,11 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
     const std::uint16_t packed =
         *reinterpret_cast<const std::uint16_t*>(codes + offset);
     const float2 weight = decode_fp8_e4m3x2(packed);
+    const float scale = block_scaled ? __bfloat162float(scales[(row / 128) * (k / 128) + k0 / 128])
+                                     : 1.0F;
     cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[pair_idx * 2]     = cutlass::half_t(weight.x);
-    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
+    out_row[pair_idx * 2]     = cutlass::half_t(weight.x * scale);
+    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y * scale);
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
@@ -123,6 +126,7 @@ void run_gemm(const cutlass::half_t* input, const cutlass::half_t* weight, const
     }
     CUDA_CHECK(cudaGetLastError());
     if constexpr (!Fused && !UnscaledFp32) {
+        if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) { return; }
         const std::int64_t count = static_cast<std::int64_t>(t) * w.n;
         scale_rows_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
             static_cast<__nv_bfloat16*>(out.data), static_cast<const __nv_bfloat16*>(w.scales),
@@ -157,7 +161,9 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
     dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
         static_cast<const std::uint8_t*>(w.qdata), n, k,
-        w.layout == QuantLayout::VoltaQpnPrepacked, weight);
+        w.layout == QuantLayout::VoltaQpnPrepacked,
+        static_cast<const __nv_bfloat16*>(w.scales),
+        w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S, weight);
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
     bf16_to_fp16_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
@@ -166,7 +172,7 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
 
     if constexpr (UnscaledFp32) {
         run_gemm<false, true>(input, weight, w, out, t, scratch.gemm, stream);
-    } else if (fuse_row_scale(n, k, t)) {
+    } else if (w.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S && fuse_row_scale(n, k, t)) {
         run_gemm<true>(input, weight, w, out, t, scratch.gemm, stream);
     } else {
         run_gemm<false>(input, weight, w, out, t, scratch.gemm, stream);

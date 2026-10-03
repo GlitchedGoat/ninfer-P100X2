@@ -196,6 +196,10 @@ int main() {
     failures += run_shape(5120, 17408, 821U);
     failures += run_shape(5120, 3072, 823U);
     failures += run_shape(5120, 8704, 827U);
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_shape(5120, 1536, 829U);
+    failures += run_shape(5120, 4352, 831U);
+#endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

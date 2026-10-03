@@ -43,8 +43,11 @@ int main() {
             plan.materialization.device_objects.size() != 883 ||
             plan.materialization.host_objects.size() != 6 ||
             plan.materialization.device_capacity_bytes[0] != 22'360'207'360ULL ||
-            plan.bindings.dflash.feature_projection.index != 889 ||
-            plan.bindings.dflash.final_norm.index != 939) {
+            ninfer::artifact::object_name(
+                binder.descriptor(plan.bindings.dflash.feature_projection)) !=
+                "dflash/feature_projection" ||
+            ninfer::artifact::object_name(binder.descriptor(plan.bindings.dflash.final_norm)) !=
+                "dflash/final_norm") {
             std::cerr << "DFlash-disabled materialization plan changed resident weights\n";
             return 1;
         }

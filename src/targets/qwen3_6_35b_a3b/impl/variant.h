@@ -49,88 +49,88 @@ struct Variant {
     // shared family runtime (targets/qwen3_6/impl/runtime) is compiled once per variant and names
     // them; every one throws, and no caller can reach them because both the Engine and the target
     // option validation reject tp > 1 for this variant first.
-    static void attention_projection(const std::array<Tensor, 2>& hidden,
-                                     const std::array<const FullAttentionProjectionWeights*, 2>& w,
-                                     const std::array<Tensor, 2>& query,
-                                     const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& key,
-                                     const std::array<Tensor, 2>& value, qwen3_6::TextPhase phase,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+    static void attention_projection(std::span<const Tensor> hidden,
+                                     std::span<const FullAttentionProjectionWeights* const> w,
+                                     std::span<const Tensor> query,
+                                     std::span<const Tensor> gate,
+                                     std::span<const Tensor> key,
+                                     std::span<const Tensor> value, qwen3_6::TextPhase phase,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec);
-    static void attention_output_projection(const std::array<Tensor, 2>& attention,
-                                            const std::array<Weight, 2>& weight,
-                                            const std::array<Tensor, 2>& residual,
-                                            const std::array<Tensor, 2>& staging,
+    static void attention_output_projection(std::span<const Tensor> attention,
+                                            std::span<const Weight> weight,
+                                            std::span<const Tensor> residual,
+                                            std::span<const Tensor> staging,
                                             qwen3_6::TextPhase phase,
-                                            const std::array<WorkspaceArena*, 2>& workspace,
+                                            std::span<WorkspaceArena* const> workspace,
                                             const ExecutionContext& ec, const ops::PeerEvents& ev);
-    static void gdn_input_projection(const std::array<Tensor, 2>& hidden,
-                                     const std::array<const GdnProjectionWeights*, 2>& w,
-                                     const std::array<Tensor, 2>& qkv,
-                                     const std::array<Tensor, 2>& output_gate,
+    static void gdn_input_projection(std::span<const Tensor> hidden,
+                                     std::span<const GdnProjectionWeights* const> w,
+                                     std::span<const Tensor> qkv,
+                                     std::span<const Tensor> output_gate,
                                      qwen3_6::TextPhase phase,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec);
     static void gdn_input_projection_snapshot(
-        const std::array<Tensor, 2>& hidden, const std::array<const GdnProjectionWeights*, 2>& w,
-        const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-        const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_slot,
-        const std::array<Tensor, 2>& snapshot_base_slot, const std::array<Tensor, 2>& query,
-        const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-        const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase phase,
-        const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
-    static void gdn_output_projection(const std::array<Tensor, 2>& hidden,
-                                      const std::array<Weight, 2>& weight,
-                                      const std::array<Tensor, 2>& residual,
-                                      const std::array<Tensor, 2>& staging,
+        std::span<const Tensor> hidden, std::span<const GdnProjectionWeights* const> w,
+        std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,
+        std::span<const Tensor> valid_columns, std::span<const Tensor> initial_slot,
+        std::span<const Tensor> snapshot_base_slot, std::span<const Tensor> query,
+        std::span<const Tensor> key, std::span<const Tensor> value,
+        std::span<const Tensor> output_gate, qwen3_6::TextPhase phase,
+        std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec);
+    static void gdn_output_projection(std::span<const Tensor> hidden,
+                                      std::span<const Weight> weight,
+                                      std::span<const Tensor> residual,
+                                      std::span<const Tensor> staging,
                                       qwen3_6::TextPhase phase,
-                                      const std::array<WorkspaceArena*, 2>& workspace,
+                                      std::span<WorkspaceArena* const> workspace,
                                       const ExecutionContext& ec, const ops::PeerEvents& ev);
-    static void gdn_control_projection(const std::array<Tensor, 2>& hidden,
-                                       const std::array<const GdnProjectionWeights*, 2>& w,
-                                       const std::array<Tensor, 2>& g,
-                                       const std::array<Tensor, 2>& beta,
-                                       const std::array<WorkspaceArena*, 2>& workspace,
+    static void gdn_control_projection(std::span<const Tensor> hidden,
+                                       std::span<const GdnProjectionWeights* const> w,
+                                       std::span<const Tensor> g,
+                                       std::span<const Tensor> beta,
+                                       std::span<WorkspaceArena* const> workspace,
                                        const ExecutionContext& ec);
-    static void post_mixer(const std::array<Tensor, 2>& hidden,
-                           const std::array<const PostMixerWeights*, 2>& w,
-                           const std::array<Tensor, 2>& residual,
-                           const std::array<Tensor, 2>& staging, qwen3_6::TextPhase phase,
-                           const std::array<WorkspaceArena*, 2>& workspace,
+    static void post_mixer(std::span<const Tensor> hidden,
+                           std::span<const PostMixerWeights* const> w,
+                           std::span<const Tensor> residual,
+                           std::span<const Tensor> staging, qwen3_6::TextPhase phase,
+                           std::span<WorkspaceArena* const> workspace,
                            const ExecutionContext& ec, const ops::PeerEvents& ev);
     static void gdn_input_projection_record(
-        const std::array<Tensor, 2>& hidden, const std::array<const GdnProjectionWeights*, 2>& w,
-        const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-        const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_slots,
-        const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
-        const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-        const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase phase,
-        const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
-    static void mtp_attention_projection(const std::array<Tensor, 2>& hidden,
-                                         const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                         const std::array<Tensor, 2>& query,
-                                         const std::array<Tensor, 2>& gate,
-                                         const std::array<Tensor, 2>& key,
-                                         const std::array<Tensor, 2>& value,
-                                         const std::array<WorkspaceArena*, 2>& workspace,
+        std::span<const Tensor> hidden, std::span<const GdnProjectionWeights* const> w,
+        std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,
+        std::span<const Tensor> valid_columns, std::span<const Tensor> initial_slots,
+        std::span<const Tensor> conv_record, std::span<const Tensor> query,
+        std::span<const Tensor> key, std::span<const Tensor> value,
+        std::span<const Tensor> output_gate, qwen3_6::TextPhase phase,
+        std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec);
+    static void mtp_attention_projection(std::span<const Tensor> hidden,
+                                         std::span<const MtpAttentionProjectionWeights* const> w,
+                                         std::span<const Tensor> query,
+                                         std::span<const Tensor> gate,
+                                         std::span<const Tensor> key,
+                                         std::span<const Tensor> value,
+                                         std::span<WorkspaceArena* const> workspace,
                                          const ExecutionContext& ec);
-    static void mtp_kv_projection(const std::array<Tensor, 2>& hidden,
-                                  const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                  const std::array<Tensor, 2>& key,
-                                  const std::array<Tensor, 2>& value,
-                                  const std::array<WorkspaceArena*, 2>& workspace,
+    static void mtp_kv_projection(std::span<const Tensor> hidden,
+                                  std::span<const MtpAttentionProjectionWeights* const> w,
+                                  std::span<const Tensor> key,
+                                  std::span<const Tensor> value,
+                                  std::span<WorkspaceArena* const> workspace,
                                   const ExecutionContext& ec);
-    static void mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
-                                      const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                      const std::array<Tensor, 2>& query,
-                                      const std::array<Tensor, 2>& gate,
-                                      const std::array<WorkspaceArena*, 2>& workspace,
+    static void mtp_q_gate_projection(std::span<const Tensor> hidden,
+                                      std::span<const MtpAttentionProjectionWeights* const> w,
+                                      std::span<const Tensor> query,
+                                      std::span<const Tensor> gate,
+                                      std::span<WorkspaceArena* const> workspace,
                                       const ExecutionContext& ec);
-    static void mtp_post_mixer(const std::array<Tensor, 2>& hidden,
-                               const std::array<const MtpPostMixerWeights*, 2>& w,
-                               const std::array<Tensor, 2>& residual,
-                               const std::array<Tensor, 2>& staging,
-                               const std::array<WorkspaceArena*, 2>& workspace,
+    static void mtp_post_mixer(std::span<const Tensor> hidden,
+                               std::span<const MtpPostMixerWeights* const> w,
+                               std::span<const Tensor> residual,
+                               std::span<const Tensor> staging,
+                               std::span<WorkspaceArena* const> workspace,
                                const ExecutionContext& ec, const ops::PeerEvents& ev);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
@@ -188,40 +188,40 @@ struct Variant {
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
     [[nodiscard]] static std::size_t
-    mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+    mtp_attention_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                                 std::int32_t last);
     [[nodiscard]] static std::size_t
-    mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    mtp_q_gate_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                   qwen3_6::TextPhase phase, std::int32_t first,
                                                   std::int32_t last);
     [[nodiscard]] static std::size_t
-    attention_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    attention_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                          qwen3_6::TextPhase phase,
                                                          std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                   qwen3_6::TextPhase phase, std::int32_t first,
                                                   std::int32_t last);
     [[nodiscard]] static std::size_t gdn_input_projection_snapshot_workspace_capacity_bytes(
-        WeightsProfile weights_profile, qwen3_6::TextPhase phase, std::int32_t batch_size,
+        WeightsProfile weights_profile, int tp, qwen3_6::TextPhase phase, std::int32_t batch_size,
         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t gdn_input_projection_record_workspace_capacity_bytes(
-        WeightsProfile weights_profile, qwen3_6::TextPhase phase, std::int32_t batch_size,
+        WeightsProfile weights_profile, int tp, qwen3_6::TextPhase phase, std::int32_t batch_size,
         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                    qwen3_6::TextPhase phase, std::int32_t first,
                                                    std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_norm_control_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    gdn_norm_control_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                          std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
+    post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, int tp, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                              std::int32_t last);
 };
 

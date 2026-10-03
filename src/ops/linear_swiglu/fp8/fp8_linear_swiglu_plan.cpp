@@ -179,7 +179,20 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 
 std::size_t fp8_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy,
                                                              std::int32_t min_tokens,
-                                                             std::int32_t max_tokens) {
+                                                             std::int32_t max_tokens, int tp) {
+#ifdef NINFER_VOLTA_BUILD
+    if (tp == 4 && policy == LinearPolicy::A16Only && min_tokens > 0 && max_tokens >= min_tokens) {
+        using Geometry = Fp8MlpGateUpTp4ColumnGeometry;
+        if (max_tokens < kVoltaCutlassMinT && fp8_linear_swiglu_qpn_split_supported(
+                Geometry::kOutputRows, Geometry::kInputRows, max_tokens)) {
+            return qpn_split_workspace_bytes<Geometry>(max_tokens);
+        }
+        return materialized_workspace_bytes(Geometry::kOutputRows, max_tokens) +
+               fp8_cutlass_sm70_workspace_bytes(Geometry::kOutputRows, Geometry::kInputRows,
+                                                max_tokens);
+    }
+#endif
+    if (tp != 2) { throw std::invalid_argument("fp8 linear_swiglu: unsupported TP profile"); }
     return capacity_bytes_impl<Fp8MlpGateUpTp2ColumnGeometry>(policy, min_tokens, max_tokens);
 }
 
@@ -196,6 +209,27 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
 void fp8_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                       LinearPolicy policy, WorkspaceArena* workspace,
                                       cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (weight.n == 8704 && weight.k == 5120) {
+        if (policy != LinearPolicy::A16Only || workspace == nullptr) {
+            throw std::invalid_argument("fp8 TP4 linear_swiglu requires A16 and workspace");
+        }
+        auto scope = workspace->scope();
+        if (x.ne[1] < kVoltaCutlassMinT &&
+            fp8_linear_swiglu_qpn_split_supported(weight.n, weight.k, x.ne[1])) {
+            auto scratch = allocate_qpn_split_workspace<Fp8MlpGateUpTp4ColumnGeometry>(
+                *workspace, x.ne[1]);
+            fp8_linear_swiglu_qpn_split_launch(x, weight, out,
+                static_cast<float*>(scratch.gate.data), static_cast<float*>(scratch.up.data),
+                stream);
+        } else {
+            Tensor projected = allocate_materialized_workspace(*workspace, weight.n, x.ne[1]);
+            fp8_cutlass_sm70_unscaled_fp32_launch(x, weight, projected, *workspace, stream);
+            swiglu_fp32_launch(projected, weight.scales, out, stream);
+        }
+        return;
+    }
+#endif
     if (resolve_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
         if (workspace == nullptr && x.ne[1] == 1) {
             fp8_linear_swiglu_decode_launch_shard(x, weight, out, stream);

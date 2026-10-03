@@ -20,6 +20,15 @@
 namespace ninfer::ops::detail {
 namespace {
 
+__global__ void remap_positions_kernel(const std::int32_t* positions,
+                                       const std::int32_t* indices, std::int32_t* out, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const int p = positions[i];
+        out[i] = indices[p / kPagedKVPageSize] * kPagedKVPageSize + p % kPagedKVPageSize;
+    }
+}
+
 #ifdef NINFER_VOLTA_BUILD
 // Narrowest token tile that takes the Volta tensor-core decode route; anything below stays on the
 // SIMT kernel. Tuned by measurement -- see the note at the route itself and the V100 implementation.
@@ -489,6 +498,16 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
                                                    envelope, partial_acc, partial_m, partial_l, out,
                                                    stream);
     });
+}
+
+void gqa_remap_positions_launch(const Tensor& positions, const Tensor& page_indices,
+                                Tensor& out, cudaStream_t stream) {
+    const int count = positions.ne[0] * positions.ne[1];
+    remap_positions_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(page_indices.data),
+        static_cast<std::int32_t*>(out.data), count);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

@@ -12,6 +12,9 @@
 
 namespace ninfer::ops::detail {
 
+void gqa_remap_positions_launch(const Tensor& positions, const Tensor& page_indices,
+                                Tensor& out, cudaStream_t stream);
+
 enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt, VoltaFlash };
 
 struct GqaSmallTInvocation {

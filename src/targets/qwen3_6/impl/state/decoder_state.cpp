@@ -14,7 +14,7 @@ std::uint32_t page_count(std::uint32_t capacity) {
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
                               std::int32_t quant_group, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups) {
+                              std::uint32_t physical_page_groups, bool ram_kv) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -27,7 +27,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
+    if (!ram_kv && physical_page_groups < logical_pages) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
 
@@ -35,6 +35,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.page_group_count      = physical_page_groups;
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
+    pool_spec.ram_enabled           = ram_kv;
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
@@ -61,11 +62,11 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups);
+                                spec.kv_table_rows, spec.text_physical_page_groups, spec.ram_kv);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
+                                   spec.kv_table_rows, spec.mtp_physical_page_groups, spec.ram_kv);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;
@@ -110,6 +111,9 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
         .quant_group   = quant_group_,
+        .read_indices = pool_.read_indices(),
+        .read_table = pool_.read_tables(),
+        .read_capacity = pool_.ram_enabled() ? pool_.page_group_count() * kPagedKVPageSize : 0U,
     };
 }
 
@@ -128,6 +132,9 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
         .quant_group   = quant_group_,
+        .read_indices = pool_.read_indices(),
+        .read_tables = pool_.read_tables(),
+        .read_capacity = pool_.ram_enabled() ? pool_.page_group_count() * kPagedKVPageSize : 0U,
     };
 }
 

@@ -395,6 +395,53 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
     const auto pattern_group = [&](std::int64_t local_group, std::uint64_t shift) -> std::uint64_t {
         return decorrelate(static_cast<std::uint64_t>(local_group) + shift, 0xc2b2U);
     };
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (n % 128 || k % 128 || row_origin % 128 || column_origin % 128) {
+            throw std::invalid_argument("FP8 block fixture requires whole 128 blocks");
+        }
+        PackedWeight packed;
+        packed.code_plane_bytes = static_cast<std::uint64_t>(n) * k;
+        packed.scale_plane_offset = detail::align_up_size(packed.code_plane_bytes, 256);
+        packed.scale_plane_bytes = static_cast<std::uint64_t>(n / 128) * (k / 128) * 2;
+        packed.payload.resize(packed.scale_plane_offset + packed.scale_plane_bytes);
+        constexpr std::uint8_t codes[]{0, 128, 1, 129, 7, 135, 8, 136,
+                                       24, 152, 56, 184, 68, 196, 126, 254};
+        for (int row = 0; row < n; ++row) {
+            for (int col = 0; col < k; ++col) {
+                const auto hash = detail::mix64((static_cast<std::uint64_t>(row + row_origin) << 32)
+                                                ^ (col + column_origin) ^ seed);
+                packed.payload[static_cast<std::size_t>(row) * k + col] = codes[hash & 15];
+            }
+        }
+        constexpr std::uint16_t scales[]{0x3a89, 0x3b09, 0x3b55, 0x3bb3};
+        for (int rb = 0; rb < n / 128; ++rb) {
+            for (int kb = 0; kb < k / 128; ++kb) {
+                const auto hash = detail::mix64((static_cast<std::uint64_t>(rb + row_origin / 128) << 32)
+                                                ^ (kb + column_origin / 128) ^ seed);
+                detail::store_u16_le(packed.payload, packed.scale_plane_offset +
+                    (static_cast<std::size_t>(rb) * (k / 128) + kb) * 2, scales[hash & 3]);
+            }
+        }
+        Weight& w = packed.weight;
+        w.qtype = qtype;
+        w.layout = QuantLayout::BlockScale128;
+        w.scale_dtype = DType::BF16;
+        w.group = w.group_size = 128;
+        w.ndim = 2;
+        w.n = w.shape[0] = w.padded_shape[0] = n;
+        w.k = w.shape[1] = w.padded_shape[1] = k;
+        w.shape[2] = w.shape[3] = w.padded_shape[2] = w.padded_shape[3] = 1;
+        w.scale_ne[0] = k / 128;
+        w.scale_ne[1] = n / 128;
+        w.scale_ne[2] = w.scale_ne[3] = 1;
+        w.scale_nb[0] = 2;
+        w.scale_nb[1] = k / 128 * 2;
+        w.scale_nb[2] = w.scale_nb[3] = w.scale_nb[1] * (n / 128);
+        w.payload_bytes = packed.payload.size();
+        w.payload = w.qdata = packed.payload.data();
+        w.scales = packed.payload.data() + packed.scale_plane_offset;
+        return packed;
+    }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
             throw std::invalid_argument(
@@ -765,6 +812,39 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
 
 // Independent logical decode for numerical oracles. The packed representation is materialized as
 // its specified logical FP32 weight before the complete Op oracle receives it.
+// Independent host encoding of a represented SM70 QPN input. Logical (row,K16) iteration is
+// intentionally distinct from the production packed-index transform. Keep the native fixture
+// for the numerical oracle; this returns only the permuted device payload.
+inline std::vector<std::uint8_t> nvfp4_qpn_payload(const PackedWeight& native) {
+    if (native.weight.qtype != QType::NVFP4 ||
+        native.weight.layout != QuantLayout::BlockScaleK16M128x4) {
+        throw std::invalid_argument("NVFP4 QPN fixture requires the native layout");
+    }
+    auto packed = native.payload;
+    const int n = native.weight.n, k = native.weight.k, groups = k / 16;
+    for (int row = 0; row < n; ++row) {
+        const int r = row % 32;
+        const int lane = (r / 8) * 4 + (r % 4) + ((r % 8) / 4) * 16;
+        for (int group = 0; group < groups; ++group) {
+            const auto tuple = (static_cast<std::size_t>(row / 32) * groups + group) * 32 + lane;
+            for (int j = 0; j < 16; ++j) {
+                const int column = group * 16 + j;
+                const auto source = native.payload[static_cast<std::size_t>(row) * k / 2 + column / 2];
+                const int code = (source >> (4 * (column % 2))) & 15;
+                const int position = (j / 8) * 8 + (j % 8) / 2 + (j % 2) * 4;
+                auto& byte = packed[tuple * 8 + position / 2];
+                const int shift = 4 * (position % 2);
+                byte = static_cast<std::uint8_t>((byte & ~(15 << shift)) | (code << shift));
+            }
+            const auto scale = native.scale_plane_offset +
+                (static_cast<std::size_t>(row / 128) * (k / 64) + group / 4) * 512 +
+                (row % 32) * 16 + ((row % 128) / 32) * 4 + group % 4;
+            packed[native.scale_plane_offset + tuple] = native.payload[scale];
+        }
+    }
+    return packed;
+}
+
 inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
                                   std::int32_t column) {
     const Weight& weight = packed.weight;
@@ -772,6 +852,12 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
         throw std::out_of_range("quantized-weight fixture: logical index out of range");
     }
 
+    if (weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        const auto code = packed.payload[static_cast<std::size_t>(row) * weight.k + column];
+        const auto scale = detail::load_u16_le(packed.payload, packed.scale_plane_offset +
+            (static_cast<std::size_t>(row / 128) * (weight.k / 128) + column / 128) * 2);
+        return detail::decode_e4m3fn(code) * static_cast<double>(detail::bf16_to_f32(scale));
+    }
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         if (weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
             weight.group != weight.k || weight.group_size != static_cast<std::uint32_t>(weight.k)) {

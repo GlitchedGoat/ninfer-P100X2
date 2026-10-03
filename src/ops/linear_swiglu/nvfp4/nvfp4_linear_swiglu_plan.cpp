@@ -340,7 +340,18 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 
 std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy,
                                                                 std::int32_t min_tokens,
-                                                                std::int32_t max_tokens) {
+                                                                std::int32_t max_tokens, int tp) {
+#ifdef NINFER_VOLTA_BUILD
+    if (tp == 4 && policy == LinearPolicy::A16Only && min_tokens > 0 && max_tokens >= min_tokens) {
+        using Geometry = Nvfp4MlpGateUpTp4ColumnGeometry;
+        if (nvfp4_linear_swiglu_qpn_split_supported(
+                Geometry::kOutputRows, Geometry::kInputRows, max_tokens)) {
+            return qpn_split_workspace_bytes<Geometry>(max_tokens);
+        }
+        return cutlass_route_workspace_bytes<Geometry>(max_tokens);
+    }
+#endif
+    if (tp != 2) { throw std::invalid_argument("nvfp4 linear_swiglu: unsupported TP profile"); }
     return capacity_bytes_impl<Nvfp4MlpGateUpTp2ColumnGeometry>(policy, min_tokens, max_tokens);
 }
 
@@ -353,6 +364,26 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
 void nvfp4_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                         LinearPolicy policy, WorkspaceArena* workspace,
                                         cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (weight.n == 8704 && weight.k == 5120) {
+        if (policy != LinearPolicy::A16Only || workspace == nullptr) {
+            throw std::invalid_argument("nvfp4 TP4 linear_swiglu requires A16 and workspace");
+        }
+        auto scope = workspace->scope();
+        if (nvfp4_linear_swiglu_qpn_split_supported(weight.n, weight.k, x.ne[1])) {
+            auto scratch = allocate_qpn_split_workspace<Nvfp4MlpGateUpTp4ColumnGeometry>(
+                *workspace, x.ne[1]);
+            nvfp4_linear_swiglu_qpn_split_launch(
+                x, weight, out, static_cast<float*>(scratch.gate.data), scratch.activation.data,
+                stream);
+        } else {
+            Tensor projected = workspace->alloc(DType::FP32, {weight.n, x.ne[1]}, 256);
+            nvfp4_cutlass_sm70_fp32_launch(x, weight, projected, *workspace, stream);
+            swiglu_fp32_launch(projected, nullptr, out, stream);
+        }
+        return;
+    }
+#endif
     dispatch_impl<Nvfp4MlpGateUpTp2ColumnGeometry>(x, weight, out, policy, workspace, stream);
 }
 

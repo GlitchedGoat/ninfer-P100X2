@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -43,15 +44,35 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 }
 
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFormat routed_gate_up,
-                 NumericFormat routed_down, artifact::TensorPlacement placement) {
+                 NumericFormat routed_down, artifact::TensorPlacement placement,
+                 bool expert_storage) {
     const auto bind = [&](std::string_view name, NumericFormat format,
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
+    const auto bind_routed = [&](std::string_view name, NumericFormat format,
+                                 std::array<std::uint64_t, 2> shape) {
+        if (!expert_storage) {
+            return artifact::bind_tensor(binder, name, format,
+                                          {shape[0], shape[1]}, placement);
+        }
+        const auto handle = binder.require_tensor(
+            name, format,
+            format == NumericFormat::BF16 || format == NumericFormat::FP32 ||
+                    format == NumericFormat::I32
+                ? artifact::StorageLayout::ContiguousLeV1
+                : artifact::StorageLayout::RowSplitK128V1,
+            std::span<const std::uint64_t>(shape.data(), shape.size()));
+        binder.materialize_virtual_rows(
+            handle, {artifact::SliceRange{0, shape[0] / 2},
+                     artifact::SliceRange{shape[0] / 2, shape[0] / 2}});
+        return handle;
+    };
     return MoePlan{
         .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16, {257, 2048}),
-        .routed_gate_up     = bind(prefix + "routed_gate_up", routed_gate_up, {262144, 2048}),
-        .routed_down        = bind(prefix + "routed_down", routed_down, {524288, 512}),
+        .routed_gate_up     = bind_routed(prefix + "routed_gate_up", routed_gate_up,
+                                          {262144, 2048}),
+        .routed_down        = bind_routed(prefix + "routed_down", routed_down, {524288, 512}),
         .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S, {1024, 2048}),
         .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S, {2048, 512}),
     };
@@ -94,7 +115,8 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               bool expert_storage) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
@@ -137,7 +159,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
         target.moe = bind_moe(binder, prefix + "moe/", NumericFormat::Q4G64_F16S,
-                              routed_down_format(layer), artifact::TensorPlacement::Device);
+                              routed_down_format(layer), artifact::TensorPlacement::Device,
+                              expert_storage);
     }
 
     out.final_norm =
@@ -176,7 +199,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
     out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
-                                  NumericFormat::W8G32_F16S, mtp_placement);
+                                  NumericFormat::W8G32_F16S, mtp_placement, false);
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
     const artifact::TensorPlacement vision_placement =

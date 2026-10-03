@@ -8,9 +8,11 @@
 // Here exact graph/eager output and acceptance checks protect graph replay and
 // cross-device commits. Fresh, non-speculative teacher-forced logits check every
 // speculative output position, recording the chosen token's actual logit deficit (not
-// merely the reference's top-two gap). No near-tie tolerance silently licenses
-// a different greedy choice. Prefill/decode rounding can cause this strict check
-// to fail; such a result requires investigation rather than claiming losslessness.
+// merely the reference's top-two gap). Q4_K_M/NVFP4 retain the strict zero-disagreement
+// criterion. Native block-FP8 also measures ordinary decode's re-prefill discrepancy:
+// each probe's speculative worst deficit must not exceed its ordinary control and
+// both stay within the established 0.5-logit BF16 grouping bound. This is not a
+// claim of bit-identical trajectories or an independent whole-model quality score.
 //
 // NINFER_V100X2_ARTIFACT=/path/to/qwen3_8_27b_q4_k_m.ninfer ctest -R v100x2_real
 // Add NINFER_V100X2_PROPOSAL_HEAD=optimized to exercise the shortlist proposal head.
@@ -54,8 +56,8 @@ ninfer::EngineOptions engine_options(const char* artifact, bool speculation, boo
                                      ninfer::SpeculativeOptions profile) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
-    options.tp = 2;
-    options.devices = {0, 1};
+    options.tp = v100x2_test::tp();
+    options.devices = v100x2_test::devices();
     options.max_context = kContext;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(kContext);
     options.prefill_chunk = kChunk;
@@ -82,6 +84,21 @@ ninfer::GenerationResult generate(ninfer::Engine& engine, const Tokens& prompt,
     require(result.generated_token_ids.size() == count, "generation ended before its token budget");
     require(result.reused_prompt_tokens == 0, "the full-reset probe unexpectedly reused a prefix");
     return result;
+}
+
+ninfer::RequestOptions sampled_options() {
+    auto options = request_options(kOutputs);
+    options.execution.sampling.temperature = 0.7F;
+    options.execution.sampling.top_k = 20;
+    options.execution.sampling.top_p = 0.8F;
+    options.execution.sampling.presence_penalty = 0.5F;
+    options.execution.sampling.frequency_penalty = 0.3F;
+    options.execution.sampling.seed = 20260826ULL;
+    return options;
+}
+
+ninfer::GenerationResult generate_sampled(ninfer::Engine& engine, const Tokens& prompt) {
+    return engine.generate(engine.prepare_tokens(prompt, false), sampled_options());
 }
 
 Tokens chat_tokens(ninfer::Engine& engine, const std::string& text) {
@@ -164,6 +181,40 @@ void compare_rounds(const ninfer::GenerationResult& captured,
             "graph/eager speculative acceptance or fallback patterns differ");
 }
 
+void exercise_mtp_batches(const char* artifact, ninfer::SpeculativeOptions profile,
+                           const std::array<Tokens, kProbes>& inputs) {
+    std::array<std::array<ninfer::GenerationResult, 2>, 2> captured;
+    for (bool graphs : {true, false}) {
+        auto options = engine_options(artifact, true, graphs, profile);
+        options.max_concurrency = 2;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2 * kContext);
+        ninfer::Engine engine(options);
+        engine.debug_enable_peer_egress_check(true);
+        for (std::size_t mixed = 0; mixed < 2; ++mixed) {
+            auto first = engine.prepare_tokens(inputs[0], false);
+            auto second = engine.prepare_tokens(inputs[1], false);
+            const auto before = engine.runtime_stats();
+            auto a = engine.submit(std::move(first), request_options(kOutputs));
+            auto b = engine.submit(std::move(second), mixed ? sampled_options() : request_options(kOutputs));
+            std::array<ninfer::GenerationResult, 2> results{a.wait(), b.wait()};
+            const auto after = engine.runtime_stats();
+            require(after.decode_row_rounds - before.decode_row_rounds >
+                        after.decode_rounds - before.decode_rounds,
+                    "greedy/mixed MTP probe did not execute a multi-row decode round");
+            for (std::size_t lane = 0; lane < 2; ++lane) {
+                require_speculation(results[lane], profile);
+                if (graphs) {
+                    captured[mixed][lane] = std::move(results[lane]);
+                } else {
+                    compare_rounds(captured[mixed][lane], results[lane]);
+                }
+            }
+        }
+        v100x2_test::check_peer_egress(engine, profile.backend);
+    }
+    std::cout << "MTP B=2 greedy/mixed graph/eager outputs and acceptance PASS" << std::endl;
+}
+
 int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
     std::cout << "spec="
               << (profile.backend == ninfer::SpeculativeBackend::Mtp ? "mtp" : "dflash")
@@ -172,11 +223,14 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
               << std::endl;
     std::array<Tokens, kProbes> inputs;
     std::array<ninfer::GenerationResult, kProbes> captured;
+    ninfer::GenerationResult captured_sampled;
     std::array<std::array<Logits, kLogitPositions.size()>, kProbes> speculative_logits;
     std::uint64_t accepted_total = 0;
+    bool native_fp8 = false;
     {
         ninfer::Engine engine(engine_options(artifact, true, true, profile));
         v100x2_test::check_identity(engine);
+        native_fp8 = engine.load_summary().weights_id == "fp8";
         inputs = prompts(engine);
         engine.debug_enable_peer_egress_check(true);
         for (std::size_t p = 0; p < kProbes; ++p) {
@@ -189,6 +243,10 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
                       << "/" << captured[p].speculative.drafted_tokens << std::endl;
         }
         require(accepted_total > 0, "no proposal was accepted; the commit path was not exercised");
+        // Exercise both graph topologies in one Engine, then switch back to the greedy route.
+        // Nonzero penalties also protect rank-local counter ownership on the full-logit path.
+        captured_sampled = generate_sampled(engine, inputs[0]);
+        compare_rounds(captured[0], generate(engine, inputs[0]));
         v100x2_test::check_peer_egress(engine, profile.backend);
         require(engine.memory_summary().cuda_graph_node_count > 0,
                 "graphs were requested but no decode graph was captured");
@@ -210,6 +268,9 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
             require_speculation(eager, profile);
             compare_rounds(captured[p], eager);
         }
+        compare_rounds(captured_sampled, generate_sampled(engine, inputs[0]));
+        compare_rounds(captured[0], generate(engine, inputs[0]));
+        std::cout << "greedy/sampling route switch and sampled graph/eager parity PASS" << std::endl;
         v100x2_test::check_peer_egress(engine, profile.backend);
         require(engine.memory_summary().cuda_graph_node_count == 0,
                 "the eager control unexpectedly captured a graph");
@@ -217,6 +278,10 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
 
     std::size_t disagreements = 0;
     float worst_deficit = 0.0F;
+    std::size_t ordinary_disagreements = 0;
+    float ordinary_worst_deficit = 0.0F;
+    std::array<float, kProbes> speculative_probe_deficits{};
+    std::array<float, kProbes> ordinary_probe_deficits{};
     {
         ninfer::Engine engine(engine_options(artifact, false, false, profile));
         engine.debug_enable_logit_capture(true);
@@ -226,6 +291,7 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
             std::cout << "probe=" << p << " speculative_vs_plain_sequence_equal="
                       << (plain.generated_token_ids == captured[p].generated_token_ids) << std::endl;
             Tokens context = inputs[p];
+            Tokens ordinary_context = inputs[p];
             for (std::size_t i = 0; i < kOutputs; ++i) {
                 const auto logits = probe(engine, context);
                 const auto best = argmax(logits);
@@ -235,6 +301,7 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
                 if (best != emitted) {
                     const float deficit = value(logits[best]) - value(logits[emitted]);
                     worst_deficit = std::max(worst_deficit, deficit);
+                    speculative_probe_deficits[p] = std::max(speculative_probe_deficits[p], deficit);
                     ++disagreements;
                     std::cerr << "teacher_force probe=" << p << " position=" << i
                               << " target=" << best << " speculative=" << emitted
@@ -247,13 +314,45 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
                     }
                 }
                 context.push_back(emitted);
+                const auto ordinary_logits = probe(engine, ordinary_context);
+                const auto ordinary_best = argmax(ordinary_logits);
+                const auto ordinary_emitted = plain.generated_token_ids[i];
+                if (ordinary_best != ordinary_emitted) {
+                    const float deficit = value(ordinary_logits[ordinary_best]) -
+                                          value(ordinary_logits[ordinary_emitted]);
+                    ordinary_worst_deficit = std::max(ordinary_worst_deficit, deficit);
+                    ordinary_probe_deficits[p] = std::max(ordinary_probe_deficits[p], deficit);
+                    ++ordinary_disagreements;
+                    std::cerr << "ordinary_teacher_force probe=" << p << " position=" << i
+                              << " target=" << ordinary_best << " emitted=" << ordinary_emitted
+                              << " emitted_logit_deficit=" << deficit << '\n';
+                }
+                ordinary_context.push_back(ordinary_emitted);
             }
         }
     }
     std::cout << "teacher_force_positions=" << kProbes * kOutputs
               << " disagreements=" << disagreements << " worst_emitted_logit_deficit="
               << worst_deficit << std::endl;
-    require(disagreements == 0, "outputs failed strict non-speculative teacher-forced argmax");
+    std::cout << "ordinary_teacher_force_positions=" << kProbes * kOutputs
+              << " disagreements=" << ordinary_disagreements << " worst_emitted_logit_deficit="
+              << ordinary_worst_deficit << std::endl;
+    if (native_fp8) {
+        // Existing model-level BF16 grouping bound, not fitted to this FP8 fixture.
+        // Independent FP64 Op oracles still qualify the represented block codes/scales.
+        constexpr float kNearTieBound = 0.5F;
+        for (std::size_t p = 0; p < kProbes; ++p) {
+            require(ordinary_probe_deficits[p] <= kNearTieBound &&
+                        speculative_probe_deficits[p] <= ordinary_probe_deficits[p],
+                    "native FP8 speculation exceeds its ordinary re-prefill error envelope");
+        }
+        std::cout << "native FP8 per-probe ordinary-controlled BF16 grouping check PASS" << std::endl;
+    } else {
+        require(disagreements == 0, "outputs failed strict non-speculative teacher-forced argmax");
+    }
+    if (profile.backend == ninfer::SpeculativeBackend::Mtp) {
+        exercise_mtp_batches(artifact, profile, inputs);
+    }
     return 0;
 }
 
@@ -266,8 +365,8 @@ int main() {
         return 77;
     }
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
-        std::cout << "skip: V100X2 integration requires two CUDA devices\n";
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < v100x2_test::tp()) {
+        std::cout << "skip: insufficient devices for the selected tensor-parallel width\n";
         return 77;
     }
     try {

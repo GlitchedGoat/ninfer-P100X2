@@ -68,10 +68,10 @@ int pack_case(std::int32_t hidden, std::int32_t tokens) {
     return failures;
 }
 
-int split_case(std::int32_t tokens) {
-    constexpr std::int32_t kInputRows = 14336;
-    constexpr std::int32_t kQueryRows = 6144;
-    constexpr std::int32_t kKvRows    = 1024;
+int split_case(std::int32_t tokens, int tp) {
+    const std::int32_t kInputRows = 14336 / tp;
+    const std::int32_t kQueryRows = 6144 / tp;
+    const std::int32_t kKvRows    = 1024 / tp;
     const auto input = bit_pattern(static_cast<std::size_t>(kInputRows) * tokens, 0x2468'ace0u);
     std::vector<std::uint16_t> expected_query(static_cast<std::size_t>(kQueryRows) * tokens);
     std::vector<std::uint16_t> expected_key(static_cast<std::size_t>(kKvRows) * tokens);
@@ -105,10 +105,10 @@ int split_case(std::int32_t tokens) {
     device_value.fill(0xcd);
 
     Tensor input_tensor(device_input.data(), DType::BF16, {kInputRows, tokens});
-    Tensor query_tensor(device_query.data(), DType::BF16, {256, 24, tokens});
-    Tensor key_tensor(device_key.data(), DType::BF16, {256, 4, tokens});
-    Tensor gate_tensor(device_gate.data(), DType::BF16, {256, 24, tokens});
-    Tensor value_tensor(device_value.data(), DType::BF16, {256, 4, tokens});
+    Tensor query_tensor(device_query.data(), DType::BF16, {256, 24 / tp, tokens});
+    Tensor key_tensor(device_key.data(), DType::BF16, {256, 4 / tp, tokens});
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {256, 24 / tp, tokens});
+    Tensor value_tensor(device_value.data(), DType::BF16, {256, 4 / tp, tokens});
     ops::mtp_split_attn_in(input_tensor, query_tensor, key_tensor, gate_tensor, value_tensor,
                            nullptr);
     cuda_synchronize();
@@ -152,9 +152,11 @@ int main() {
     failures += pack_case(2048, 1);
     failures += pack_case(2048, 6);
     failures += pack_case(2048, 48);
-    failures += split_case(1);
-    failures += split_case(6);
-    failures += split_case(48);
+    for (int tp : {1, 2, 4}) {
+        failures += split_case(1, tp);
+        failures += split_case(6, tp);
+        failures += split_case(48, tp);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " mtp_pack\n";
     return failures ? 1 : 0;
 }

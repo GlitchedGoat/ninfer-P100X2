@@ -74,8 +74,8 @@ KvCacheStorage parse_kv_dtype(const char* text) {
 
 int parse_tp(const char* text) {
     const int value = parse_nonnegative_int(text, "tp");
-    if (value != 1 && value != 2) {
-        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    if (value != 1 && value != 2 && value != 4) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1, 2 or 4)");
     }
     return value;
 }
@@ -93,8 +93,8 @@ std::vector<int> parse_devices(const char* text) {
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
-    if (result.empty() || result.size() > 2) {
-        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    if (result.size() != 1 && result.size() != 2 && result.size() != 4) {
+        throw std::invalid_argument("--devices must list 1, 2 or 4 device ids");
     }
     return result;
 }
@@ -114,19 +114,22 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
-           "[--devices N,N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
+           "[--devices N,...] [--storage-device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       --ram-kv-window: experimental approximate lexical RAM-KV; one SM70 27B Text/MTP request, TP1/TP2\n"
+           "       RAM archive budget defaults to 32000000000 bytes (not process RSS); disabled without the window option\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
@@ -144,7 +147,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
-           "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
+           "       Prefix reuse supports parallel Text/MTP, including exact prompt hits.\n"
            "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
            "       an arbitrary matching token prefix is not a reusable checkpoint.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -154,6 +157,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --tp selects the tensor-parallel degree (default 1); --tp 2 splits the model "
            "across two GPUs and requires --devices; it supports --spec mtp and --spec dflash, "
            "but not --vision.\n"
+           "       --tp 4 supports SM70 Qwen3.8-27B NVFP4/native FP8 Text/MTP with "
+           "--devices 0,1,2,3; Vision and DFlash are unavailable.\n"
            "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
@@ -222,6 +227,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--ram-kv-window") {
+            options.ram_kv.gpu_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ram-kv-window"), "ram-kv-window"));
+            if (options.ram_kv.gpu_tokens == 0) { throw std::invalid_argument("RAM KV window must be positive"); }
+        } else if (arg == "--ram-kv-budget-bytes") {
+            options.ram_kv.budget_bytes = parse_u64(require_value("--ram-kv-budget-bytes"), "ram-kv-budget-bytes");
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -292,6 +303,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--devices") {
             options.devices  = parse_devices(require_value("--devices"));
             devices_explicit = true;
+        } else if (arg == "--storage-device") {
+            options.storage_device = parse_nonnegative_int(require_value("--storage-device"),
+                                                            "storage-device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -345,7 +359,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(
+            options.ram_kv.gpu_tokens != 0 ? options.ram_kv.gpu_tokens : options.max_context);
     }
     if (devices_explicit) {
         if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
@@ -362,7 +377,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

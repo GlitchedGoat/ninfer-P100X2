@@ -2107,11 +2107,14 @@ int run_leg_c(const ExecutionContext& ec) {
     std::cout << "\n--- Leg C: gdn_input_proj_conv_snapshot / conv_record channel split "
                  "(contract 2) ---\n";
     int failures = 0;
+    const auto nvfp4_policy = std::min(ec.dev[0]->sm(), ec.dev[1]->sm()) >= 120
+                                 ? ops::LinearPolicy::AllowA4
+                                 : ops::LinearPolicy::A16Only;
     const std::vector<ConvCase> cases{
         {"fp8 gdn conv", QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::A16Only, 1, 4, false},
         {"fp8 gdn conv", QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::AllowA8, 2, 3, true},
         {"nvfp4 gdn conv", QType::NVFP4, ops::LinearPolicy::A16Only, 1, 4, false},
-        {"nvfp4 gdn conv", QType::NVFP4, ops::LinearPolicy::AllowA4, 2, 3, true},
+        {"nvfp4 gdn conv", QType::NVFP4, nvfp4_policy, 2, 3, true},
         // Split-storage two-weight form (Q4 query_key + Q5 value_z), the groupwise profile's
         // binding for this object -- a real tp2 + groupwise + MTP route, so it gets the same GPU
         // parity treatment as the fused forms rather than registry coverage alone. A16 only.
@@ -2494,7 +2497,7 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, peer_access);
 
     failures += verify_rejections(ec);
     failures += verify_conv_channel_map();

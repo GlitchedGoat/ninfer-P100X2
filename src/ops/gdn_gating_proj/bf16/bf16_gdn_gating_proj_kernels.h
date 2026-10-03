@@ -107,6 +107,7 @@ void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,
                                     cudaStream_t stream);
 // Transient workspace required by bf16_gdn_gating_dispatch_shard for the given token count.
-[[nodiscard]] std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens);
+[[nodiscard]] std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens,
+                                                               std::int32_t heads = 24);
 
 } // namespace ninfer::ops::detail

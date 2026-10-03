@@ -27,6 +27,14 @@ enum class Fp8LinearAddRoute : std::uint8_t {
 
 Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                 LinearPolicy policy, std::int32_t tokens) {
+#ifdef NINFER_VOLTA_BUILD
+    if (tokens > 0 && output_rows == 5120 && (input_rows == 1536 || input_rows == 4352)) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("fp8 TP4 linear_add admits only SM70 A16");
+        }
+        return Fp8LinearAddRoute::LinearThenAdd;
+    }
+#endif
     // TP2: also admit the row-parallel halves of the two residual geometries (6144 -> 3072,
     // 17408 -> 8704) -- the same shape rule NVFP4's own resolve_route widening follows
     // (nvfp4_linear_add_plan.cpp), so ops::linear_add_row_parallel's fused rank can call this

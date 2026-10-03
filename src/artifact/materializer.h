@@ -34,10 +34,11 @@ struct MaterializationStats {
 
 class MaterializedArtifact {
 public:
-    MaterializedArtifact()                                           = default;
-    ~MaterializedArtifact()                                          = default;
-    MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
-    MaterializedArtifact& operator=(MaterializedArtifact&&) noexcept = default;
+    struct VirtualMapping;
+    MaterializedArtifact();
+    ~MaterializedArtifact();
+    MaterializedArtifact(MaterializedArtifact&&) noexcept;
+    MaterializedArtifact& operator=(MaterializedArtifact&&) noexcept;
     MaterializedArtifact(const MaterializedArtifact&)                = delete;
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
@@ -72,6 +73,7 @@ private:
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> device_arena_;
     std::array<int, kMaximumDevices> physical_devices_{};
     std::vector<ObjectStorage> objects_;
+    std::vector<std::unique_ptr<VirtualMapping>> virtual_mappings_;
     MaterializationStats stats_;
 };
 

@@ -59,6 +59,7 @@ struct FoldProfile {
     std::int32_t layers;
     std::int32_t value_heads;
     std::int32_t conv_channels;
+    std::int32_t qk_heads = kQkHeads;
 };
 
 constexpr ReductionCriterion recurrent_state_criterion() {
@@ -73,10 +74,10 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
                        const std::vector<float>& actual) {
     gdn_ref::Inputs input;
     input.head_dim    = kStateDim;
-    input.qk_heads    = kQkHeads;
+    input.qk_heads    = profile.qk_heads;
     input.value_heads = profile.value_heads;
     input.tokens      = commit;
-    input.q.assign(static_cast<std::size_t>(kStateDim) * kQkHeads * commit, 0.0F);
+    input.q.assign(static_cast<std::size_t>(kStateDim) * profile.qk_heads * commit, 0.0F);
     input.k.resize(input.q.size());
     input.v.resize(static_cast<std::size_t>(kStateDim) * profile.value_heads * commit);
     input.g.resize(static_cast<std::size_t>(profile.value_heads) * commit);
@@ -85,9 +86,9 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
 
     for (std::int32_t token = 0; token < commit; ++token) {
         const std::int64_t column = token;
-        for (std::int32_t head = 0; head < kQkHeads; ++head) {
+        for (std::int32_t head = 0; head < profile.qk_heads; ++head) {
             const std::size_t base =
-                static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
+                static_cast<std::size_t>((column * profile.qk_heads + head) * kStateDim);
             for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                 input.k[base + dim] = bf16_to_f32(key_records[base + dim]);
             }
@@ -137,7 +138,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         .record_capacity = kRecordCapacity,
         .width           = width,
         .conv_channels   = profile.conv_channels,
-        .qk_heads        = kQkHeads,
+        .qk_heads        = profile.qk_heads,
         .value_heads     = profile.value_heads,
         .key_dim         = kStateDim,
         .value_dim       = kStateDim,
@@ -168,9 +169,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                  channel] =
                         bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
                 }
-                for (std::int32_t head = 0; head < kQkHeads; ++head) {
+                for (std::int32_t head = 0; head < profile.qk_heads; ++head) {
                     const std::size_t base =
-                        static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
+                        static_cast<std::size_t>((column * profile.qk_heads + head) * kStateDim);
                     for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                         key_records[base + dim] =
                             bf16_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
@@ -296,7 +297,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     expected_recurrent.fill(0);
     DeviceBuffer local_snapshot_state(static_cast<std::size_t>(width + 1) * recurrent_slot_bytes);
     local_snapshot_state.fill(0);
-    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
+    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * profile.qk_heads * width;
     const std::size_t out_elements =
         static_cast<std::size_t>(kStateDim) * profile.value_heads * width;
     DeviceBuffer q(q_elements * sizeof(std::uint16_t));
@@ -312,7 +313,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     initial_device.copy_from_host(&local_initial_slot, sizeof(local_initial_slot));
     base_device.copy_from_host(&local_base_slot, sizeof(local_base_slot));
 
-    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, kQkHeads, width, 1});
+    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, profile.qk_heads, width, 1});
     Tensor local_states(local_snapshot_state.p, DType::FP32,
                         {kStateDim, kStateDim, profile.value_heads, width + 1});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
@@ -722,6 +723,8 @@ int main() {
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
+    failures += run_case({48, 12, 2560, 4}, 4, 4, {0, 1, 3, 4}, 1822U);
+    failures += run_case({48, 12, 2560, 4}, 6, 1, {6}, 1823U);
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);

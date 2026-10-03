@@ -115,6 +115,24 @@ std::size_t current_total_device_bytes(int device) {
     return total_bytes;
 }
 
+void enable_weight_storage_peer(ExecutionContext& execution) {
+    if (!execution.has_storage()) { return; }
+    const int primary = execution.primary().device;
+    const int storage = execution.storage->device;
+    int can_access = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, primary, storage));
+    if (!can_access) {
+        throw std::invalid_argument("expert storage mode requires CUDA peer access between the two devices");
+    }
+    CUDA_CHECK(cudaSetDevice(primary));
+    cudaError_t err = cudaDeviceEnablePeerAccess(storage, 0);
+    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) { CUDA_CHECK(err); }
+    CUDA_CHECK(cudaSetDevice(storage));
+    err = cudaDeviceEnablePeerAccess(primary, 0);
+    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) { CUDA_CHECK(err); }
+    CUDA_CHECK(cudaSetDevice(primary));
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, ExecutionContext& execution,
                                        artifact::Reader& reader, Clock::time_point load_start,
@@ -125,7 +143,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     const int tp                                  = execution.tp;
     DeviceContext& device                         = execution.primary();
 
-    artifact::Binder binder(reader, tp);
+    const int materialization_devices = tp + (execution.has_storage() ? 1 : 0);
+    artifact::Binder binder(reader, materialization_devices, execution.has_storage());
     auto load_plan = Target::plan_load(binder, options, weights_profile);
     // The capacity curve describes ONE device. At tp 2 it is already the per-device curve (halved
     // KV heads, halved GDN state) because the sequence plan is built with `tp`, so the same curve
@@ -143,6 +162,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
                                                  preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
+    enable_weight_storage_peer(execution);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), execution,
                                               progress.callback ? &progress : nullptr);
     const artifact::MaterializationStats stats = materialized.stats();
@@ -151,6 +171,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     for (int rank = 0; rank < tp; ++rank) {
         execution.dev[static_cast<std::size_t>(rank)]->synchronize();
     }
+    if (execution.has_storage()) { execution.storage->synchronize(); }
     std::vector<std::size_t> free_before_runtime;
     free_before_runtime.reserve(static_cast<std::size_t>(tp));
     for (int rank = 0; rank < tp; ++rank) {
@@ -170,6 +191,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     for (int rank = 0; rank < tp; ++rank) {
         execution.dev[static_cast<std::size_t>(rank)]->synchronize();
     }
+    if (execution.has_storage()) { execution.storage->synchronize(); }
     instance->kv_capacity_resolution.available_after_startup_bytes =
         current_free_device_bytes(device.device);
 
@@ -198,8 +220,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         row.workspace_bytes     = memory.workspace.capacity_bytes;
         // Measured per device: instantiating the decode graphs materializes driver state on each
         // device the graph has nodes on, which at tp 2 is both of them.
-        row.cuda_graph_bytes = rank == 0 ? memory.cuda_graph_observed_bytes
-                                         : memory.cuda_graph_peer_observed_bytes;
+        row.cuda_graph_bytes = memory.cuda_graph_rank_observed_bytes[rank];
         row.reserved_bytes = row.weights_bytes + capacity_resolution.runtime_reservation_bytes;
         row.free_after_startup_bytes = current_free_device_bytes(row.device);
         row.total_bytes              = current_total_device_bytes(row.device);

@@ -2,6 +2,134 @@
 
 ## V100X2 measurement and acceptance
 
+### Separate NVLink deployment: TP2 stage
+
+The [NVLink deployment table](../README.md#nvlink-deployment-tp2-stage) is measured on
+2026-10-02 on a different four-V100-SXM2-16GB host, all-pairwise NV2, 300 W per card,
+driver 580.178.04 / CUDA 12.8 / SM70. NInfer uses only devices 0,1 at TP2; devices 2,3
+are idle. A verified direct NVLink mesh bypasses the PCIe-only translated-IOMMU guard,
+then still passes the directed CUDA UVA D2D qualification. No system configuration changed.
+
+The six occupied-context points use the official Qwen3.8-27B NVFP4 v3 artifact, saved final-task
+code prompts with 3072/8192/16384/32768/65536/85000 actual input tokens, 180000 capacity
+(180032 allocated), INT8 group-64 KV, chunk 2560, greedy optimized MTP3, CUDA Graphs, two
+cold requests and no extra warmup/prefix reuse. Each produces one prefill token plus 512
+committed timed decode tokens; graphs prime outside measurement. Prefill is 2101.49 tok/s
+at 3072 and 1463.73 tok/s at 85000; committed decode is 111.19 and 85.53 tok/s respectively.
+Every pair reproduces all 513 output IDs and speculative counters; no EOS/EOG occurs.
+
+The same deployment also completes a capacity-only sweep from 1024 through 65536, with
+512 actual input tokens, chunk 1024 and **256** timed decode tokens at every capacity. The
+smaller output window leaves sufficient speculative margin in the 1024-capacity row.
+All seven requested capacities are allocated exactly. Committed decode is 112.60–112.97 tok/s;
+all 257 output IDs and speculative counters repeat exactly at each capacity.
+
+The ordinary control keeps the saved 3072/85000 inputs, capacity 180000, chunk 2560 and
+512 timed decode tokens, but disables speculation and omits the optimized draft head.
+Its committed decode is 39.584 ± 0.004 / 28.349 ± 0.003 tok/s. MTP/plain output IDs match
+at 85000, not at 3072; within each route both repetitions match. This is not universal
+speculative/ordinary output parity or a scored quality evaluation.
+
+Mean request-phase seconds for the MTP3 occupancy sweep (model load and graph priming excluded):
+
+| Actual input | Prepare | Prefill | Decode, 512 committed tokens | Total request |
+|---:|---:|---:|---:|---:|
+| 3072 | 0.000042 | 1.4618 | 4.6048 | 6.0708 |
+| 8192 | 0.000075 | 3.8749 | 4.6955 | 8.5763 |
+| 16384 | 0.000265 | 7.9909 | 4.9015 | 12.8985 |
+| 32768 | 0.000602 | 17.3586 | 5.0202 | 22.3849 |
+| 65536 | 0.001199 | 40.8425 | 5.6714 | 46.5187 |
+| 85000 | 0.001555 | 58.0711 | 5.9864 | 64.0614 |
+
+The benchmark prepares saved token IDs, so its Prepare column is not raw-text tokenizer latency.
+The first occupancy process reports 56.10 s model load, including 53.56 s upload, 21.20 GB
+artifact bytes read and 22.46 GB host-to-device traffic; these are startup costs, not request
+throughput. Total request also includes boundary/output work outside the two GPU phase timers.
+
+The same four-card host has a separate 1Cat/vLLM control using the existing FP4 and FP8 model
+directories (MTP3, maximum context 180000, 1,570-token prompt, 256 streamed output tokens):
+NVFP4 measured 0.955 s TTFT and 83.03 tok/s streamed decode; FP8 measured 1.590 s TTFT and
+83.23 tok/s. These short-prompt HTTP numbers are not occupied-85K or NInfer-TP4 claims. The
+original OneCat UI remained on port 8888; the temporary controls used loopback 6100/6101.
+
+Reports are on that host in `results/tp2-nvlink/`; the corresponding saved commands and
+`tools/v100/bench_tp.py` distinguish occupied-context, capacity and plain-decode sweeps.
+Wall decode is `n_gen / (total_seconds - first_token_seconds)` and remains separate from
+phase decode. These fixed output windows are not a code-quality score, a same-host NVLink A/B,
+or TP4 results. Ordinary/streaming API and turn-checkpoint prefix reuse pass a separate smoke.
+The TP4 NVFP4 measurements below are separate from the completed native block-128 FP8
+qualification reported with them.
+
+The four-card NVLink host separately ran the production multi-device operator checks. The
+collective suite covers direct NVLink and staged fallback, uneven gathers, broadcasts and
+three graph replays. The quarter-shard BF16 projection suite covers column/row forms at
+`3584×5120`, `5120×1536` and `5120×2560`, plus an exactly-once residual-add route at
+`5120×1536` and `5120×4352`, for one and four active columns. All ten residual/projection
+cases and their graph replays reported zero failures. This proves four-rank transport and
+registered BF16 split mechanics; it does not establish a four-rank Engine schedule or a
+native block-scaled FP8 decoder.
+
+### Separate NVLink deployment: NInfer TP4
+
+Measured on 2026-10-03 on the same four-V100/NV2 host, all devices 0,1,2,3 active. The
+[TP4 occupancy table](../README.md#nvlink-deployment-ninfer-tp4) uses the same saved final-task
+inputs as the earlier TP2 snapshot: official Qwen3.8 NVFP4 v3, 180000 capacity (180032
+allocated), INT8 group-64 KV, chunk 2560, greedy optimized MTP3, CUDA Graphs and two cold
+requests per point. One prefill output plus 512 committed timed decode outputs; no prefix
+reuse, extra warmup or EOS/EOG. All repetition IDs and acceptance counters agree.
+
+| Actual input | Prepare, s | Prefill, s | Decode, 512 committed tokens, s | Total request, s |
+|---:|---:|---:|---:|---:|
+| 3072 | 0.000051 | 1.2899 | 4.0739 | 5.3728 |
+| 8192 | 0.000108 | 3.3922 | 3.7423 | 7.1409 |
+| 16384 | 0.000316 | 6.8790 | 4.1260 | 11.0149 |
+| 32768 | 0.000628 | 14.3753 | 4.3404 | 18.7256 |
+| 65536 | 0.001211 | 31.6256 | 4.6922 | 36.3251 |
+| 85000 | 0.001540 | 43.4132 | 4.9904 | 48.4093 |
+
+Prepare uses saved token IDs, not raw-text tokenization. Load and graph priming are outside
+request timing. The first process reports 60.25 s load (56.94 s upload), 21.20 GB artifact
+reads and 25.01 GB aggregate host-to-device traffic. Rank 0 reserves 6.25 GB weights,
+1.73 GB sequence and 1.61 GB workspace; these are per-device arenas, not four-card sums.
+Observed graph residency is 26/22/22/22 MiB across the four ranks. It is measured separately
+from the 188 MiB per-device graph allowance.
+
+At 85000 input, prefill is 1957.93 ± 2.16 tok/s, committed decode 102.60 ± 0.08 tok/s and
+wall decode 102.51 ± 0.08 tok/s, with 78.56% acceptance. Against the earlier TP2 snapshot,
+these are 33.76% / 19.95% prefill/decode increases. Acceptance and arithmetic grouping differ;
+this is not isolated width scaling, cross-width token parity or a code-quality score.
+
+The four-card NVFP4 gate passes exact graph/eager and sampled routing, B=2 state and all
+64 strict teacher-forced positions, with zero argmax disagreements. Prefix replay/append and
+partial-round truncation pass their exact state controls. A cached-vs-cold divergence at
+position 28 has zero teacher-forced logit deficit; stop-vs-budget truncation yields identical
+append outputs, logits and counters. Cold re-prefill is not claimed bit-identical.
+Reports remain on the remote host in `results/tp4-nvfp4/`.
+
+### Native block-128 FP8 TP4
+
+The converted `qwen3_8_27b_fp8.ninfer` artifact was measured on the same four-card NV2 host,
+with the same 180000 capacity, INT8 group-64 KV, chunk 2560, optimized MTP3 and two cold
+repetitions. The six occupied-context points produced one prefill output plus 512 committed
+decode outputs:
+
+| Actual input | Prefill tok/s | Decode phase tok/s | Decode wall tok/s | Acceptance |
+|---:|---:|---:|---:|---:|
+| 3072 | 2415.00 ± 13.42 | 98.75 ± 0.02 | 98.59 ± 0.02 | 80.04% |
+| 8192 | 2445.95 ± 5.48 | 100.16 ± 0.01 | 100.07 ± 0.02 | 80.44% |
+| 16384 | 2404.93 ± 4.30 | 95.48 ± 0.01 | 95.31 ± 0.02 | 77.27% |
+| 32768 | 2298.05 ± 0.04 | 89.15 ± 0.01 | 89.02 ± 0.01 | 74.68% |
+| 65536 | 2089.18 ± 1.61 | 85.05 ± 0.11 | 84.99 ± 0.11 | 80.22% |
+| 85000 | 1972.43 ± 2.89 | 81.53 ± 0.09 | 81.47 ± 0.09 | 80.58% |
+
+The capacity sweep uses 512 input tokens, 256 committed outputs and chunk 1024. Decode phase
+throughput is 101.12–101.55 tok/s at every requested capacity from 1024 through 65536; all
+allocated capacities, output IDs and speculative counters repeat exactly. Plain controls are
+40.98 tok/s at 3072 and 33.12 tok/s at 85000. The FP8 state gate and prefix gate pass on all
+four ranks. Its numerical rule is ordinary-cold-controlled: three speculative teacher-forced
+argmax differences (maximum deficit 0.125) are within the ordinary control's one difference
+and 0.125 maximum deficit. This is not a token-by-token losslessness claim.
+
 ### P2P enabled
 
 The current host was measured on 2026-10-01 after rebooting with `iommu=pt`: two Tesla
@@ -18,6 +146,8 @@ Graphs. Occupancy measurements fix capacity at 180000 (180032 allocated KV posit
 Graphs are primed outside measurement. Each request produces 513 tokens: one during prefill
 and 512 committed timed decode tokens. Model default stopping is disabled, but no measured
 window actually contains EOS/EOG; every request finishes at the output limit.
+This occupancy/capacity snapshot predates the [greedy and collective update](#exact-greedy-and-small-message-p2p-update).
+Its other occupancies have not been remeasured with that update.
 
 | Actual input tokens | Prefill tok/s | Committed decode tok/s | Wall decode tok/s | Accepted/drafted per run | Rounds | Acceptance |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -125,6 +255,258 @@ below with `--prefill-chunk 2560` and `-r 2`.
 A faster 16-key softmax-update candidate changed output IDs and acceptance and did not
 establish a >10% gain with small quality loss. It was removed; the target attention retains
 its original FP32 accumulation order. No new lossy-attention switch is delivered.
+
+#### Exact greedy and small-message P2P update
+
+The same saved `profiles/bench/v100-code-85000-iommu-pt.ids` input is used for this separate
+matched campaign: official NVFP4 v3, 85000 occupied tokens, 180000 capacity, chunk=2560,
+complete INT8 group-64 KV, TP2, one request, greedy optimized MTP3 and CUDA Graphs. Each
+implementation runs two cold requests without prefix reuse or an extra request warmup;
+load and graph priming are outside request timing. Every request emits one prefill token
+and 512 timed committed decode tokens. Rates are mean ± sample standard deviation.
+
+| Implementation | Prefill tok/s | Committed decode tok/s |
+|---|---:|---:|
+| Control: complete target logits | 1315.36 ± 2.45 | 81.797 ± 0.076 |
+| Exact shard-winner verification | 1312.31 ± 3.15 | 82.396 ± 0.037 |
+| Plus parallel shard argmax | 1312.38 ± 1.68 | 82.434 ± 0.130 |
+| Plus direct-peer small-message sum, delivered | 1311.95 ± 3.70 | **85.212 ± 0.062** |
+
+Combined decode gain is **4.1748%**. The collective step improves decode **3.3699%** over
+the preceding route. The isolated argmax step is within end-to-end noise, and no prefill
+improvement is claimed. All eight requests produce the same 513 IDs and complete speculative
+fields: 357/463 drafts accepted over 155 rounds, 77.1058% acceptance, positions 135/117/105,
+zero fallback steps. The fixed output window contains no EOS/EOG. The older chunk=3072 sweep
+has different rounding/acceptance and is not a matched control for these changes.
+
+Greedy MTP verification now uses the same exact shard-winner route as DFlash: each rank
+computes its represented BF16 logit maximum, equal maxima choose the lower global ID, and
+only FP32 values/I32 indices and final IDs cross the link. At SM70's 124160-row vocabulary
+shards, widths 1–64 use parallel row tiles plus selected-value extraction instead of one CTA
+scanning the whole shard. A cold-L2 captured C4 candidate comparison measured 104.448 →
+14.336 µs for shard 0 and 94.208 → approximately 12 µs for shard 1. Final public-Op rotating
+input measurements are 11.20/10.68 µs respectively, under different cache/timing conditions.
+These are operator results, not an isolated end-to-end speedup claim. Sampled/mixed batches
+keep full logits and rank-local penalty counters. Both graph topologies are warmed/captured
+at startup, so request sampling changes do not trigger capture.
+
+Qualified SM70 P2P allreduces of at most 81920 bytes read both immutable operands and write
+only rank-local sum staging. Both read completions retire before a local D2D copy publishes
+the result into the original operands. This preserves the FP32 two-operand sum and one BF16
+RNE store, requires no extra device storage, and retains the three-phase cross-device order.
+Wide prefill and actual peer-off calls retain DMA plus local combine. A 64-round captured
+public-collective candidate comparison measured 15.136 → 9.360 µs at 10 KiB, 18.832 →
+13.216 µs at 40 KiB and 22.848 → 18.880 µs at 80 KiB. Large peer-read payloads were slower,
+so the delivered dispatch does not use them. These graph-chain measurements are not the
+host-synchronized 500-iteration transport measurements above.
+
+| Delivered request phase | Unprofiled mean |
+|---|---:|
+| Model load, once | 20.019 s, including 17.297 s upload |
+| Prompt preparation, saved IDs | 0.001550 s |
+| Prefill and first token | 64.789 s |
+| Decode, 512 committed tokens | 6.009 s |
+| Remaining request overhead | 0.003267 s |
+| Complete resident request | 70.803 s |
+
+Wall decode averages 85.169 tok/s. The measured complete-request gain is only 0.116% versus
+the 70.885 s control because prefill dominates; this is not claimed as a stable total-request
+speedup. Neither Vision nor prefix reuse is active in this workload.
+
+Independent argmax/state checks cover valid-domain padding, negative winners, cross-shard
+ties, zero/short drafts, ignored greedy penalties, preserved inputs and eager/Graph replay.
+Allreduce passes its independent FP64 oracle on eager/captured routes, odd shapes, the
+40959/40960/40961-element dispatch boundary and skewed 64-round chains, with actual P2P
+enabled and disabled inside the test process. Linear, LinearAdd, SwiGLU and output-head
+split checks pass. NVFP4 real-model and prefix gates pass, including 64 teacher-forcing
+positions, greedy → sampled → greedy route switches with penalties, two-row all-greedy/mixed
+batch Graph/eager output and acceptance equality, and peer-egress consistency. No numerical
+criteria were relaxed. These checks support this transition, not universal model-quality parity.
+
+One broader MTP split suite remains blocked in its pre-existing groupwise Q4/Q5 snapshot
+case: its SM70 shard dispatch selects the Ampere-only grouped-MMA kernel, whose trap was
+confirmed by compute-sanitizer. The preceding W8 MTP/FP8/NVFP4 cases pass. This path is not
+the NVFP4 or GGUF-derived identity used here; it is not counted as a passing regression or
+changed by this optimization. Test-only fixes correct stale BF16 registry expectations,
+newer-device A4/A8 invocation and current-device selection without weakening comparisons.
+
+Local paired reports are `profiles/bench/p2p_mtp_round2/{baseline_85k,greedy_winners_85k,
+greedy_tiled_85k,peer_sum_85k}.json`; they and their corpus are not committed. Reproduction:
+
+```bash
+taskset -c 0-15 build-v100/bench/ninfer_bench \
+  --weights /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  --corpus profiles/bench/v100-code-85000-iommu-pt.ids -pg 85000,512 \
+  --max-ctx 180000 --prefill-chunk 2560 --kv-dtype int8 --tp 2 --devices 0,1 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --warmup 0 -r 2 \
+  --capture-generation -o json --output-file profiles/bench/mtp85k.json
+```
+
+#### QUASAR v3: Volta QPN projections
+
+The separate `qwen3.8-27b/quasar-nvfp4` trial uses the published QUASAR NInfer v3 artifact
+on this two-card PCIe-P2P host, without NVLink. QUASAR is QAT, not mathematically lossless
+compression. Its stored NVFP4 codes/scales and FP32 activation divisors remain unchanged;
+this does not establish BF16-equivalent artifact quality. The profile is text-only and loads
+zero Vision objects onto either GPU; validation-only Vision data remains in the original file.
+
+SM70 Attention/GDN input and output projections now share the load-time QPN layout with MLP.
+Narrow inputs write final output planes directly. Wide projections decode weights once per
+call for CUTLASS and distribute the BF16 result. There is no second resident weight copy,
+A4 activation quantization or attention-history pruning. Independent FP64 input-projection
+oracles cover real TP1/TP2 geometries and QPN/CUTLASS boundaries. Public Engine MTP and DFlash
+gates each pass 64 strict teacher-forced positions and graph/eager sampling checks.
+
+Measured on 2026-10-03: two V100-SXM2 16 GB, 300 W/card, CUDA 12.8 / SM70, saved code inputs,
+chunk 2560, complete INT8 group-64 KV, greedy optimized-head MTP3, CUDA Graphs and no prefix
+reuse. Two measured requests per row; 3072-input rows have no extra warmup, and 85000 input
+follows one complete warmup. Each generates one prefill output and 512 timed committed decode
+outputs. Load and graph priming are outside timing. Decode is committed output divided by
+wall time after the first token; rates are mean ± sample standard deviation.
+
+| Route | Actual input / capacity | Prefill tok/s | Committed wall decode tok/s | Acceptance |
+|---|---:|---:|---:|---:|
+| Before QPN input integration | 3072 / 8192 | 376.71 ± 0.77 | 102.02 ± 0.06 | 85.78% |
+| QPN / MTP3 | 3072 / 8192 | 1751.55 ± 30.90 | 139.80 ± 0.08 | 85.19% |
+| QPN / MTP3, warmed | 85000 / 180000 | 1315.28 ± 2.61 | 100.34 ± 0.05 | 86.62% |
+
+The matched short-input gain is 4.65× prefill / 1.37× decode. Warmed 85K mean prefill,
+decode phase and total request times are 64.625 / 5.100 / 69.729 seconds; the decode-phase
+rate is 100.40 tok/s. MTP weights occupy 8.66 GiB per card. Within each route, repetitions
+reproduce all output IDs and speculative counters. Before/after short-input trajectories
+first differ at output position 270; numerical qualification does not prove unchanged
+end-to-end quality. No BF16 quality score or full-180K/256K occupied-context result is claimed.
+Reports: `profiles/bench/quasar-qpn-projections/{before-mtp3,after-mtp3,after-85k-mtp3-warm}.json`.
+
+#### QUASAR v3: stop-aware task matrix
+
+Measured on 2026-10-03 through the public Engine using the same frozen token IDs as the
+official-v3 non-code sweep below. Four tasks cover a three-chapter Chinese story requesting
+900–1200 Chinese characters and fixed literal items; six-section English-to-Chinese translation
+with at least 20 glossary entries; exactly 32 prescribed JSONL records; and a five-slot logic
+puzzle with a complete service/colour/port mapping and final `CHECK=4606`.
+
+Both backends use TP2 devices 0,1, **98304 context/KV capacity**, chunk 1024, complete INT8
+group-64 KV, greedy CUDA Graphs, zero presence/frequency penalties, disabled thinking/prefix
+reuse and zero Vision GPU objects. MTP uses three drafts and the optimized proposal head;
+DFlash uses seven drafts and the full proposal head. Every case has one full warmup; native
+inputs have two measured repetitions per backend, all other points only one. All 80 measured
+requests stop naturally at their first model end token before the 2048-output budget. Load,
+graph priming, warmup and cooldown are excluded. Committed wall decode is
+`(published_tokens - 1) / (total_seconds - first_token_seconds)`; phase decode is retained
+separately in the report. Counts include the prefill output and terminating model token.
+
+The actual input counts are 129 / 395 / 118 / 417 for native story / translation / JSONL /
+logic, then exactly 1024 / 2048 / 4096 / 8192 / 16384 / 32768 / 65536 / 85000 for each task.
+Distinct technical-document backgrounds precede the unchanged final task/template. Visible
+background varies with length, so this is not a single-variable length or retrieval-quality
+experiment. **D/M means DFlash7 / MTP3** in every paired table. Native decode shows mean ±
+sample standard deviation; other entries are single measurements, not stable means.
+
+##### Chinese story
+
+| Actual input tokens | Prefill tok/s D/M | Committed wall decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 129 (native) | 631.17 / 632.74 | 56.45 ± 0.002 / 89.58 ± 0.007 | 11.43% / 39.80% | 990 / 1152 | No |
+| 1024 | 1587.24 / 1676.19 | 59.98 / 89.34 | 13.73% / 40.11% | 1202 / 1202 | Yes |
+| 2048 | 1588.60 / 1679.56 | 58.38 / 85.06 | 13.80% / 37.80% | 1034 / 1034 | Yes |
+| 4096 | 1576.10 / 1666.56 | 53.75 / 83.76 | 11.42% / 36.47% | 934 / 934 | Yes |
+| 8192 | 1548.49 / 1638.20 | 55.62 / 82.65 | 12.90% / 37.00% | 940 / 940 | Yes |
+| 16384 | 1500.94 / 1583.26 | 58.74 / 85.15 | 15.47% / 41.59% | 952 / 952 | Yes |
+| 32768 | 1415.61 / 1481.05 | 48.32 / 77.06 | 13.08% / 40.12% | 726 / 726 | Yes |
+| 65536 | 1257.29 / 1322.89 | 41.32 / 64.82 | 13.72% / 38.96% | 796 / 796 | Yes |
+| 85000 | 1176.69 / 1226.43 | 39.26 / 61.28 | 14.63% / 39.70% | 1077 / 1077 | Yes |
+
+##### English → Chinese translation
+
+| Actual input tokens | Prefill tok/s D/M | Committed wall decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 395 (native) | 1201.31 / 1238.48 | 162.90 ± 0.021 / 143.66 ± 0.044 | 60.36% / 83.74% | 998 / 858 | No |
+| 1024 | 1587.78 / 1682.12 | 154.45 / 143.26 | 57.56% / 84.42% | 1027 / 1027 | Yes |
+| 2048 | 1581.97 / 1678.69 | 149.46 / 140.75 | 57.28% / 84.32% | 1012 / 1012 | Yes |
+| 4096 | 1570.32 / 1665.85 | 144.89 / 138.87 | 55.06% / 82.24% | 899 / 899 | Yes |
+| 8192 | 1545.72 / 1637.66 | 145.07 / 139.49 | 56.61% / 85.52% | 924 / 975 | No |
+| 16384 | 1505.51 / 1582.73 | 124.65 / 129.88 | 48.96% / 80.69% | 757 / 757 | Yes |
+| 32768 | 1413.89 / 1480.07 | 124.26 / 124.26 | 56.03% / 85.08% | 882 / 882 | Yes |
+| 65536 | 1264.06 / 1322.04 | 98.82 / 102.86 | 52.81% / 81.32% | 883 / 883 | Yes |
+| 85000 | 1184.80 / 1232.95 | 87.06 / 93.29 | 49.87% / 78.03% | 723 / 723 | Yes |
+
+##### 32-record JSONL
+
+| Actual input tokens | Prefill tok/s D/M | Committed wall decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 118 (native) | 563.48 / 567.46 | 247.73 ± 0.134 / 163.33 ± 0.032 | 99.05% / 99.89% | 1190 / 1190 | Yes |
+| 1024 | 1588.03 / 1680.68 | 242.15 / 161.98 | 99.05% / 100.00% | 1190 / 1190 | Yes |
+| 2048 | 1581.29 / 1679.06 | 232.84 / 158.92 | 98.30% / 99.78% | 1190 / 1190 | Yes |
+| 4096 | 1574.58 / 1665.46 | 234.86 / 158.91 | 99.05% / 100.00% | 1190 / 1190 | Yes |
+| 8192 | 1549.08 / 1635.96 | 229.81 / 156.56 | 98.30% / 99.78% | 1190 / 1190 | Yes |
+| 16384 | 1504.45 / 1581.44 | 221.85 / 151.38 | 98.30% / 99.89% | 1190 / 1190 | Yes |
+| 32768 | 1413.90 / 1472.01 | 198.65 / 139.45 | 98.30% / 99.78% | 1190 / 1190 | Yes |
+| 65536 | 1261.11 / 1318.70 | 165.74 / 119.52 | 98.30% / 99.78% | 1190 / 1190 | Yes |
+| 85000 | 1180.44 / 1227.40 | 152.72 / 111.73 | 98.30% / 99.78% | 1190 / 1190 | Yes |
+
+##### Five-slot logic puzzle
+
+| Actual input tokens | Prefill tok/s D/M | Committed wall decode tok/s D/M | Acceptance D/M | Total output tokens D/M | Identical IDs |
+|---:|---:|---:|---:|---:|:---:|
+| 417 (native) | 1240.28 / 1283.12 | 204.68 ± 0.034 / 152.93 ± 0.042 | 80.06% / 91.83% | 1301 / 1301 | Yes |
+| 1024 | 1594.90 / 1681.08 | 185.00 / 143.35 | 71.69% / 84.41% | 656 / 656 | Yes |
+| 2048 | 1581.55 / 1678.54 | 193.55 / 151.54 | 78.17% / 92.79% | 699 / 699 | Yes |
+| 4096 | 1569.54 / 1664.90 | 151.70 / 137.03 | 58.27% / 81.33% | 514 / 514 | Yes |
+| 8192 | 1547.80 / 1636.89 | 195.49 / 143.77 | 81.29% / 89.14% | 670 / 642 | No |
+| 16384 | 1502.74 / 1580.28 | 177.22 / 139.75 | 75.55% / 89.77% | 699 / 697 | No |
+| 32768 | 1412.87 / 1476.17 | 162.39 / 132.71 | 77.59% / 93.58% | 612 / 612 | Yes |
+| 65536 | 1258.20 / 1316.37 | 135.01 / 112.12 | 77.25% / 91.89% | 693 / 693 | Yes |
+| 85000 | 1186.82 / 1238.87 | 127.43 / 105.94 | 79.14% / 93.06% | 655 / 655 | Yes |
+
+##### Complete requests and output qualifications
+
+| Task at 85000 input tokens | Prefill seconds D/M | Decode wall seconds D/M | Total resident request seconds D/M |
+|---|---:|---:|---:|
+| Chinese story | 72.237 / 69.307 | 27.404 / 17.560 | 99.642 / 86.868 |
+| English → Chinese translation | 71.742 / 68.940 | 8.293 / 7.740 | 80.036 / 76.681 |
+| 32-record JSONL | 72.007 / 69.252 | 7.786 / 10.642 | 79.794 / 79.895 |
+| Five-slot logic puzzle | 71.620 / 68.611 | 5.132 / 6.173 | 76.754 / 74.785 |
+
+At 85K, DFlash improves JSONL/logic decode by 36.69% / 20.28%, with identical complete output
+IDs; story/translation decode is slower. DFlash prefill is slower throughout the matrix.
+JSONL total request time differs by only 0.101 seconds (about 0.13%), within what a single
+pair can establish; this is not claimed as a stable whole-request gain. Logic is slower
+overall despite faster decode. The 247.73 tok/s native JSONL rate is high-acceptance structured
+generation, not ordinary translation, general code or a 12K-input JSONL translation speed.
+
+All ten JSONL completions per backend pass exact count/value/arithmetic/field-order checks.
+All ten logic answers per backend contain the complete expected mapping and `CHECK=4606`,
+including separate assignment lists and combined mappings. Translations retain six headings
+and at least twenty glossary entries; this is not an independent translation-accuracy score.
+All stories retain the three chapter headings and required literal items, but only 8K, 16K
+and 64K satisfy the 900–1200 Chinese-character bound. The 85K story contains 1228 Chinese
+characters in both routes. Native repetitions reproduce output IDs and speculative counters
+within each backend. Only 31 of 36 task/length pairs match complete IDs: native story/translation,
+8K translation/logic and 16K logic differ. All 85K pairs and every JSONL pair match. No universal
+token parity, artifact-quality score or quality-losslessness claim follows from these checks.
+
+MTP reserves 8.66 GiB weights per card, DFlash 10.36 GiB. At this capacity the reported per-card
+KV/workspace reservations are 1.64/0.74 GiB for MTP and 1.625/0.727 GiB for DFlash; these
+figures are GPU arenas, not process RSS or aggregate two-card memory.
+
+Three unexpected host resets interrupted this campaign. Completed results survived and only
+missing repetitions were resumed. The final continuation uses 600-second active windows with
+a 120-second next-request margin and **180-second idle periods**, at completed-request boundaries
+and between backends. Observed DFlash active blocks before rest were 505.27 / 487.91 / 553.25 s.
+Rest does not enter request times. The third reset still occurred after the three-minute-rest
+policy, during the last logic measurement's prefill; cooldown is not a demonstrated reset fix.
+The last saved samples showed 54/59°C and zero corrected/uncorrected GPU ECC, with no recorded
+collector error or kernel Xid explaining the reset. Root cause remains undetermined; completed
+measurements do not establish sustained hardware stability.
+
+Reports and corpus remain local under `profiles/bench/quasar-qpn-projections/{all-mtp3,
+all-dflash7,matrix-summary}.json` and `profiles/bench/other_inputs_20261001/cases.json`.
+The read-only health logs preserve 200 ms GPU samples, per-second host/process/thread and Engine
+progress, request/phase/cooldown timestamps, PCIe AER/EDAC and kernel events with synced writes.
+No power limits, clocks or system settings were changed. Reproduction uses the public
+[`ninfer_v100_task_bench`](../bench/README.md#stop-aware-v100-task-probes); raw outputs, telemetry,
+model files and the local filming demo are not committed.
 
 #### DFlash2 v3: separate capacity
 
@@ -639,8 +1021,9 @@ do not relabel the retained staging attribution as a measurement of the current 
 - [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp), which stores completed KV
   blocks in host RAM and retrieves a query-selected subset into a bounded GPU window. That is an
   approximate attention policy, not a transparent full-180K KV spill: it changes which history
-  participates in attention. The V100X2 contract therefore keeps complete-context semantics and
-  does not silently substitute KVMem retrieval.
+  participates in attention. The default V100X2 route keeps complete-context semantics. The
+  [optional native RAM-KV experiment](maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment)
+  instead uses explicitly selected lexical retrieval; it is not the KVMem Q/K-vector algorithm.
 
 #### Historical pre-v3 DFlash2 route
 
@@ -708,7 +1091,10 @@ tokens measured **50.68 ± 0.04 committed decode tok/s** (mean ± sample standar
 establishes the earlier staging result for this prompt and output window; it does not guarantee the
 same speed on every prompt.
 
-Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the UVA D2D copy
+Startup disables PCIe direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains. An active direct
+NVLink mesh is identified via NVML's remote PCI endpoints; those links do not traverse the host
+IOMMU and are qualified separately. NVML is used only at startup and is not required for the
+PCIe/fallback route. Startup verifies the UVA D2D copy
 with exact byte comparisons in both directions, and rejects startup if verification fails. The
 collective suite covers different tensor sizes, guards and 64 consecutive rounds; the public Engine
 CUDA Graph path is exercised by the measurements below. The INT8 attention test also passes its

@@ -112,38 +112,44 @@ TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords*
 }
 
 void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
-                     const Tensor& previous_hidden, std::int32_t position,
-                     std::span<const std::int32_t> rope_position, bool build_proposal) {
+                    const Tensor& previous_hidden, std::int32_t position,
+                    std::span<const std::int32_t> rope_position, bool build_proposal) {
     auto tp = tp_execution(state.execution);
-    tp->mtp_kv = state.mtp_kv_peer;
-    if (!tp->mtp_kv.valid() || !tp->io->mtp) {
-        throw std::logic_error("tensor-parallel MTP bridge requires both KV windows");
+    for (std::size_t index = 0; index < state.execution.peers.size(); ++index) {
+        tp[index].mtp_kv = state.mtp_kv_peers[index];
+        if (!tp[index].mtp_kv.valid() || !tp[index].io->mtp) {
+            throw std::logic_error("parallel MTP bridge requires every rank's KV window");
+        }
+        tp[index].work->reset();
     }
     state.execution.work.reset();
-    tp->work->reset();
     const auto restored = resume_hidden(state.execution, previous_hidden);
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &*tp);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     std::span(tp).first(state.execution.peers.size()));
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
-
-    const std::array<WorkspaceArena*, 2> work{&state.execution.work, tp->work};
-    const std::array<qwen3_6::RoundState*, 2> io{&state.execution.io, tp->io};
-    std::array<Tensor, 2> positions, rope, ar_hidden, logits, ar_positions;
-    for_each_rank(*tp->execution, [&](int rank) {
-        const auto r = static_cast<std::size_t>(rank);
-        const auto stream = tp->execution->dev[r]->stream;
-        positions[r] = io[r]->mtp->target_positions.slice(0, 0, 1);
-        ops::set_i32_scalar(positions[r], position, stream);
-        rope[r] = work[r]->alloc(DType::I32, {1, 3});
-        CUDA_CHECK(cudaMemcpyAsync(rope[r].data, rope_position.data(), rope_position.size_bytes(),
+    const auto work = rank_views(state.execution, [&](int rank) {
+        return rank == 0 ? &state.execution.work : tp[rank - 1].work;
+    });
+    const auto io = rank_views(state.execution, [&](int rank) {
+        return rank == 0 ? &state.execution.io : tp[rank - 1].io;
+    });
+    const auto& ec = *tp[0].execution;
+    std::array<Tensor, kMaximumExecutionDevices> positions{}, rope{}, ar_hidden{}, logits{}, ar_positions{};
+    for_each_rank(ec, [&](int rank) {
+        const auto stream = ec.dev[rank]->stream;
+        positions[rank] = io[rank]->mtp->target_positions.slice(0, 0, 1);
+        ops::set_i32_scalar(positions[rank], position, stream);
+        rope[rank] = work[rank]->alloc(DType::I32, {1, 3});
+        CUDA_CHECK(cudaMemcpyAsync(rope[rank].data, rope_position.data(), rope_position.size_bytes(),
                                    cudaMemcpyHostToDevice, stream));
-        ar_hidden[r] = io[r]->mtp->ar_hidden;
-        logits[r] = io[r]->logits.slice(1, 0, 1);
-        ar_positions[r] = io[r]->mtp->position.slice(0, 0, 1);
+        ar_hidden[rank] = io[rank]->mtp->ar_hidden;
+        logits[rank] = io[rank]->logits.slice(1, 0, 1);
+        ar_positions[rank] = io[rank]->mtp->position.slice(0, 0, 1);
     });
     Tensor draft0 = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     const auto visible = static_cast<std::uint32_t>(position + 1);
@@ -151,33 +157,33 @@ void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr);
     if (build_proposal) {
-        for_each_rank(*tp->execution, [&](int rank) {
-            const auto r = static_cast<std::size_t>(rank);
-            ops::set_i32_scalar(ar_positions[r], position + 1, tp->execution->dev[r]->stream);
+        for_each_rank(ec, [&](int rank) {
+            ops::set_i32_scalar(ar_positions[rank], position + 1, ec.dev[rank]->stream);
         });
-        for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
-            Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
-            Tensor next_draft = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
-            const std::array<Tensor, 2> next_hidden{
-                state.execution.prefill_hidden.slice(1, i, 1), tp->prefill_hidden->slice(1, i, 1)};
-            const auto ar_visible = static_cast<std::uint32_t>(position + i + 1);
-            card.mtp_forward_ar_step(previous_token, ar_hidden, ar_positions,
-                                     {ar_visible, ar_visible}, next_hidden, logits, next_draft);
-            for_each_rank(*tp->execution, [&](int rank) {
-                const auto r = static_cast<std::size_t>(rank);
-                const auto stream = tp->execution->dev[r]->stream;
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden[r].data, next_hidden[r].data,
-                                           ar_hidden[r].bytes(), cudaMemcpyDeviceToDevice, stream));
-                ops::increment_i32_scalar(ar_positions[r], stream);
+        for (int index = 1; index < static_cast<int>(state.mtp_proposal_extent); ++index) {
+            Tensor previous = state.execution.io.mtp->draft_tokens.slice(0, index - 1, 1);
+            Tensor next = state.execution.io.mtp->draft_tokens.slice(0, index, 1);
+            const auto next_hidden = rank_views(state.execution, [&](int rank) {
+                return rank == 0 ? state.execution.prefill_hidden.slice(1, index, 1)
+                                 : tp[rank - 1].prefill_hidden->slice(1, index, 1);
+            });
+            const auto ar_visible = static_cast<std::uint32_t>(position + index + 1);
+            card.mtp_forward_ar_step(previous, ar_hidden, ar_positions, {ar_visible, ar_visible},
+                                     next_hidden, logits, next);
+            for_each_rank(ec, [&](int rank) {
+                CUDA_CHECK(cudaMemcpyAsync(ar_hidden[rank].data, next_hidden[rank].data,
+                                           ar_hidden[rank].bytes(), cudaMemcpyDeviceToDevice,
+                                           ec.dev[rank]->stream));
+                ops::increment_i32_scalar(ar_positions[rank], ec.dev[rank]->stream);
             });
         }
     }
-    // The following suffix prefill resets both arenas and may replace the staging hidden. Retire
-    // both bridge streams here, including a bridge with no proposal or cross-rank logit gather.
     state.execution.device.synchronize();
-    tp->device->synchronize();
     state.execution.work.reset();
-    tp->work->reset();
+    for (const auto& peer : state.execution.peers) {
+        peer.device->synchronize();
+        peer.work->reset();
+    }
 }
 
 } // namespace
@@ -198,7 +204,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
              static_cast<std::uint32_t>(state.execution.io.mtp->draft_tokens.ne[0]))) {
         throw std::logic_error("MTP bridge proposal extent is outside the configured window");
     }
-    if (state.execution.peer != nullptr) {
+    if (!state.execution.peers.empty()) {
         if (next_embedding != nullptr) {
             throw std::logic_error("tensor-parallel MTP bridge supports text inputs only");
         }
@@ -260,50 +266,34 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
-        std::optional<TpExecution> tp = tp_execution(state.execution);
-        if (tp) {
-            // Rank 1 runs the round from ITS OWN copy of the same ingress record. Everything the
-            // peer needs that is not in the ingress -- verify ids, target positions, the accepted
-            // count, the next round's AR positions -- is DERIVED from it by the same deterministic
-            // Ops, run again on device 1, rather than transferred: the only other inputs are the
-            // gathered logits, which are bit-identical on both ranks.
-            if (!tp->io->mtp_decode.has_value()) {
-                throw std::logic_error("tensor-parallel MTP decode requires a peer frame");
-            }
-            // Rank 1 uploads ITS OWN ingress record, not rank 0's. The two differ in exactly one
-            // field per row -- `sampling[row].token_counts`, which must name rank 1's penalty
-            // counter lane. `speculative_accept_greedy_drafts` reads and atomically writes that
-            // pointer in sampling mode, so handing rank 1 a pointer into rank 0's arena is an
-            // illegal access without peer mapping and a silent double-increment with it. Every
-            // other byte is identical, which is what keeps the two replicated accepts in step.
-            const qwen3_6::MtpDecodeIngress* peer_ingress =
-                state.execution.peer->mtp_host_ingress;
-            if (peer_ingress == nullptr) {
-                throw std::logic_error("tensor-parallel MTP decode requires a peer ingress record");
+        auto tp = tp_execution(state.execution);
+        for (const auto& peer : state.execution.peers) {
+            if (!peer.io->mtp_decode || peer.mtp_host_ingress == nullptr) {
+                throw std::logic_error("parallel MTP decode requires every peer frame and ingress");
             }
             const CurrentDevice restore;
-            CUDA_CHECK(cudaSetDevice(tp->device->device));
-            CUDA_CHECK(cudaMemcpyAsync(tp->io->mtp_decode->ingress.data, peer_ingress,
+            CUDA_CHECK(cudaSetDevice(peer.device->device));
+            CUDA_CHECK(cudaMemcpyAsync(peer.io->mtp_decode->ingress.data, peer.mtp_host_ingress,
                                        sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
-                                       tp->device->stream));
+                                       peer.device->stream));
         }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
                          state.execution.io, state.execution.prefill_hidden,
                          state.execution.prefill_chunk, 0, {}, &state.text_cache,
-                         &state.mtp_cache, tp ? &*tp : nullptr);
+                         &state.mtp_cache, std::span(tp).first(state.execution.peers.size()));
 
         MtpRoundView v = slice_mtp_frame(frame, batch_size);
 
-        if (!tp) {
+        if (state.execution.peers.empty()) {
             ops::speculative_prepare_verify_inputs(v.anchors, v.current_drafts, v.frontiers,
                                                    v.current_extents, v.verify_ids,
                                                    v.target_positions,
                                                    state.execution.device.stream);
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                  verify_view(v, state.execution.replay_records),
-                                 envelopes.target_verify);
+                                 envelopes.target_verify, state.greedy_target);
 
             ops::mtp_prepare_next_round(v.verify_ids, v.anchors, v.accepted, v.frontiers,
                                         v.budgets, v.licensed_counts, v.rope_deltas,
@@ -342,73 +332,75 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                            state.execution.device.stream));
             }
         } else {
-            const ExecutionContext& ec = *tp->execution;
-            MtpRoundView p         = slice_mtp_frame(*tp->io->mtp_decode, batch_size);
-            MtpRoundView* views[2] = {&v, &p};
-            for_each_rank(ec, [&](int rank) {
-                MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
-                ops::speculative_prepare_verify_inputs(r.anchors, r.current_drafts, r.frontiers,
-                                                       r.current_extents, r.verify_ids,
-                                                       r.target_positions, ec.dev[rank]->stream);
+            const auto& ec = *tp[0].execution;
+            auto views = rank_views(state.execution, [&](int rank) {
+                return rank == 0 ? v : slice_mtp_frame(*tp[rank - 1].io->mtp_decode, batch_size);
             });
+            const auto field = [&](Tensor MtpRoundView::* member) {
+                return rank_views(state.execution, [&](int rank) { return views[rank].*member; });
+            };
+            for_each_rank(ec, [&](int rank) {
+                auto& value = views[rank];
+                ops::speculative_prepare_verify_inputs(
+                    value.anchors, value.current_drafts, value.frontiers, value.current_extents,
+                    value.verify_ids, value.target_positions, ec.dev[rank]->stream);
+            });
+            std::array<TargetVerifyFrameView, kMaximumExecutionDevices - 1> peer_frames{};
+            for (int rank = 1; rank < ec.tp; ++rank) {
+                peer_frames[rank - 1] = verify_view(views[rank], tp[rank - 1].replay_records);
+            }
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                  verify_view(v, state.execution.replay_records),
-                                 verify_view(p, tp->replay_records), envelopes.target_verify);
+                                 std::span(peer_frames).first(state.execution.peers.size()),
+                                 envelopes.target_verify, state.greedy_target);
             for_each_rank(ec, [&](int rank) {
-                MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
+                auto& value = views[rank];
                 ops::mtp_prepare_next_round(
-                    r.verify_ids, r.anchors, r.accepted, r.frontiers, r.budgets, r.licensed_counts,
-                    r.rope_deltas, r.alignment_ids, r.next_extents, r.ar_positions,
-                    r.ar_rope_positions, r.ar_valid_columns,
-                    static_cast<std::int32_t>(state.text_cache.max_context()),
+                    value.verify_ids, value.anchors, value.accepted, value.frontiers, value.budgets,
+                    value.licensed_counts, value.rope_deltas, value.alignment_ids,
+                    value.next_extents, value.ar_positions, value.ar_rope_positions,
+                    value.ar_valid_columns, static_cast<std::int32_t>(state.text_cache.max_context()),
                     ec.dev[rank]->stream);
             });
-            card.mtp_forward_decode_batch(v.alignment_ids, {v.target_hidden, p.target_hidden},
-                                          {v.target_positions, p.target_positions},
-                                          {v.target_rope, p.target_rope},
-                                          {v.licensed_counts, p.licensed_counts},
-                                          {v.mtp_rows, p.mtp_rows}, envelopes.batch,
-                                          {v.alignment_hidden, p.alignment_hidden});
+            card.mtp_forward_decode_batch(
+                v.alignment_ids, field(&MtpRoundView::target_hidden),
+                field(&MtpRoundView::target_positions), field(&MtpRoundView::target_rope),
+                field(&MtpRoundView::licensed_counts), field(&MtpRoundView::mtp_rows),
+                envelopes.batch, field(&MtpRoundView::alignment_hidden));
             for_each_rank(ec, [&](int rank) {
-                MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
-                ops::speculative_select_accepted_hidden(r.alignment_hidden, r.accepted, r.ar_hidden,
-                                                        ec.dev[rank]->stream);
+                auto& value = views[rank];
+                ops::speculative_select_accepted_hidden(
+                    value.alignment_hidden, value.accepted, value.ar_hidden, ec.dev[rank]->stream);
             });
-
-            const std::array<Tensor, 2> proposal_logits = {v.proposal_logits, p.proposal_logits};
+            const auto proposal_logits = field(&MtpRoundView::proposal_logits);
             Tensor draft0 = v.next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch({v.ar_hidden, p.ar_hidden}, proposal_logits, draft0);
+            card.mtp_propose_batch(field(&MtpRoundView::ar_hidden), proposal_logits, draft0);
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
-                Tensor previous =
-                    v.next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
-                Tensor next = v.next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1)
-                                  .view({batch_size});
-                std::array<Tensor, 2> position;
-                std::array<Tensor, 2> rope;
-                std::array<Tensor, 2> valid;
-                std::array<Tensor, 2> hidden_batch;
-                std::array<Tensor, 2> next_hidden_batch;
-                for (std::size_t r = 0; r < 2; ++r) {
-                    MtpRoundView& view = *views[r];
-                    position[r] = view.ar_positions.slice(1, static_cast<std::int32_t>(step), 1)
-                                      .view({1, batch_size});
-                    rope[r] = view.ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
-                                  .view({1, batch_size});
-                    valid[r] = view.ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
-                                   .view({batch_size});
-                    hidden_batch[r] = view.ar_hidden.view({TextConfig::hidden, 1, batch_size});
-                    next_hidden_batch[r] =
-                        view.next_hidden.view({TextConfig::hidden, 1, batch_size});
-                }
-                Tensor previous_batch = previous.view({1, batch_size});
-                card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              {v.mtp_rows, p.mtp_rows}, envelopes.ar[step],
-                                              next_hidden_batch);
-                card.mtp_propose_batch({v.next_hidden, p.next_hidden}, proposal_logits, next);
+                Tensor previous = v.next_drafts.slice(1, step, 1).view({1, batch_size});
+                Tensor next = v.next_drafts.slice(1, step + 1, 1).view({batch_size});
+                const auto positions = rank_views(state.execution, [&](int rank) {
+                    return views[rank].ar_positions.slice(1, step, 1).view({1, batch_size});
+                });
+                const auto rope = rank_views(state.execution, [&](int rank) {
+                    return views[rank].ar_rope_positions.slice(1, step, 1).view({1, batch_size});
+                });
+                const auto valid = rank_views(state.execution, [&](int rank) {
+                    return views[rank].ar_valid_columns.slice(1, step, 1).view({batch_size});
+                });
+                const auto hidden = rank_views(state.execution, [&](int rank) {
+                    return views[rank].ar_hidden.view({TextConfig::hidden, 1, batch_size});
+                });
+                const auto output = rank_views(state.execution, [&](int rank) {
+                    return views[rank].next_hidden.view({TextConfig::hidden, 1, batch_size});
+                });
+                card.mtp_forward_decode_batch(previous, hidden, positions, rope, valid,
+                                              field(&MtpRoundView::mtp_rows),
+                                              envelopes.ar[step], output);
+                card.mtp_propose_batch(field(&MtpRoundView::next_hidden), proposal_logits, next);
                 for_each_rank(ec, [&](int rank) {
-                    MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
-                    CUDA_CHECK(cudaMemcpyAsync(r.ar_hidden.data, r.next_hidden.data,
-                                               r.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                    auto& value = views[rank];
+                    CUDA_CHECK(cudaMemcpyAsync(value.ar_hidden.data, value.next_hidden.data,
+                                               value.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
                                                ec.dev[rank]->stream));
                 });
             }

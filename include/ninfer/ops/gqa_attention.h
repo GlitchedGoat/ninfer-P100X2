@@ -76,7 +76,8 @@ struct GqaExecutionEnvelope {
 [[nodiscard]] std::size_t
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                        GqaExecutionEnvelope envelope, std::int32_t batch_size,
-                                       std::int32_t min_width, std::int32_t max_width);
+                                       std::int32_t min_width, std::int32_t max_width,
+                                       bool resident_read = false);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let
@@ -103,6 +104,11 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16
  * or INT8-G64 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
  * planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence b.
+ * With optional read_indices/read_tables (B=1 only), the read set is the chronologically
+ * ordered resident logical pages. Every query/write page must be resident. The formula's key
+ * domain is restricted to those pages with ORIGINAL key position <= original query position;
+ * Q/K RoPE is not changed. Metadata and all query positions are stable through this invocation.
+ * The capacity query's resident_read=true includes the temporary I32 position remap.
  *
  * In masked form, every row's valid columns are the prefix [0,valid_columns[b]); positions in that
  * prefix are sequential and address populated causal histories. Each nonempty row repeats its

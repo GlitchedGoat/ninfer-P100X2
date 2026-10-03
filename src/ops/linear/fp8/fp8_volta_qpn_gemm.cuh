@@ -85,7 +85,8 @@ __device__ __forceinline__ void fp8_decode_quad(std::uint32_t word, half2& lo, h
 // nvfp4_volta_qpn_gemm.cuh, which got them first; this is the same pattern applied to the
 // simpler single-projection kernel. The shared reduce buffer is SPLITK * kTiles * 256 floats, so
 // SPLITK=16 at kTiles=4 is never instantiated (64 KB, over Volta's 48 KB static limit).
-template <int kTiles, int SPLITK, int NACC, bool Prepacked, class OutputPolicy>
+template <int kTiles, int SPLITK, int NACC, bool Prepacked, class OutputPolicy,
+          bool BlockScaled = false>
 __global__ __launch_bounds__(
     SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
         ? 1
@@ -129,6 +130,13 @@ __global__ __launch_bounds__(
     }
 
     for (int b = b0; b < bend; ++b) {
+        half2 block_scale;
+        if constexpr (BlockScaled) {
+            // E4M3 decode carries 2^-8; absorb it before contraction because the block
+            // multiplier varies along K and cannot be applied in the epilogue.
+            block_scale = __float2half2_rn(
+                __bfloat162float(scales[(good ? col : 0) / 128 * blocks + b]) * 256.0F);
+        }
         uint4 cw[8];
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
@@ -154,6 +162,10 @@ __global__ __launch_bounds__(
                 half2 b4[4];
                 fp8_decode_quad(words[2 * u], b4[0], b4[1]);
                 fp8_decode_quad(words[2 * u + 1], b4[2], b4[3]);
+                if constexpr (BlockScaled) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) { b4[j] = __hmul2(b4[j], block_scale); }
+                }
                 const unsigned* B = reinterpret_cast<const unsigned*>(b4);
                 const int kbase   = b * S::kKPerBlock + e * 16 + u * 8;
 
@@ -221,7 +233,7 @@ __global__ __launch_bounds__(
             // through the caller's policy so the fused attention projections can scatter straight
             // into their q/gate/k/v (or qkv/z) planes instead of a contiguous buffer they would
             // then have to split.
-            const float scale = __bfloat162float(scales[ocol]) * 256.0f;
+            const float scale = BlockScaled ? 1.0F : __bfloat162float(scales[ocol]) * 256.0f;
             output.store(ocol, row, v * scale);
         }
     }
@@ -230,7 +242,7 @@ __global__ __launch_bounds__(
 // Shared launcher. Every FP8 consumer -- plain Linear, the attention projections, the GDN input
 // projection -- differs only in where the epilogue puts its results, so they share one kernel and
 // supply their own output policy.
-template <class OutputPolicy>
+template <class OutputPolicy, bool BlockScaled = false>
 void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPolicy output,
                                       std::int32_t n, cudaStream_t stream) {
     using S              = Fp8VoltaQpnSchedule;
@@ -241,7 +253,7 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const __nv_bfloat16*>(w.scales);
     const auto* xd     = static_cast<const __nv_bfloat16*>(x.data);
-    const bool vocabulary = n >= 100000 && k == 5120;
+    const bool vocabulary = (n == 248320 || n == 124160 || n == 62080) && k == 5120;
     // Generation-2 winners from a private sweep (bench/ops/fp8_qpn8_splitk_sweep.cu, deleted):
     // SPLITK8 NACC1 wins at every kTiles on attn input, GDN input, and the 17408-K residual shape
     // (1.08-1.55x over SPLITK4). The 6144-K residual shape is the one exception -- SPLITK16 wins
@@ -253,10 +265,10 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
 #define NINFER_FP8_QPN_LAUNCH(TILES, SPLITK, NACC)                                      \
     do {                                                                                 \
         if (w.layout == QuantLayout::VoltaQpnPrepacked) {                                \
-            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, true>                        \
+            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, true, OutputPolicy, BlockScaled> \
                 <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output); \
         } else {                                                                         \
-            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, false>                       \
+            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, false, OutputPolicy, BlockScaled> \
                 <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output); \
         }                                                                                \
     } while (false)

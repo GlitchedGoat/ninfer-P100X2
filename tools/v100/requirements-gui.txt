@@ -1,0 +1,2 @@
+# Install one of these bindings in the customer's Python environment.
+PyQt6>=6.4

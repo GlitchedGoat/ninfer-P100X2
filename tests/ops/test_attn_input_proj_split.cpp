@@ -370,8 +370,12 @@ int run_fused_case(const ExecutionContext& ec, QType qtype, std::uint32_t seed,
     std::array<DeviceWeight, 2> shard_device;
     for (int rank = 0; rank < 2; ++rank) {
         set_device(ec, rank);
-        shard_device[static_cast<std::size_t>(rank)] =
-            upload_weight(shard[static_cast<std::size_t>(rank)].shard);
+        auto fixture = shard[static_cast<std::size_t>(rank)].shard;
+        if (qtype == QType::NVFP4 && ec.dev[rank]->sm() == 70) {
+            fixture.payload = qw::nvfp4_qpn_payload(fixture);
+            fixture.weight.layout = QuantLayout::VoltaQpnPrepacked;
+        }
+        shard_device[static_cast<std::size_t>(rank)] = upload_weight(fixture);
     }
 
     for (const std::int32_t tokens : tokens_sweep) {
@@ -428,7 +432,7 @@ int run_fused_case(const ExecutionContext& ec, QType qtype, std::uint32_t seed,
 
             // --- (b) the split form -------------------------------------------------------------
             const std::size_t split_capacity = ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                qtype, policy, tokens, tokens);
+                qtype, policy, tokens, tokens, 2);
             std::array<std::optional<GuardedDeviceBuffer>, 2> split_q;
             std::array<std::optional<GuardedDeviceBuffer>, 2> split_gate;
             std::array<std::optional<GuardedDeviceBuffer>, 2> split_k;
@@ -624,7 +628,7 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         Tensor reference_v(ref_v.data(), DType::BF16, {kKvRows, tokens});
 
         DeviceArena reference_workspace(
-            ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens));
+            std::max<std::size_t>(ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens), 1));
 
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         ops::attn_input_proj(reference_x, full_qk_device.weight, full_gv_device.weight, reference_q,
@@ -676,10 +680,10 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
         std::array<std::optional<DeviceArena>, 2> split_workspace;
         const std::size_t shard_workspace =
             ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                QType::Q4G64_F16S, ops::LinearPolicy::A16Only, tokens, tokens);
+                QType::Q4G64_F16S, ops::LinearPolicy::A16Only, tokens, tokens, 2);
         for (int rank = 0; rank < 2; ++rank) {
             set_device(ec, rank);
-            split_workspace[static_cast<std::size_t>(rank)].emplace(shard_workspace);
+            split_workspace[static_cast<std::size_t>(rank)].emplace(std::max<std::size_t>(shard_workspace, 1));
         }
         const std::array<WorkspaceArena*, 2> workspace{
             &*split_workspace[0], &*split_workspace[1]};
@@ -737,7 +741,7 @@ int verify_registry() {
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
                 (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                    QType::NVFP4, policy, tokens, tokens);
+                    QType::NVFP4, policy, tokens, tokens, 2);
             } catch (const std::exception& error) {
                 std::cerr << "registry: NVFP4 column-parallel workspace " << policy_name(policy)
                           << " T=" << tokens << " rejected: " << error.what() << '\n';
@@ -750,7 +754,7 @@ int verify_registry() {
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
                 (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                    QType::FP8_E4M3FN_ROW_BF16S, policy, tokens, tokens);
+                    QType::FP8_E4M3FN_ROW_BF16S, policy, tokens, tokens, 2);
             } catch (const std::exception& error) {
                 std::cerr << "registry: FP8 column-parallel workspace " << policy_name(policy)
                           << " T=" << tokens << " rejected: " << error.what() << '\n';
@@ -763,7 +767,7 @@ int verify_registry() {
         bool threw = false;
         try {
             (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::AllowA4, 1, 1);
+                QType::FP8_E4M3FN_ROW_BF16S, ops::LinearPolicy::AllowA4, 1, 1, 2);
         } catch (const std::exception&) { threw = true; }
         if (!threw) {
             std::cerr << "registry: FP8 AllowA4 was admitted but must not be\n";
@@ -774,7 +778,7 @@ int verify_registry() {
         bool threw = false;
         try {
             (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                qtype, ops::LinearPolicy::A16Only, 1, 1);
+                qtype, ops::LinearPolicy::A16Only, 1, 1, 2);
         } catch (const std::exception&) { threw = true; }
         if (!threw) {
             std::cerr << "registry: qtype " << static_cast<int>(qtype)
@@ -787,7 +791,7 @@ int verify_registry() {
     for (const QType qtype : {QType::GGML_K, QType::Q4G64_F16S, QType::Q5G64_F16S}) {
         try {
             (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                qtype, ops::LinearPolicy::A16Only, 1, 1);
+                qtype, ops::LinearPolicy::A16Only, 1, 1, 2);
         } catch (const std::exception& error) {
             std::cerr << "registry: supported qtype " << static_cast<int>(qtype)
                       << " was rejected: " << error.what() << '\n';
@@ -845,7 +849,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(k1.p, DType::BF16, {kShardKvRows, 1})};
         const std::array<Tensor, 2> v{Tensor(v0.p, DType::BF16, {kShardKvRows, 2}),
                                       Tensor(v1.p, DType::BF16, {kShardKvRows, 1})};
-        ops::attn_input_proj_column_parallel(x, {fake, fake}, q, gate, k, v, ec);
+        ops::attn_input_proj_column_parallel(x, std::array<Weight, 2>{fake, fake}, q, gate, k, v, ec);
     });
 
     // Disagreeing K.
@@ -862,7 +866,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(k1.p, DType::BF16, {kShardKvRows, 1})};
         const std::array<Tensor, 2> v{Tensor(v0.p, DType::BF16, {kShardKvRows, 1}),
                                       Tensor(v1.p, DType::BF16, {kShardKvRows, 1})};
-        ops::attn_input_proj_column_parallel(x, {fake, other}, q, gate, k, v, ec);
+        ops::attn_input_proj_column_parallel(x, std::array<Weight, 2>{fake, other}, q, gate, k, v, ec);
     });
 
     // A single-device context is not a split context.
@@ -878,7 +882,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                       Tensor(k1.p, DType::BF16, {kShardKvRows, 1})};
         const std::array<Tensor, 2> v{Tensor(v0.p, DType::BF16, {kShardKvRows, 1}),
                                       Tensor(v1.p, DType::BF16, {kShardKvRows, 1})};
-        ops::attn_input_proj_column_parallel(x, {fake, fake}, q, gate, k, v, single);
+        ops::attn_input_proj_column_parallel(x, std::array<Weight, 2>{fake, fake}, q, gate, k, v, single);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";
@@ -914,19 +918,27 @@ int main() {
               << '\n';
 
     failures += verify_split_rejections(ec);
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDeviceProperties(&properties, ec.dev[0]->device), "query attention device");
+    std::vector<ops::LinearPolicy> nvfp4_policies{ops::LinearPolicy::A16Only};
+    std::vector<ops::LinearPolicy> fp8_policies{ops::LinearPolicy::A16Only};
+    if (properties.major >= 12) {
+        nvfp4_policies.push_back(ops::LinearPolicy::AllowA4);
+        fp8_policies.push_back(ops::LinearPolicy::AllowA8);
+    }
     // T sweep: T=1 (decode edge), small-T/MMA frontiers, T=128 (W4A4 MMA under AllowA4), T=1024 (a
     // multiple of 256 -- the sole route into the NVFP4 W4A4 TMA kernel, exercised on the shard
     // TMA descriptor as well as the tp1 one).
     failures += run_fused_case(ec, QType::NVFP4, 41u, "nvfp4 attn_input fused",
-                               {1, 2, 5, 8, 17, 32, 48, 128, 1024},
-                               {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
+                               {1, 3, 4, 8, 9, 32, 33, 127, 128, 129, 1024},
+                               nvfp4_policies);
     // FP8's own tp2 column shard, wired as a TRUE split (the fused kernel family is
     // Geometry-templated, same as NVFP4 -- see attn_input_proj.h's design note). T sweep: 1 the
     // decode edge; 2/8/10 small-T (kFp8LinearSmallTMax<AttnInput>=11); 11 the AllowA8 route's own
     // A8 crossover; 32/48/128/1024 beyond it.
     failures += run_fused_case(ec, QType::FP8_E4M3FN_ROW_BF16S, 46u, "fp8 attn_input fused",
                                {1, 2, 8, 10, 11, 32, 48, 128, 1024},
-                               {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8});
+                               fp8_policies);
     failures += run_split_storage_case(ec, 43u);
 
     std::cout << (failures ? "FAIL" : "OK") << " attn_input_proj split\n";

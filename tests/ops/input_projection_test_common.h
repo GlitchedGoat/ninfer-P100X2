@@ -43,22 +43,37 @@ inline std::vector<float> make_bf16_activation(std::int32_t rows, std::int32_t t
 
 class DevicePackedWeight {
 public:
-    explicit DevicePackedWeight(quantized_weight::PackedWeight packed)
-        : host(std::move(packed)), device(host.payload.size()) {
-        device.copy_from_host(host.payload.data(), host.payload.size());
+    explicit DevicePackedWeight(quantized_weight::PackedWeight packed, bool volta_qpn = false)
+        : host(std::move(packed)),
+          device_payload_(volta_qpn ? quantized_weight::nvfp4_qpn_payload(host)
+                                   : std::vector<std::uint8_t>{}),
+          volta_qpn_(volta_qpn), device(host.payload.size()) {
+        const auto& payload = volta_qpn_ ? device_payload_ : host.payload;
+        device.copy_from_host(payload.data(), payload.size());
     }
 
-    Weight view() const { return host.device_weight(device.p); }
+    Weight view() const {
+        auto weight = host.device_weight(device.p);
+        if (volta_qpn_) { weight.layout = QuantLayout::VoltaQpnPrepacked; }
+        return weight;
+    }
 
     int verify_preserved(std::string_view label) const {
-        std::vector<std::uint8_t> after(host.payload.size());
+        const auto& expected = volta_qpn_ ? device_payload_ : host.payload;
+        std::vector<std::uint8_t> after(expected.size());
         device.copy_to_host(after.data(), after.size());
-        if (after == host.payload) { return 0; }
+        if (after == expected) { return 0; }
         std::cerr << label << ": packed weight was modified\n";
         return 1;
     }
 
     quantized_weight::PackedWeight host;
+
+private:
+    std::vector<std::uint8_t> device_payload_;
+    bool volta_qpn_;
+
+public:
     DeviceBuffer device;
 };
 

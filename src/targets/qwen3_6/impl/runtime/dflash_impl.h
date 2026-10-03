@@ -315,7 +315,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         // produces its local top-16 ordered keys and rank 0 merges the two 16-entry lists.
         const std::int32_t selector_columns = static_cast<std::int32_t>(k) * batch_size;
         const std::int32_t shard   = TextConfig::output_rows / 2;
-        if (state.execution.peer == nullptr) {
+        if (state.execution.peers.empty()) {
             Tensor logits = state.execution.work.alloc(
                 DType::BF16, {TextConfig::output_rows, selector_columns});
             ops::linear(proposal_hidden, state.execution.model.output_head, logits,
@@ -333,40 +333,40 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 state.execution.model.dflash->selector_successor_codebook, anchors, partial,
                 topk, drafts, state.execution.device.stream);
         } else {
-            Tensor peer_hidden = state.execution.peer->work->alloc(DType::BF16,
+            Tensor peer_hidden = state.execution.peers[0].work->alloc(DType::BF16,
                                                                      {Config::hidden, selector_columns});
-            ops::broadcast_rank0(proposal_hidden, peer_hidden,
-                                 *state.execution.peer->execution,
-                                 *state.execution.peer->events);
+            ops::broadcast_rank0(proposal_hidden, std::span<const Tensor>(&peer_hidden, 1),
+                                 *state.execution.peers[0].execution,
+                                 *state.execution.peers[0].events);
             Tensor part0 = state.execution.work.alloc(DType::BF16, {shard, selector_columns});
-            Tensor part1 = state.execution.peer->work->alloc(DType::BF16, {shard, selector_columns});
+            Tensor part1 = state.execution.peers[0].work->alloc(DType::BF16, {shard, selector_columns});
             ops::linear_column_parallel(
-                {proposal_hidden, peer_hidden},
-                {state.execution.model.output_head, state.execution.peer->model->output_head},
-                {part0, part1}, *state.execution.peer->execution);
+                std::array<Tensor, 2>{proposal_hidden, peer_hidden},
+                std::array<Weight, 2>{state.execution.model.output_head, state.execution.peers[0].model->output_head},
+                std::array<Tensor, 2>{part0, part1}, *state.execution.peers[0].execution);
             const std::int32_t local_parts =
                 (shard + ops::kDFlashSelectorTile - 1) / ops::kDFlashSelectorTile;
             Tensor partial0 = state.execution.work.alloc(DType::I64,
                                                          {16, local_parts, selector_columns});
             Tensor local_keys0 = state.execution.work.alloc(DType::I64, {16, selector_columns});
-            Tensor partial1 = state.execution.peer->work->alloc(DType::I64,
+            Tensor partial1 = state.execution.peers[0].work->alloc(DType::I64,
                                                                  {16, local_parts, selector_columns});
-            Tensor local_keys1 = state.execution.peer->work->alloc(DType::I64, {16, selector_columns});
+            Tensor local_keys1 = state.execution.peers[0].work->alloc(DType::I64, {16, selector_columns});
             ops::dflash2_local_topk(part0, partial0, local_keys0, 0,
                                     state.execution.device.stream);
             {
                 const CurrentDevice restore;
-                CUDA_CHECK(cudaSetDevice(state.execution.peer->device->device));
+                CUDA_CHECK(cudaSetDevice(state.execution.peers[0].device->device));
                 ops::dflash2_local_topk(part1, partial1, local_keys1, shard,
-                                        state.execution.peer->device->stream);
+                                        state.execution.peers[0].device->stream);
             }
             // gather_columns_rank0 concatenates the first tensor dimension (the local top-k
             // entries), so the two [16,C] lists become one [32,C] list.  Keeping columns in the
             // second dimension preserves the selector's column-major tensor convention.
             Tensor gathered_keys = state.execution.work.alloc(DType::I64, {32, selector_columns});
             ops::gather_columns_rank0(
-                gathered_keys, {local_keys0, local_keys1}, *state.execution.peer->execution,
-                *state.execution.peer->events);
+                gathered_keys, std::array<Tensor, 2>{local_keys0, local_keys1}, *state.execution.peers[0].execution,
+                *state.execution.peers[0].events);
             Tensor global_keys = state.execution.work.alloc(DType::I64, {16, selector_columns});
             Tensor selector_gate = state.execution.work.alloc(DType::BF16, {256, selector_columns});
             ops::linear(proposal_hidden, state.execution.model.dflash->selector_hidden_projection,
@@ -394,17 +394,18 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
-        std::optional<TpExecution> tp = tp_execution(state.execution);
+        auto tp_ranks = tp_execution(state.execution);
+        const TpExecution* tp = state.execution.peers.empty() ? nullptr : &tp_ranks[0];
         qwen3_6::DFlashDecodeState* peer_frame = nullptr;
         if (tp) {
-            if (!tp->io->dflash_decode || state.execution.peer->dflash_host_ingress == nullptr) {
+            if (!tp->io->dflash_decode || state.execution.peers[0].dflash_host_ingress == nullptr) {
                 throw std::logic_error("tensor-parallel DFlash decode requires a peer frame and ingress");
             }
             peer_frame = &*tp->io->dflash_decode;
             const CurrentDevice restore;
             CUDA_CHECK(cudaSetDevice(tp->device->device));
             CUDA_CHECK(cudaMemcpyAsync(peer_frame->ingress.data,
-                                       state.execution.peer->dflash_host_ingress,
+                                       state.execution.peers[0].dflash_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress),
                                        cudaMemcpyHostToDevice, tp->device->stream));
         }
@@ -454,7 +455,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             ops::prepare_masked_block(peer_anchors, peer_frontiers, peer_valid,
                                       Variant::DFlashConfig::mask_token, peer_ids,
                                       peer_positions, tp->device->stream);
-            ops::broadcast_rank0(drafts, peer_drafts, *tp->execution, *tp->events);
+            ops::broadcast_rank0(drafts, std::span<const Tensor>(&peer_drafts, 1),
+                                 *tp->execution, *tp->events);
             CUDA_CHECK(cudaSetDevice(tp->device->device));
             Tensor peer_verify_ids = peer_frame->verify_ids.slice(1, 0, batch_size);
             ops::speculative_prepare_verify_ids(
@@ -465,7 +467,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
                          state.execution.io, state.execution.prefill_hidden,
                          state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr,
-                         tp ? &*tp : nullptr);
+                         std::span(tp_ranks).first(state.execution.peers.size()));
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
         auto verify_view = [batch_size](qwen3_6::DFlashDecodeState& f,
@@ -497,7 +499,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         if (peer_frame != nullptr) {
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                  verify_view(frame, state.execution.replay_records, &sink),
-                                 verify_view(*peer_frame, tp->replay_records, nullptr),
+                                 std::array<TargetVerifyFrameView, 1>{
+                                     verify_view(*peer_frame, tp->replay_records, nullptr)},
                                  target_envelope, state.greedy_target);
         } else {
             target_verify_accept(state.execution, state.continuation_hidden_store, card,

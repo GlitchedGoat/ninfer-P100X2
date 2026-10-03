@@ -47,6 +47,10 @@ void launch_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& g
 
 void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                               cudaStream_t stream) {
+    if (attn_in.ne[0] == 3584) {
+        launch_split_attn_in<3584, 1536, 256>(attn_in, q, k, gate, v, stream);
+        return;
+    }
     // The wrapper has already accepted exactly one of the two registered row geometries.
     if (attn_in.ne[0] == kMtpAttnRowsTp2) {
         launch_split_attn_in<kMtpAttnRowsTp2, kMtpQRowsTp2, kMtpKvRowsTp2>(attn_in, q, k, gate, v,

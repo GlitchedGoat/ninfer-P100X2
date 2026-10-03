@@ -39,6 +39,10 @@ using Gqa35Geometry = GqaGeometry<16, 2, 2>;
 // split form here follows: the split reuses its family's measured policy rather than re-deriving
 // one.
 using Gqa27Tp2Geometry = GqaGeometry<12, 2, 2>;
+using Gqa27Tp4Geometry = GqaGeometry<6, 1, 4>;
+static_assert(Gqa27Tp4Geometry::QHeads * 4 == Gqa27Geometry::QHeads);
+static_assert(Gqa27Tp4Geometry::KVHeads * 4 == Gqa27Geometry::KVHeads);
+static_assert(Gqa27Tp4Geometry::GroupSize == Gqa27Geometry::GroupSize);
 
 static_assert(Gqa27Tp2Geometry::QHeads * 2 == Gqa27Geometry::QHeads);
 static_assert(Gqa27Tp2Geometry::KVHeads * 2 == Gqa27Geometry::KVHeads);
@@ -51,7 +55,8 @@ static_assert(Gqa27Tp2Geometry::GroupSize == Gqa27Geometry::GroupSize);
 #define NINFER_GQA_GEOMETRIES(X)                                                                   \
     X(Gqa27Geometry)                                                                               \
     X(Gqa35Geometry)                                                                               \
-    X(Gqa27Tp2Geometry)
+    X(Gqa27Tp2Geometry)                                                                            \
+    X(Gqa27Tp4Geometry)
 
 // The cache-append kernels (A2) read Geometry::KVHeads and nothing else -- no Q-head count, no
 // group size, no split policy -- so any two geometries with the same KV-head count produce the
@@ -69,6 +74,7 @@ static_assert(Gqa27Tp2Geometry::GroupSize == Gqa27Geometry::GroupSize);
 // it is added.
 #define NINFER_GQA_KV_REPRESENTATIVES(X)                                                           \
     X(Gqa27Geometry)                                                                               \
-    X(Gqa35Geometry)
+    X(Gqa35Geometry)                                                                               \
+    X(Gqa27Tp4Geometry)
 
 } // namespace ninfer::ops

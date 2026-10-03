@@ -138,6 +138,17 @@ using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 // schedule's 16-row CTAs and leaves K untouched.
 using Fp8VocabularyTp2ColumnGeometry = Fp8Geometry<124160, 5120>;
 
+#ifdef NINFER_VOLTA_BUILD
+using Fp8MlpGateUpTp4ColumnGeometry = Fp8Geometry<8704, 5120>;
+// Official NVFP4 v3 also contains row-scaled FP8 attention/GDN/MLP/head projections.
+// These finite quarter-shard shapes use the existing runtime-dimensioned SM70 leaf, with
+// represented row scales unchanged. This is NOT the separate block-128 FP8 source codec.
+inline constexpr bool is_fp8_volta_tp4_problem(std::int32_t n, std::int32_t k) {
+    return (k == 5120 && (n == 3584 || n == 4096 || n == 8704 || n == 62080)) ||
+           (n == 5120 && (k == 1536 || k == 4352));
+}
+#endif
+
 // gdn_input_proj's own tp2 column shard -- each device's own head-local half of the
 // fused Q|K|V|Z object (16384 -> 8192). FP8 is not optional for this object: it is the flagship
 // geometry, bound by bind_qwen38_nvfp4_text_layers's GDN input_projection. This is the first FP8
@@ -211,6 +222,9 @@ enum class Fp8Problem : std::uint8_t {
 };
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
+#ifdef NINFER_VOLTA_BUILD
+    if (is_fp8_volta_tp4_problem(output_rows, input_rows)) { return true; }
+#endif
     return (output_rows == Fp8AttnInputGeometry::kOutputRows &&
             input_rows == Fp8AttnInputGeometry::kInputRows) ||
            (output_rows == Fp8GdnInputGeometry::kOutputRows &&

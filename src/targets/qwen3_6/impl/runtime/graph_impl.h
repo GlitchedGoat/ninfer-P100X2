@@ -14,8 +14,7 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
         if (!executable->ready()) {
             throw std::logic_error("decode graph was not prepared at load time");
         }
-        if (state.execution.peer != nullptr) {
-            const TpPeerCore& peer = *state.execution.peer;
+        for (const TpPeerCore& peer : state.execution.peers) {
             if (peer.graph_bridge == nullptr) {
                 throw std::logic_error("tensor-parallel graph launch requires a peer bridge");
             }
@@ -44,17 +43,21 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
 template <class Context, class Body>
 void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& body) {
     state.execution.work.reset();
-    if (state.execution.peer == nullptr) {
+    if (state.execution.peers.empty()) {
         definition.capture(state.execution.device.stream, body);
         return;
     }
-    const TpPeerCore& peer = *state.execution.peer;
-    if (peer.graph_bridge == nullptr) {
-        throw std::logic_error("tensor-parallel graph capture requires a peer capture bridge");
+    std::array<DecodeGraphPeerCapture, kMaximumExecutionDevices - 1> captures{};
+    for (std::size_t index = 0; index < state.execution.peers.size(); ++index) {
+        const TpPeerCore& peer = state.execution.peers[index];
+        if (peer.graph_bridge == nullptr) {
+            throw std::logic_error("tensor-parallel graph capture requires every peer bridge");
+        }
+        peer.work->reset();
+        captures[index] = {peer.graph_bridge, peer.device->stream};
     }
-    peer.work->reset();
     definition.capture(state.execution.device.stream, body,
-                       DecodeGraphPeerCapture{peer.graph_bridge, peer.device->stream});
+                       std::span(captures).first(state.execution.peers.size()));
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

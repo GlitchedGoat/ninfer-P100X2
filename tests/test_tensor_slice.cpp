@@ -489,6 +489,56 @@ int main() {
         }, "GGML_K partial block in later column range");
     }
 
+    // Native FP8 block-128: codes and scale words retain their global coordinates.
+    {
+        const auto build = [](std::uint64_t n, std::uint64_t k, std::uint64_t ro,
+                              std::uint64_t ko) {
+            Bytes bytes(n * k + (n / 128) * (k / 128) * 2);
+            for (std::uint64_t r = 0; r < n; ++r) {
+                for (std::uint64_t c = 0; c < k; ++c) {
+                    bytes[r*k+c] = pattern(r+ro, c+ko, (r+ro)/128 + (c+ko)/128);
+                }
+            }
+            for (std::uint64_t r = 0; r < n/128; ++r) {
+                for (std::uint64_t c = 0; c < k/128; ++c) {
+                    const auto at = n*k + (r*(k/128)+c)*2;
+                    bytes[at] = pattern(r+ro/128, c+ko/128, 7);
+                    bytes[at+1] = pattern(r+ro/128, c+ko/128, 11);
+                }
+            }
+            return bytes;
+        };
+        constexpr auto layout = StorageLayout::BlockScaleM128K128V1;
+        constexpr auto format = NumericFormat::FP8_E4M3FN_BLOCK128_BF16S;
+        const std::array<std::uint64_t,2> shape{1024,1024};
+        const auto parent = build(1024,1024,0,0);
+        for (int rank = 0; rank < 4; ++rank) {
+            const std::array<SliceRange,1> range{SliceRange{static_cast<std::uint64_t>(rank)*256,256}};
+            expect_equal(apply_slice(parent, ninfer::artifact::tensor_row_slice(layout,format,shape,range)),
+                         build(256,1024,rank*256,0), "FP8 block TP4 rows");
+            expect_equal(apply_slice(parent, ninfer::artifact::tensor_column_slice(layout,format,shape,range)),
+                         build(1024,256,0,rank*256), "FP8 block TP4 columns");
+        }
+        const std::array<SliceRange,2> fused{SliceRange{128,128},SliceRange{768,256}};
+        auto expected = build(128,1024,128,0);
+        const auto second = build(256,1024,768,0);
+        Bytes joined;
+        joined.insert(joined.end(),expected.begin(),expected.begin()+128*1024);
+        joined.insert(joined.end(),second.begin(),second.begin()+256*1024);
+        joined.insert(joined.end(),expected.begin()+128*1024,expected.end());
+        joined.insert(joined.end(),second.begin()+256*1024,second.end());
+        expect_equal(apply_slice(parent, ninfer::artifact::tensor_row_slice(layout,format,shape,fused)),
+                     joined, "FP8 block disjoint fused rows");
+        expect_throws([&] {
+            const std::array<SliceRange,1> range{SliceRange{64,128}};
+            (void)ninfer::artifact::tensor_row_slice(layout,format,shape,range);
+        }, "FP8 block split scale row rejected");
+        expect_throws([&] {
+            const std::array<SliceRange,1> range{SliceRange{128,64}};
+            (void)ninfer::artifact::tensor_column_slice(layout,format,shape,range);
+        }, "FP8 block split scale column rejected");
+    }
+
     // --- range validation -------------------------------------------------------------------
     {
         const std::array<std::uint64_t, 2> shape = {8, 8};

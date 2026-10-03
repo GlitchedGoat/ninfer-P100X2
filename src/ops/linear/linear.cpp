@@ -9,6 +9,7 @@
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/fp8/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
@@ -99,6 +100,12 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 supports A16 only");
+        }
+        detail::fp8_block_launch(x, w, out, workspace, stream);
+        return;
     case QType::GGML_K:
 #ifdef NINFER_VOLTA_BUILD
         if (workspace != nullptr && x.ne[1] >= 128) {
@@ -145,6 +152,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     }
 
     switch (qtype) {
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 supports A16 only");
+        }
+        return detail::fp8_block_workspace_bytes(output_rows, input_rows, min_tokens, max_tokens);
     case QType::GGML_K:
         if (output_rows <= 0 || input_rows <= 0 || input_rows % 256 != 0 ||
             policy != LinearPolicy::A16Only) {
@@ -223,34 +235,36 @@ namespace {
 // validate_linear_semantics; these are the invariants only the pair makes sense of. The split
 // axis's own extents are deliberately NOT required to match: an uneven split is legal and neither
 // form ever needs to know the logical total.
-void validate_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                          const ExecutionContext& ec, bool column_parallel) {
     detail::require_split_context(
-        ec, "linear split: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
-        throw std::invalid_argument("linear split: both ranks must carry the same token count");
+        ec, "linear split: requires two or four distinct devices", ec.tp);
+    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        throw std::invalid_argument("linear split: argument width must equal TP width");
     }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
-        throw std::invalid_argument("linear split: both ranks must carry the same weight format");
-    }
-    if (column_parallel) {
-        if (w[0].k != w[1].k) {
-            throw std::invalid_argument(
-                "linear column-parallel: both ranks must consume the same input extent K");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (x[0].ne[1] != x[rank].ne[1]) {
+            throw std::invalid_argument("linear split: ranks must carry the same token count");
         }
-        return;
-    }
-    if (w[0].n != w[1].n) {
-        throw std::invalid_argument(
-            "linear row-parallel: both ranks must produce the same output extent N");
+        if (w[0].qtype != w[rank].qtype || w[0].layout != w[rank].layout) {
+            throw std::invalid_argument("linear split: ranks must carry the same weight format");
+        }
+        if (column_parallel && w[0].k != w[rank].k) {
+            throw std::invalid_argument(
+                "linear column-parallel: ranks must consume the same input extent K");
+        }
+        if (!column_parallel && w[0].n != w[rank].n) {
+            throw std::invalid_argument(
+                "linear row-parallel: ranks must produce the same output extent N");
+        }
     }
 }
 
 // Everything a rank owns must live on that rank's device. Compiled out of Release; see
 // require_rank_residency.
-void validate_split_residency(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                              const std::array<Tensor, 2>& out, const ExecutionContext& ec) {
-    for (int rank = 0; rank < 2; ++rank) {
+void validate_split_residency(std::span<const Tensor> x, std::span<const Weight> w,
+                              std::span<const Tensor> out, const ExecutionContext& ec) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, out[slot].data,
@@ -258,17 +272,17 @@ void validate_split_residency(const std::array<Tensor, 2>& x, const std::array<W
     }
 }
 
-// Validates both ranks and returns the mutable output views the launchers need.
-//
-// `dispatch_linear` takes `Tensor&`, and the Op's public arguments are `const std::array<Tensor,2>&`
-// (per-rank views the caller owns), so exactly one mutable copy per rank is made here and reused
-// for both the validation and the launch. Tensor is a small non-owning view; copying it copies no
-// device memory.
-std::array<Tensor, 2> validated_outputs(const std::array<Tensor, 2>& x,
-                                        const std::array<Weight, 2>& w,
-                                        const std::array<Tensor, 2>& out, LinearPolicy policy) {
-    std::array<Tensor, 2> destination{out[0], out[1]};
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+// Validate every active rank before issuing any work. Tensor is a non-owning view; the fixed
+// four-entry host array copies no device memory and allocates nothing during graph recording.
+std::array<Tensor, kMaximumExecutionDevices> validated_outputs(
+    std::span<const Tensor> x, std::span<const Weight> w, std::span<const Tensor> out,
+    LinearPolicy policy, std::span<WorkspaceArena* const> workspace) {
+    if (out.size() != x.size() || workspace.size() != x.size()) {
+        throw std::invalid_argument("linear split: output/workspace width must equal TP width");
+    }
+    std::array<Tensor, kMaximumExecutionDevices> destination{};
+    for (std::size_t slot = 0; slot < x.size(); ++slot) {
+        destination[slot] = out[slot];
         validate_linear_semantics(x[slot], w[slot], destination[slot], policy);
     }
     return destination;
@@ -277,40 +291,44 @@ std::array<Tensor, 2> validated_outputs(const std::array<Tensor, 2>& x,
 // One rank's single-device projection, issued on that rank's own stream. This is the whole of the
 // "split kernel": the shard Weight narrows N (column-parallel) or K (row-parallel), so the
 // existing launcher resolves the shard geometry and its grid is already halved along that axis.
-void issue_rank(int rank, const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                std::array<Tensor, 2>& out, LinearPolicy policy,
-                const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+void issue_rank(int rank, std::span<const Tensor> x, std::span<const Weight> w,
+                std::array<Tensor, kMaximumExecutionDevices>& out, LinearPolicy policy,
+                std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
     const auto slot = static_cast<std::size_t>(rank);
     dispatch_linear(x[slot], w[slot], out[slot], policy, workspace[slot], ec.dev[slot]->stream);
 }
 
 } // namespace
 
-void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                            const std::array<Tensor, 2>& out, LinearPolicy policy,
-                            const std::array<WorkspaceArena*, 2>& workspace,
+void linear_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                            std::span<const Tensor> out, LinearPolicy policy,
+                            std::span<WorkspaceArena* const> workspace,
                             const ExecutionContext& ec) {
     validate_split_pair(x, w, ec, /*column_parallel=*/true);
-    // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
-    std::array<Tensor, 2> destination = validated_outputs(x, w, out, policy);
+    // Validate every active rank before issuing any of them.
+    auto destination = validated_outputs(x, w, out, policy, workspace);
     validate_split_residency(x, w, out, ec);
     detail::for_each_rank(
         ec, [&](int rank) { issue_rank(rank, x, w, destination, policy, workspace, ec); });
 }
 
-void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                            const std::array<Tensor, 2>& out, const ExecutionContext& ec) {
-    linear_column_parallel(x, w, out, LinearPolicy::A16Only, {nullptr, nullptr}, ec);
+void linear_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                            std::span<const Tensor> out, const ExecutionContext& ec) {
+    const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
+    linear_column_parallel(x, w, out, LinearPolicy::A16Only,
+                           std::span(workspace).first(ec.tp), ec);
 }
 
-void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
-                         LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                         std::span<const Tensor> out, std::span<const Tensor> staging,
+                         LinearPolicy policy, std::span<WorkspaceArena* const> workspace,
                          const ExecutionContext& ec, const PeerEvents& events) {
     validate_split_pair(x, w, ec, /*column_parallel=*/false);
-    std::array<Tensor, 2> destination = validated_outputs(x, w, out, policy);
+    auto destination = validated_outputs(x, w, out, policy, workspace);
     validate_split_residency(x, w, out, ec);
-    if (!events.live()) { throw std::invalid_argument("linear row-parallel: events must be live"); }
+    if (!events.live() || events.ranks() != ec.tp || staging.size() != x.size()) {
+        throw std::invalid_argument("linear row-parallel: staging/events must match TP width");
+    }
 
     // Each rank's partial lands directly in out[rank]; allreduce_sum combines in place, so no
     // separate accumulation workspace exists to get out of step with the output. The collective
@@ -318,16 +336,16 @@ void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight
     // is what orders the peer's read after the partial is complete.
     detail::for_each_rank(
         ec, [&](int rank) { issue_rank(rank, x, w, destination, policy, workspace, ec); });
-    // staging[r] must be resident on ec.dev[r], match out[r]'s dtype and shape, and not overlap
-    // it; allreduce_sum checks all three (residency and overlap in debug builds) rather than this
-    // Op restating them.
+    // Scratch capacity follows allreduce_sum: one output contribution at TP2, four at TP4.
     allreduce_sum(out, staging, ec, events);
 }
 
-void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                         std::span<const Tensor> out, std::span<const Tensor> staging,
                          const ExecutionContext& ec, const PeerEvents& events) {
-    linear_row_parallel(x, w, out, staging, LinearPolicy::A16Only, {nullptr, nullptr}, ec, events);
+    const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
+    linear_row_parallel(x, w, out, staging, LinearPolicy::A16Only,
+                        std::span(workspace).first(ec.tp), ec, events);
 }
 
 } // namespace ninfer::ops

@@ -59,7 +59,10 @@ void require_supported_tp_features(const EngineOptions& options) {
     // The Vision encoder runs entirely on the primary device against replicated weights and has no
     // split path; the target layer states the same rule (layouts_impl.h validate_target_options).
     if (options.enable_vision) {
-        throw std::invalid_argument("--tp 2 does not support Vision in this build; use --tp 1");
+        throw std::invalid_argument("tensor-parallel execution does not support Vision; use --tp 1");
+    }
+    if (options.tp == 4 && options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("--tp 4 supports Text/MTP, not DFlash");
     }
 }
 
@@ -67,13 +70,16 @@ void require_supported_tp_features(const EngineOptions& options) {
 // construct. ExecutionContext itself validates that the ids exist, are DISTINCT, and share a
 // compute capability.
 std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
-    if (options.tp != 1 && options.tp != 2) {
-        throw std::invalid_argument("EngineOptions.tp must be 1 or 2");
+    if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
+        throw std::invalid_argument("EngineOptions.tp must be 1, 2 or 4");
     }
     require_supported_tp_features(options);
+    if (options.storage_device >= 0 && options.tp != 1) {
+        throw std::invalid_argument("--storage-device requires --tp 1");
+    }
     if (options.devices.empty()) {
         if (options.tp != 1) {
-            throw std::invalid_argument("--tp 2 requires an explicit --devices list");
+            throw std::invalid_argument("tensor-parallel execution requires an explicit --devices list");
         }
         return {options.device};
     }
@@ -198,7 +204,7 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)),
-          execution(resolve_execution_device_ids(options)) {
+          execution(resolve_execution_device_ids(options), options.storage_device) {
         DeviceContext& device = execution.primary();
         auto constructed      = targets::construct_target(options, execution);
         active                = std::move(constructed.active);
@@ -223,6 +229,9 @@ public:
             try {
                 execution.dev[static_cast<std::size_t>(rank)]->synchronize();
             } catch (...) {}
+        }
+        if (execution.has_storage()) {
+            try { execution.storage->synchronize(); } catch (...) {}
         }
     }
 

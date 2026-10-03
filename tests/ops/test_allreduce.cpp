@@ -77,6 +77,30 @@ void retire_staging(const ExecutionContext& ec) {
     }
 }
 
+template<class Body>
+cudaGraph_t capture_both(const ExecutionContext& ec, Body&& body) {
+    cudaEvent_t fork, join;
+    set_device(ec, 0);
+    cuda_check(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming), "capture fork");
+    set_device(ec, 1);
+    cuda_check(cudaEventCreateWithFlags(&join, cudaEventDisableTiming), "capture join");
+    set_device(ec, 0);
+    cuda_check(cudaStreamBeginCapture(ec.dev[0]->stream, cudaStreamCaptureModeGlobal), "capture begin");
+    cuda_check(cudaEventRecord(fork, ec.dev[0]->stream), "capture fork record");
+    set_device(ec, 1);
+    cuda_check(cudaStreamWaitEvent(ec.dev[1]->stream, fork, 0), "capture fork wait");
+    body();
+    set_device(ec, 1);
+    cuda_check(cudaEventRecord(join, ec.dev[1]->stream), "capture join record");
+    set_device(ec, 0);
+    cuda_check(cudaStreamWaitEvent(ec.dev[0]->stream, join, 0), "capture join wait");
+    cudaGraph_t graph;
+    cuda_check(cudaStreamEndCapture(ec.dev[0]->stream, &graph), "capture end");
+    cuda_check(cudaEventDestroy(fork), "capture fork destroy");
+    cuda_check(cudaEventDestroy(join), "capture join destroy");
+    return graph;
+}
+
 // `ne0` is the contiguous dimension and `ne1` the outer one, so a 1-D buffer passes ne1 == 1 and
 // the real row-parallel residual passes {5120, 48}.
 int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
@@ -125,6 +149,33 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
                                  allreduce_sum_bf16_criterion());
     failures += buffer_1.verify_guards("allreduce buffer device 1");
     failures += staging_1.verify_guards("allreduce staging device 1");
+    // Replay the same public collective from original represented inputs, against the same
+    // FP64 oracle. This exercises graph source-lifetime edges and both sum routes directly.
+    auto graph = capture_both(ec, [&] { ops::allreduce_sum(buffer, staging, ec, events); });
+    cudaGraphExec_t executable;
+    cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "allreduce graph");
+    for (int replay = 0; replay < 2; ++replay) {
+        set_device(ec, 0); buffer_0.copy_from_host(a_bits.data(), bytes);
+        set_device(ec, 1); buffer_1.copy_from_host(b_bits.data(), bytes);
+        retire_staging(ec);
+        set_device(ec, 0);
+        cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "allreduce graph launch");
+        synchronize_both(ec);
+        set_device(ec, 0);
+        failures += verify_pointwise((std::string(label) + " graph device 0").c_str(),
+                                     from_device_bf16(buffer_0.data(), count), expected,
+                                     allreduce_sum_bf16_criterion());
+        failures += buffer_0.verify_guards("allreduce graph buffer device 0");
+        failures += staging_0.verify_guards("allreduce graph staging device 0");
+        set_device(ec, 1);
+        failures += verify_pointwise((std::string(label) + " graph device 1").c_str(),
+                                     from_device_bf16(buffer_1.data(), count), expected,
+                                     allreduce_sum_bf16_criterion());
+        failures += buffer_1.verify_guards("allreduce graph buffer device 1");
+        failures += staging_1.verify_guards("allreduce graph staging device 1");
+    }
+    cuda_check(cudaGraphExecDestroy(executable), "allreduce graph destroy");
+    cuda_check(cudaGraphDestroy(graph), "allreduce definition destroy");
     return failures;
 }
 
@@ -354,6 +405,40 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
     failures += buffer_1.verify_guards("chained buffer device 1");
     failures += staging_1.verify_guards("chained staging device 1");
     failures += gathered_1.verify_guards("chained gathered device 1");
+    // Repeat the skewed state transition in a single cross-device graph, then replay from
+    // original states. No host wait exists between the 64 dependent collectives.
+    const auto graph = capture_both(ec, [&] {
+        set_device(ec, 0);
+        for (int i = 0; i < kSkewRepeats; ++i) {
+            cuda_check(cudaMemsetAsync(skew.p, i, skew.bytes, ec.dev[0]->stream), "captured skew");
+        }
+        for (int round = 0; round < kRounds; ++round) {
+            ops::allreduce_sum(buffer, staging, ec, events);
+            ops::allgather_rows(gathered, part, ec, events);
+        }
+    });
+    cudaGraphExec_t executable;
+    cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "chained graph");
+    for (int replay = 0; replay < 2; ++replay) {
+        set_device(ec, 0); buffer_0.copy_from_host(start_bits.data(), bytes);
+        set_device(ec, 1); buffer_1.copy_from_host(start_bits.data(), bytes);
+        retire_staging(ec);
+        set_device(ec, 0);
+        cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "chained graph launch");
+        synchronize_both(ec);
+        set_device(ec, 0);
+        failures += verify_pointwise("chained graph buffer 0", from_device_bf16(buffer_0.data(), count),
+                                     expected, allreduce_sum_bf16_criterion());
+        failures += verify_pointwise("chained graph gathered 0", from_device_bf16(gathered_0.data(), 2 * count),
+                                     expected_gathered, allreduce_sum_bf16_criterion());
+        set_device(ec, 1);
+        failures += verify_pointwise("chained graph buffer 1", from_device_bf16(buffer_1.data(), count),
+                                     expected, allreduce_sum_bf16_criterion());
+        failures += verify_pointwise("chained graph gathered 1", from_device_bf16(gathered_1.data(), 2 * count),
+                                     expected_gathered, allreduce_sum_bf16_criterion());
+    }
+    cuda_check(cudaGraphExecDestroy(executable), "chained graph destroy");
+    cuda_check(cudaGraphDestroy(graph), "chained definition destroy");
     return failures;
 }
 
@@ -445,16 +530,27 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    bool peer_access = ops::enable_peer_access(ec);
+    if (peer_access && std::getenv("NINFER_TEST_PEER_OFF") != nullptr) {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            cuda_check(cudaDeviceDisablePeerAccess(ec.dev[1 - rank]->device), "disable test peer access");
+        }
+        peer_access = false;
+    }
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, peer_access);
 
     int failures = 0;
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
     failures += run_allreduce_case("allreduce_sum [5120]", 5120, 1, 101u, ec, events);
+    failures += run_allreduce_case("allreduce_sum [5120,4]", 5120, 4, 111u, ec, events);
+    failures += run_allreduce_case("allreduce_sum [40959]", 40959, 1, 112u, ec, events);
+    failures += run_allreduce_case("allreduce_sum [40960]", 40960, 1, 113u, ec, events);
+    failures += run_allreduce_case("allreduce_sum [40961]", 40961, 1, 114u, ec, events);
     // The real row-parallel residual: a full 48-token prefill chunk, 2-D.
     failures += run_allreduce_case("allreduce_sum [5120,48]", 5120, 48, 102u, ec, events);
     failures += run_allreduce_case("allreduce_sum [4097]", 4097, 1, 103u, ec, events);

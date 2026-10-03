@@ -65,6 +65,8 @@ struct VoltaFlashTiling<Gqa27Geometry> {
 
 template <>
 struct VoltaFlashTiling<Gqa27Tp2Geometry> : VoltaFlashTiling<Gqa27Geometry> {};
+template <>
+struct VoltaFlashTiling<Gqa27Tp4Geometry> : VoltaFlashTiling<Gqa27Geometry> {};
 
 template <>
 struct VoltaFlashTiling<Gqa35Geometry> {
@@ -560,6 +562,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 std::size_t gqa_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
     if (q_heads == Gqa27Geometry::QHeads) { return meta_elements_impl<Gqa27Geometry>(tokens); }
     if (q_heads == Gqa27Tp2Geometry::QHeads) { return meta_elements_impl<Gqa27Tp2Geometry>(tokens); }
+    if (q_heads == Gqa27Tp4Geometry::QHeads) { return meta_elements_impl<Gqa27Tp4Geometry>(tokens); }
     if (q_heads == Gqa35Geometry::QHeads) { return meta_elements_impl<Gqa35Geometry>(tokens); }
     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");
 }
@@ -571,6 +574,12 @@ void gqa_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Te
                                       Tensor& k_gathered, Tensor& v_gathered, Tensor& mask,
                                       Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
                                       cudaStream_t stream) {
+    if (q.ne[1] == Gqa27Tp4Geometry::QHeads) {
+        volta_flash_launch_impl<Gqa27Tp4Geometry>(q, k, v, positions, table_rows, scale, cache,
+                                                  envelope, q_block_tokens, k_gathered, v_gathered,
+                                                  mask, q_f32, out_f32, dst_meta, out, stream);
+        return;
+    }
     if (q.ne[1] == Gqa27Tp2Geometry::QHeads) {
         volta_flash_launch_impl<Gqa27Tp2Geometry>(q, k, v, positions, table_rows, scale, cache,
                                                   envelope, q_block_tokens, k_gathered, v_gathered,

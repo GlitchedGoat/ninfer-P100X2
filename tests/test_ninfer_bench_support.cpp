@@ -133,6 +133,11 @@ int test_cli_contract() {
                                     "1,0", "--tp", "2", "--device", "1"});
     failures += expect(tp2.tp == 2 && tp2.device == 1 && tp2.devices == std::vector<int>({1, 0}),
                        "TP2 preserves rank order and primary device");
+    const auto tp4 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--tp", "4",
+                                    "--devices", "3,1,0,2"});
+    failures += expect(tp4.tp == 4 && tp4.device == 3 &&
+                           tp4.devices == std::vector<int>({3, 1, 0, 2}),
+                       "TP4 preserves rank order and primary device");
     const auto selected = parse_for_test(
         {"ninfer_bench", "--weights", "model.ninfer", "--devices", "2"});
     failures += expect(selected.tp == 1 && selected.device == 2 &&
@@ -141,6 +146,7 @@ int test_cli_contract() {
     for (const std::vector<std::string>& flags :
          std::vector<std::vector<std::string>>{{"--tp", "2"},
                                                {"--tp", "3"},
+                                               {"--tp", "4", "--devices", "0,1,2,2"},
                                                {"--devices", "0,1"},
                                                {"--tp", "2", "--devices", "0"},
                                                {"--tp", "2", "--devices", "0,0"},
@@ -291,6 +297,7 @@ qb::BenchEnvironment sample_environment() {
     env.memory.max_context                = 4096;
     env.memory.kv_capacity                = 8192;
     env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.cuda_graph_rank_observed_bytes = {1200,1300,0,0};
     env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
     env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
     env.memory.workspace                  = {100000000ULL, 0, 0};
@@ -339,6 +346,8 @@ int test_report_contract() {
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
     failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
+    failures += expect(report.at("memory").at("cuda_graph_rank_observed_bytes") == Json({1200,1300}),
+                       "graph residency reports exactly the active ranks");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
     failures +=

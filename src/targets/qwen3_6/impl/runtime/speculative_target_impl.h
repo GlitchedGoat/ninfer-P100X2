@@ -44,59 +44,57 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope,
-                          bool greedy_target) {
-    if (execution.peer == nullptr) {
-        throw std::logic_error("tensor-parallel target verify requires a peer");
+                          std::span<const TargetVerifyFrameView> peers,
+                          ops::GqaExecutionEnvelope envelope, bool greedy_target) {
+    if (execution.peers.empty() || peers.size() != execution.peers.size()) {
+        throw std::logic_error("parallel verify requires one frame per peer");
     }
-    if (frame.replay_records == nullptr || peer.replay_records == nullptr) {
-        throw std::logic_error("speculative target verify has no ReplaySSM record storage");
+    std::array<TargetVerifyFrameView, kMaximumExecutionDevices> views{};
+    views[0] = frame;
+    std::copy(peers.begin(), peers.end(), views.begin() + 1);
+    for (const auto& peer : peers) {
+        if (peer.replay_records == nullptr || peer.feature_sink != nullptr) {
+            throw std::logic_error("parallel target verify peer frame is incomplete");
+        }
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
-    if (peer.feature_sink != nullptr) {
-        throw std::logic_error("tensor-parallel DFlash peer feature sink is unexpected");
-    }
+    const auto field = [&](Tensor TargetVerifyFrameView::* member) {
+        return rank_views(execution, [&](int rank) { return views[rank].*member; });
+    };
+    const auto ids = field(&TargetVerifyFrameView::ids);
+    const auto positions = field(&TargetVerifyFrameView::cache_positions);
+    const auto rope = field(&TargetVerifyFrameView::rope_positions);
+    const auto valid = field(&TargetVerifyFrameView::valid_columns);
+    const auto rows = field(&TargetVerifyFrameView::kv_table_rows);
+    const auto lanes = field(&TargetVerifyFrameView::lanes);
+    const auto hidden = field(&TargetVerifyFrameView::target_hidden);
+    const auto logits = field(&TargetVerifyFrameView::target_logits);
+    const auto tokens = field(&TargetVerifyFrameView::target_tokens);
     if (frame.feature_sink != nullptr) {
-        card.target_verify_batch({frame.ids, peer.ids},
-                                 {frame.cache_positions, peer.cache_positions},
-                                 {frame.rope_positions, peer.rope_positions},
-                                 {frame.valid_columns, peer.valid_columns},
-                                 {frame.kv_table_rows, peer.kv_table_rows},
-                                 {frame.lanes, peer.lanes}, envelope,
-                                 {frame.target_hidden, peer.target_hidden},
-                                 {frame.target_logits, peer.target_logits},
-                                 {frame.target_tokens, peer.target_tokens}, *frame.feature_sink,
-                                 greedy_target);
+        card.target_verify_batch(ids, positions, rope, valid, rows, lanes, envelope,
+                                 hidden, logits, tokens, *frame.feature_sink, greedy_target);
     } else {
-        card.target_verify_batch({frame.ids, peer.ids},
-                                 {frame.cache_positions, peer.cache_positions},
-                                 {frame.rope_positions, peer.rope_positions},
-                                 {frame.valid_columns, peer.valid_columns},
-                                 {frame.kv_table_rows, peer.kv_table_rows}, {frame.lanes, peer.lanes},
-                                 envelope, {frame.target_hidden, peer.target_hidden},
-                                 {frame.target_logits, peer.target_logits},
-                                 {frame.target_tokens, peer.target_tokens}, greedy_target);
+        card.target_verify_batch(ids, positions, rope, valid, rows, lanes, envelope,
+                                 hidden, logits, tokens, greedy_target);
     }
-    const ExecutionContext& ec      = *execution.peer->execution;
-    WorkspaceArena* work[2]         = {&execution.work, execution.peer->work};
-    TargetVerifyFrameView* views[2] = {&frame, &peer};
+    const auto& ec = *execution.peers[0].execution;
     for_each_rank(ec, [&](int rank) {
-        const auto r              = static_cast<std::size_t>(rank);
-        TargetVerifyFrameView& v  = *views[r];
-        cudaStream_t stream       = ec.dev[rank]->stream;
+        auto& value = views[rank];
+        auto& work = rank == 0 ? execution.work : *execution.peers[rank - 1].work;
+        const auto stream = ec.dev[rank]->stream;
         if (greedy_target) {
             ops::speculative_accept_greedy_tokens(
-                v.target_tokens, v.drafts, v.current_extents, v.frontiers, v.anchors,
-                v.licensed_tokens, v.licensed_counts, v.accepted_drafts, TextConfig::token_domain,
-                v.sampling, stream);
+                value.target_tokens, value.drafts, value.current_extents, value.frontiers,
+                value.anchors, value.licensed_tokens, value.licensed_counts,
+                value.accepted_drafts, TextConfig::token_domain, value.sampling, stream);
         } else {
             ops::speculative_accept_greedy_drafts(
-                v.target_tokens, v.target_logits, v.drafts, v.current_extents, v.frontiers,
-                v.anchors, v.licensed_tokens, v.licensed_counts, v.accepted_drafts,
-                TextConfig::token_domain, v.sampling, *work[r], stream);
+                value.target_tokens, value.target_logits, value.drafts, value.current_extents,
+                value.frontiers, value.anchors, value.licensed_tokens, value.licensed_counts,
+                value.accepted_drafts, TextConfig::token_domain, value.sampling, work, stream);
         }
-        ops::speculative_select_accepted_hidden(v.target_hidden, v.accepted_drafts,
-                                                v.selected_hidden, stream);
+        ops::speculative_select_accepted_hidden(value.target_hidden, value.accepted_drafts,
+                                                value.selected_hidden, stream);
     });
     ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,
                  execution.device.stream);

@@ -50,7 +50,7 @@ private:
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDevice restore;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
         body(rank);
     }
@@ -76,6 +76,7 @@ struct TpPeerCore {
     // counter lane: `speculative_accept_greedy_drafts` READS and atomically WRITES that pointer
     // in sampling mode, and a pointer into the other device's arena is an illegal access without
     // peer mapping and a silent double-increment with it.
+    const qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     const qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     // Enrolls rank 1's stream in rank 0's capture. Null when graphs are disabled; the eager path
@@ -97,15 +98,27 @@ struct ExecutionCore {
     // (`ProgramImplCore::rope_frequency`). Every TextContext built from this core forwards it to
     // its text rope call sites, MTP ones included. All-null is the native constant-table path,
     // bit-for-bit, which is why the default value is the pre-YaRN behavior.
-    std::array<ops::RopeFrequencyOverride, 2> rope_frequency{};
-    const TpPeerCore* peer = nullptr;
+    std::array<ops::RopeFrequencyOverride, kMaximumExecutionDevices> rope_frequency{};
+    std::span<const TpPeerCore> peers;
 };
 
+template <class Body>
+auto rank_views(const ExecutionCore& execution, Body&& body) {
+    using Value = std::decay_t<decltype(body(0))>;
+    std::array<Value, kMaximumExecutionDevices> result{};
+    for (int rank = 0; rank <= static_cast<int>(execution.peers.size()); ++rank) {
+        result[rank] = body(rank);
+    }
+    return result;
+}
+
 // Assembles the TextContext-side view of `peer`. Returns an empty optional at tp == 1.
-[[nodiscard]] inline std::optional<TpExecution> tp_execution(const ExecutionCore& execution) {
-    if (execution.peer == nullptr) { return std::nullopt; }
-    const TpPeerCore& peer = *execution.peer;
-    TpExecution out;
+[[nodiscard]] inline std::array<TpExecution, kMaximumExecutionDevices - 1>
+tp_execution(const ExecutionCore& execution) {
+    std::array<TpExecution, kMaximumExecutionDevices - 1> result{};
+    for (std::size_t index = 0; index < execution.peers.size(); ++index) {
+    const TpPeerCore& peer = execution.peers[index];
+    TpExecution& out = result[index];
     out.execution      = peer.execution;
     out.events         = peer.events;
     out.device         = peer.device;
@@ -117,7 +130,8 @@ struct ExecutionCore {
     out.batch_kv       = peer.text_cache;
     out.batch_mtp_kv   = peer.mtp_cache;
     out.replay_records = peer.replay_records;
-    return out;
+    }
+    return result;
 }
 
 struct PrefillContext {
@@ -127,7 +141,7 @@ struct PrefillContext {
     // Rank 1's per-sequence MTP KV window at tp == 2; empty at tp == 1 and when MTP is off. The
     // text prefill needs no peer twin because it drives the BATCH cache view plus table rows,
     // but the MTP prefill appends and reads through the per-sequence execution view.
-    qwen3_6::PagedKVCacheView mtp_kv_peer;
+    std::array<qwen3_6::PagedKVCacheView, kMaximumExecutionDevices - 1> mtp_kv_peers{};
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* mtp_cache;
     DFlashPersistentState* dflash;
@@ -150,7 +164,6 @@ struct OrdinaryBatchContext {
     // Rank 1's own pinned copy of `host_ingress`, with every row's sampling counter pointer
     // nulled (ProgramImplCore::publish_peer_ordinary_ingress). Required whenever
     // `execution.tp` is engaged; null at tp1.
-    const qwen3_6::OrdinaryDecodeIngress* peer_host_ingress = nullptr;
 };
 
 struct MtpBatchContext {
@@ -161,6 +174,7 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    bool greedy_target = false;
 };
 
 struct DFlashBatchContext {
@@ -223,12 +237,14 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                           ops::GqaExecutionEnvelope envelope, bool greedy_target = false);
 // tp == 2 form. `peer` is rank 1's identically-shaped view of ITS OWN frame; the acceptance
 // arithmetic is replicated there rather than transferred, because every one of its inputs is
-// either the ingress record (copied to both frames) or the gathered logits (bit-identical on both
-// ranks). What is NOT replicated is rank 0's bookkeeping: the continuation-hidden scatter and the
+// either the ingress record (copied to both frames), gathered logits, or broadcast greedy token
+// IDs (bit-identical on both ranks). What is NOT replicated is rank 0's bookkeeping: the
+// continuation-hidden scatter and the
 // egress transfer stay on rank 0 alone.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope,
+                          std::span<const TargetVerifyFrameView> peers,
+                          ops::GqaExecutionEnvelope envelope,
                           bool greedy_target = false);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
@@ -251,7 +267,8 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                         std::int32_t purpose);
 // Retained hidden is authoritative on rank 0, including partial MTP commit corrections. Copy it
 // into rank 1's prefill scratch only on resume; both streams protect its producer/read lifetime.
-[[nodiscard]] std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden);
+[[nodiscard]] std::array<Tensor, kMaximumExecutionDevices>
+resume_hidden(ExecutionCore& execution, const Tensor& hidden);
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,

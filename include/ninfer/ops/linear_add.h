@@ -9,9 +9,9 @@
 
 #include <cuda_runtime.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -81,70 +81,47 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
 // [128,H,3]. No weight is requantized: ideal is residual + W @ transpose_heads(x).
 // FP64 decodes W's original scales/codes and applies this permutation before the dot.
 // Caller-owned transient workspace for the SM70 prefill route; no persistent state. Split form
-// adds the residual on rank 0 once and all-reduces both partial projections, following
+// adds the residual on rank 0 once and all-reduces the partial projections, following
 // linear_add_row_parallel.
 void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
                        WorkspaceArena& workspace, cudaStream_t stream);
-void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                       const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging,
-                       const std::array<WorkspaceArena*, 2>& workspace,
+void ggml_k_gdn_output(std::span<const Tensor> x, std::span<const Weight> w,
+                       std::span<const Tensor> residual,
+                       std::span<const Tensor> staging,
+                       std::span<WorkspaceArena* const> workspace,
                        const ExecutionContext& ec,
                        const PeerEvents& events);
 
-// --- Tensor-parallel split form (tp == 2) -----------------------------------------------------
+// --- Tensor-parallel split form (tp == 2 or 4) ------------------------------------------------
+// All spans have exactly ec.tp entries. Only registered per-format shard shapes are admitted;
+// accepting a four-rank context does not register an otherwise unsupported weight geometry.
+// Staging follows allreduce_sum: one output contribution per rank at TP2, four at TP4.
 //
-// linear_add is a ROW-parallel (input-split) op only: its output is the residual stream, which
-// must stay the full, identical [N,T] tensor on both devices for every op downstream of it, so
-// there is no column-parallel (output-split) form the way include/ninfer/ops/linear.h has one.
+// Rank r owns BF16 x[r] [K_r,T], weight w[r] [N,K_r], and the replicated incoming residual
+// [N,T]. The complete mathematical oracle is residual_in + sum_r W_r @ x_r, evaluated directly
+// in FP64 from represented BF16 inputs and independently decoded packed weights. Internal
+// partial storage/reduction rounding is an implementation profile, not an oracle boundary.
 //
-// Rank r owns a [K_r,T] activation block and the matching [N,K_r] weight-column shard, exactly as
-// linear_row_parallel() does. The one thing this Op adds beyond that pattern is where the residual
-// add happens: the tp1 route can fuse it into the GEMM epilogue, but a row-parallel rank only
-// ever holds a PARTIAL sum over its own K block, so fusing the (fully-formed, replicated) residual
-// into every rank's partial would add it once per rank -- i.e. count it (tp==2) times instead of
-// once. It must be added exactly once, and the reduction that combines the partials must not see
-// two different bases.
+// Rank 0 folds the residual into its partial exactly once; all other ranks overwrite their
+// copies with residual-free projections. The one allreduce_sum leaves the full residual on
+// every rank. BF16_CTRL composes plain Linear and residual_add using staging's first plane;
+// registered packed formats use their fused LinearAdd route on rank 0. There are no per-rank
+// residual additions after the reduction and no extra hot-path allocation.
 //
-// This Op resolves that by folding the residual into the reduction itself rather than by adding it
-// again afterwards: rank 0 evaluates `residual = residual + partial_0` with the same per-format
-// LinearAdd route (residual's incoming value is its own per-rank replicated copy, which is
-// correct because it enters the sum exactly once, from exactly one rank); rank 1 evaluates the pure
-// GEMM partial `residual = partial_1` (linear(), no residual term, overwriting rank 1's copy, whose
-// pre-call bytes are not needed again). The one `allreduce_sum(residual, staging, ec, events)` that
-// follows then computes `(residual_in + partial_0) + partial_1`, which both ranks are left holding
-// -- the residual added exactly once, before the reduce, with no separate post-reduce add and no
-// change to allreduce_sum's own contract (it is called exactly as documented: summing two per-rank
-// buffers of the collective's own dtype and shape). The selected private profile determines
-// whether rank 0 fuses the residual into GEMM or materializes the projection before adding it.
-//
-// Where a format's linear_add kernels are all EXACT-geometry templates with no runtime-dimensioned
-// escape hatch for a halved K (BF16_CTRL today), rank 0 instead composes the already tp2-capable
-// plain linear() at the shard shape with the standalone residual_add() Op
-// (include/ninfer/ops/residual_add.h) -- the same qualified `x += y` computation allreduce_sum's
-// own local combine uses -- so the arithmetic is identical either way; only which kernel performs
-// the fused rounding differs. See the implementation for exactly which formats take which path.
-//
-// Every requirement of linear_add() applies per rank, and the caller obligations of
-// linear_row_parallel() (per-rank device/stream residency, the legacy-default-stream trap) apply
-// unchanged here too.
-//
-// Registered formats: GGML_K, NVFP4, Q5G64_F16S, and FP8_E4M3FN_ROW_BF16S are all
-// TRUE splits -- each has a runtime-K-dimensioned linear_add kernel family, so rank 0 reaches it
-// through dispatch_linear_add exactly as linear_add() itself does, at the halved-K shard geometry.
-// BF16_CTRL is COMPOSED, not extended (see above -- its family has no runtime-K escape hatch).
-// W8G32_F16S is not registered: its own linear_add profile belongs to a different (non-TP2)
-// variant that this repository's ShardPlan never shards.
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, LinearPolicy policy,
-                             const std::array<WorkspaceArena*, 2>& workspace,
+// Ranks agree on token count, output extent N and weight format/layout. K_r may differ. Input
+// and output residency/stream requirements are the same as linear_row_parallel. GGML_K,
+// NVFP4, Q5G64_F16S, row-scaled FP8 and BF16_CTRL are admitted only at their registered shapes.
+// W8G32_F16S is not registered for this split form.
+void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                             std::span<const Tensor> residual,
+                             std::span<const Tensor> staging, LinearPolicy policy,
+                             std::span<WorkspaceArena* const> workspace,
                              const ExecutionContext& ec, const PeerEvents& events);
 
 /// A16-only convenience form for profiles whose queried transient workspace is zero.
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                             std::span<const Tensor> residual,
+                             std::span<const Tensor> staging, const ExecutionContext& ec,
                              const PeerEvents& events);
 
 } // namespace ninfer::ops

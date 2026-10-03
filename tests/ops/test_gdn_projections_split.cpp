@@ -379,14 +379,20 @@ int run_fused_case(const ExecutionContext& ec, QType qtype,
     std::array<DeviceWeight, 2> shard_device;
     for (int rank = 0; rank < 2; ++rank) {
         set_device(ec, rank);
-        shard_device[static_cast<std::size_t>(rank)] =
-            upload_weight(shard[static_cast<std::size_t>(rank)].shard);
+        auto fixture = shard[static_cast<std::size_t>(rank)].shard;
+        if (qtype == QType::NVFP4 && ec.dev[rank]->sm() == 70) {
+            fixture.payload = qw::nvfp4_qpn_payload(fixture);
+            fixture.weight.layout = QuantLayout::VoltaQpnPrepacked;
+        }
+        shard_device[static_cast<std::size_t>(rank)] = upload_weight(fixture);
     }
 
     // T sweep: T=1 (decode edge), small-T/MMA frontiers, T=128 (W4A4/A8 route under the permissive
     // policy), T=1024 (a multiple of 256 -- the sole route into the NVFP4 W4A4 TMA kernel, and the
     // shard's own TMA descriptor per the w4a4.cu/w4a4_tma.cu changes).
-    const std::vector<std::int32_t> tokens_sweep{1, 2, 5, 8, 17, 32, 48, 128, 1024};
+    const auto tokens_sweep = qtype == QType::NVFP4
+        ? std::vector<std::int32_t>{1, 3, 4, 8, 9, 32, 33, 127, 128, 129, 1024}
+        : std::vector<std::int32_t>{1, 2, 5, 8, 17, 32, 48, 128, 1024};
 
     for (const std::int32_t tokens : tokens_sweep) {
         std::vector<float> activation(static_cast<std::size_t>(kInputRows) * tokens);
@@ -1189,7 +1195,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                         Tensor(qkv1.p, DType::BF16, {kShardQkvRows, 1})};
         const std::array<Tensor, 2> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 2}),
                                       Tensor(z1.p, DType::BF16, {kShardValueRows, 1})};
-        ops::gdn_input_proj_column_parallel(x, {fake, fake}, qkv, z, ec);
+        ops::gdn_input_proj_column_parallel(x, std::array<Weight, 2>{fake, fake}, qkv, z, ec);
     });
 
     expect_throw("column K", [&] {
@@ -1201,7 +1207,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                         Tensor(qkv1.p, DType::BF16, {kShardQkvRows, 1})};
         const std::array<Tensor, 2> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 1}),
                                       Tensor(z1.p, DType::BF16, {kShardValueRows, 1})};
-        ops::gdn_input_proj_column_parallel(x, {fake, other}, qkv, z, ec);
+        ops::gdn_input_proj_column_parallel(x, std::array<Weight, 2>{fake, other}, qkv, z, ec);
     });
 
     expect_throw("tp1 context", [&] {
@@ -1212,7 +1218,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
                                         Tensor(qkv1.p, DType::BF16, {kShardQkvRows, 1})};
         const std::array<Tensor, 2> z{Tensor(z0.p, DType::BF16, {kShardValueRows, 1}),
                                       Tensor(z1.p, DType::BF16, {kShardValueRows, 1})};
-        ops::gdn_input_proj_column_parallel(x, {fake, fake}, qkv, z, single);
+        ops::gdn_input_proj_column_parallel(x, std::array<Weight, 2>{fake, fake}, qkv, z, single);
     });
 
     std::cout << (failures ? "FAIL" : "OK") << " split rejections\n";
@@ -1221,7 +1227,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int failures = verify_registry();
     if (failures != 0) {
         std::cout << "FAIL gdn_projections split (registry)\n";
@@ -1248,11 +1254,18 @@ int main() {
               << '\n';
 
     failures += verify_split_rejections(ec);
-    failures += run_fused_case(
-        ec, QType::NVFP4, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}, 41u);
-    failures += run_fused_case(
-        ec, QType::FP8_E4M3FN_ROW_BF16S, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8},
-        45u);
+    std::vector<ops::LinearPolicy> nvfp4_policies{ops::LinearPolicy::A16Only};
+    std::vector<ops::LinearPolicy> fp8_policies{ops::LinearPolicy::A16Only};
+    if (ec.dev[0]->sm() >= 120) {
+        nvfp4_policies.push_back(ops::LinearPolicy::AllowA4);
+        fp8_policies.push_back(ops::LinearPolicy::AllowA8);
+    }
+    failures += run_fused_case(ec, QType::NVFP4, nvfp4_policies, 41u);
+    if (argc == 2 && std::string_view(argv[1]) == "--nvfp4") {
+        std::cout << (failures ? "FAIL" : "OK") << " NVFP4 gdn_projections split\n";
+        return failures ? 1 : 0;
+    }
+    failures += run_fused_case(ec, QType::FP8_E4M3FN_ROW_BF16S, fp8_policies, 45u);
     failures += run_split_storage_case(ec, 43u);
     failures += run_gating_case(ec, 51u);
     failures += run_gating_fused_case(ec, 53u, 48);

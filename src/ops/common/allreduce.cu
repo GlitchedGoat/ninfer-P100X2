@@ -1,11 +1,11 @@
 // Implements: include/ninfer/ops/allreduce.h
 //
-// Host-side composition only: the transport is cudaMemcpyAsync with cudaMemcpyDeviceToDevice over
+// Host-side composition: the DMA transport is cudaMemcpyAsync with cudaMemcpyDeviceToDevice over
 // UVA pointers (see pull_peer() below -- deliberately NOT cudaMemcpyPeerAsync, which stream
 // capture rejects), and the local combine reuses the qualified residual_add computation body
 // (x += y in BF16 with FP32 accumulation and a single round-to-nearest-even on store), which is
-// exactly this Op's local step. Sharing that private launch body keeps one implementation of the
-// BF16 sum instead of a second, separately qualified copy of the same arithmetic.
+// exactly this Op's local step. Qualified small SM70 P2P sums instead read both operands into a
+// rank-local staging output, using the same FP32-add/BF16-store arithmetic.
 //
 // Both collectives share one three-phase issue order. The phases exist because a wait must not be
 // issued before the record it observes: cudaStreamWaitEvent snapshots the event's current state,
@@ -13,9 +13,9 @@
 // peer's phase-A record had not been issued yet.
 //
 //   phase A, both ranks:  record(inputs_ready[r])
-//   phase B, both ranks:  wait(inputs_ready[1-r]); pull peer source into own storage;
+//   phase B, both ranks:  wait(inputs_ready[1-r]); pull or sum peer source into own staging;
 //                         record(pull_done[r])
-//   phase C, both ranks:  wait(pull_done[1-r]); local combine (allreduce_sum only)
+//   phase C, both ranks:  wait(pull_done[1-r]); local combine or publish sum (allreduce_sum only)
 //
 // THE PULL ITSELF is cudaMemcpyAsync with cudaMemcpyDeviceToDevice over UVA pointers, NOT
 // cudaMemcpyPeerAsync -- see pull_peer() below for why. The choreography, the streams each call
@@ -24,6 +24,7 @@
 #include "ninfer/ops/allreduce.h"
 
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
+#include "ops/launcher/allreduce.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,10 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <nvml.h>
+#endif
 
 namespace ninfer::ops {
 namespace {
@@ -40,9 +45,14 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(message); }
 }
 
-void require_two_devices(const ExecutionContext& ec, const char* message) {
-    require(ec.tp == 2 && ec.dev[0].has_value() && ec.dev[1].has_value(), message);
-    require(ec.dev[0]->device != ec.dev[1]->device, message);
+void require_collective_devices(const ExecutionContext& ec, const char* message) {
+    require(ec.tp == 2 || ec.tp == 4, message);
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        require(ec.dev[rank].has_value(), message);
+        for (int other = 0; other < rank; ++other) {
+            require(ec.dev[rank]->device != ec.dev[other]->device, message);
+        }
+    }
 }
 
 std::uint8_t* byte_offset(void* base, std::size_t offset) {
@@ -97,13 +107,71 @@ void startup_check(cudaError_t status, const char* operation) {
     }
 }
 
+// NVLink does not traverse the host IOMMU. Qualify this exception from the active
+// links' actual PCI endpoints, not an advertised CUDA peer-access bit. NVML is
+// startup-only and optional: when it cannot establish the complete mesh, retain
+// the conservative PCIe/IOMMU rule. No driver setting is changed.
+bool active_nvlink_mesh(const ExecutionContext& ec) {
+#if defined(__linux__)
+    void* library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) { return false; }
+    const auto init = reinterpret_cast<decltype(&nvmlInit_v2)>(dlsym(library, "nvmlInit_v2"));
+    const auto shutdown = reinterpret_cast<decltype(&nvmlShutdown)>(dlsym(library, "nvmlShutdown"));
+    const auto get_device = reinterpret_cast<decltype(&nvmlDeviceGetHandleByPciBusId_v2)>(
+        dlsym(library, "nvmlDeviceGetHandleByPciBusId_v2"));
+    const auto state = reinterpret_cast<decltype(&nvmlDeviceGetNvLinkState)>(
+        dlsym(library, "nvmlDeviceGetNvLinkState"));
+    const auto remote = reinterpret_cast<decltype(&nvmlDeviceGetNvLinkRemotePciInfo_v2)>(
+        dlsym(library, "nvmlDeviceGetNvLinkRemotePciInfo_v2"));
+    if (!init || !shutdown || !get_device || !state || !remote || init() != NVML_SUCCESS) {
+        dlclose(library);
+        return false;
+    }
+    std::array<nvmlDevice_t, kMaximumExecutionDevices> devices{};
+    std::array<std::array<unsigned, 4>, kMaximumExecutionDevices> pci{};
+    bool complete = true;
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        char bus_id[32]{};
+        if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), ec.dev[rank]->device) != cudaSuccess ||
+            get_device(bus_id, &devices[rank]) != NVML_SUCCESS ||
+            std::sscanf(bus_id, "%x:%x:%x.%x", &pci[rank][0], &pci[rank][1],
+                        &pci[rank][2], &pci[rank][3]) != 4) {
+            complete = false;
+            break;
+        }
+    }
+    for (int rank = 0; complete && rank < ec.tp; ++rank) {
+        std::array<bool, kMaximumExecutionDevices> linked{};
+        linked[rank] = true;
+        for (unsigned link = 0; link < NVML_NVLINK_MAX_LINKS; ++link) {
+            nvmlEnableState_t enabled{};
+            nvmlPciInfo_t endpoint{};
+            if (state(devices[rank], link, &enabled) != NVML_SUCCESS ||
+                enabled != NVML_FEATURE_ENABLED ||
+                remote(devices[rank], link, &endpoint) != NVML_SUCCESS) { continue; }
+            for (int other = 0; other < ec.tp; ++other) {
+                if (endpoint.domain == pci[other][0] && endpoint.bus == pci[other][1] &&
+                    endpoint.device == pci[other][2]) { linked[other] = true; }
+            }
+        }
+        for (int other = 0; other < ec.tp; ++other) { complete &= linked[other]; }
+    }
+    shutdown();
+    dlclose(library);
+    return complete;
+#else
+    (void)ec;
+    return false;
+#endif
+}
+
 // Linux CUDA PCIe P2P is unsupported behind a translated IOMMU domain. A small
 // allocation can nevertheless pass a copy probe while other mappings silently
 // lose writes, so the domain restriction takes precedence over that probe.
 std::string translated_iommu_domain(const ExecutionContext& ec) {
     std::string reason;
 #if defined(__linux__)
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         char pci_bus_id[32]{};
         startup_check(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), ec.dev[rank]->device),
                       "cudaDeviceGetPCIBusId");
@@ -136,7 +204,7 @@ public:
     }
 
     ~PeerTransferProbe() {
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < ec_.tp; ++rank) {
             cleanup(cudaSetDevice(ec_.dev[rank]->device), "cudaSetDevice");
             if (source_[rank] != nullptr) { cleanup(cudaFree(source_[rank]), "cudaFree source"); }
             if (destination_[rank] != nullptr) {
@@ -154,7 +222,7 @@ public:
     }
 
     void initialize() {
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < ec_.tp; ++rank) {
             set_device(rank);
             startup_check(cudaMalloc(&source_[rank], kBytes), "cudaMalloc source");
             startup_check(cudaMalloc(&destination_[rank], kBytes), "cudaMalloc destination");
@@ -170,25 +238,28 @@ public:
     // Empty means both complete copies matched their independent host patterns exactly.
     std::string qualify() {
         std::string mismatch;
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < ec_.tp; ++rank) {
             set_device(rank);
             cudaStream_t stream = ec_.dev[rank]->stream;
-            startup_check(cudaMemsetAsync(destination_[rank], 0xcd, kBytes, stream),
-                          "clear destination");
-            startup_check(pull_peer(destination_[rank], source_[1 - rank], kBytes, stream),
-                          "cross-device copy");
-            startup_check(cudaStreamSynchronize(stream), "retire cross-device copy");
-            std::array<std::uint32_t, kWords> actual{};
-            startup_check(cudaMemcpy(actual.data(), destination_[rank], kBytes,
-                                      cudaMemcpyDeviceToHost), "read destination");
-            for (std::size_t i = 0; i < kWords; ++i) {
-                if (actual[i] != pattern(1 - rank, i)) {
-                    if (mismatch.empty()) {
-                        mismatch = "device " + std::to_string(ec_.dev[1 - rank]->device) +
-                                   " -> " + std::to_string(ec_.dev[rank]->device) +
-                                   " data mismatch at word " + std::to_string(i);
+            for (int source_rank = 0; source_rank < ec_.tp; ++source_rank) {
+                if (rank == source_rank) { continue; }
+                startup_check(cudaMemsetAsync(destination_[rank], 0xcd, kBytes, stream),
+                              "clear destination");
+                startup_check(pull_peer(destination_[rank], source_[source_rank], kBytes, stream),
+                              "cross-device copy");
+                startup_check(cudaStreamSynchronize(stream), "retire cross-device copy");
+                std::array<std::uint32_t, kWords> actual{};
+                startup_check(cudaMemcpy(actual.data(), destination_[rank], kBytes,
+                                          cudaMemcpyDeviceToHost), "read destination");
+                for (std::size_t i = 0; i < kWords; ++i) {
+                    if (actual[i] != pattern(source_rank, i)) {
+                        if (mismatch.empty()) {
+                            mismatch = "device " + std::to_string(ec_.dev[source_rank]->device) +
+                                       " -> " + std::to_string(ec_.dev[rank]->device) +
+                                       " data mismatch at word " + std::to_string(i);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
@@ -196,13 +267,16 @@ public:
     }
 
     void disable_peer_access() const {
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < ec_.tp; ++rank) {
             set_device(rank);
-            const cudaError_t status = cudaDeviceDisablePeerAccess(ec_.dev[1 - rank]->device);
-            if (status == cudaErrorPeerAccessNotEnabled) {
-                (void)cudaGetLastError();
-            } else {
-                startup_check(status, "cudaDeviceDisablePeerAccess");
+            for (int other = 0; other < ec_.tp; ++other) {
+                if (rank == other) { continue; }
+                const cudaError_t status = cudaDeviceDisablePeerAccess(ec_.dev[other]->device);
+                if (status == cudaErrorPeerAccessNotEnabled) {
+                    (void)cudaGetLastError();
+                } else {
+                    startup_check(status, "cudaDeviceDisablePeerAccess");
+                }
             }
         }
     }
@@ -225,8 +299,8 @@ private:
 
     const ExecutionContext& ec_;
     int previous_ = 0;
-    std::array<void*, 2> source_{};
-    std::array<void*, 2> destination_{};
+    std::array<void*, kMaximumExecutionDevices> source_{};
+    std::array<void*, kMaximumExecutionDevices> destination_{};
 };
 
 #ifndef NDEBUG
@@ -251,30 +325,37 @@ void require_disjoint(const void* first, std::size_t first_bytes, const void* se
 } // namespace
 
 bool enable_peer_access(const ExecutionContext& ec) {
-    if (ec.tp != 2 || !ec.dev[0].has_value() || !ec.dev[1].has_value()) { return false; }
-    const int pair[2] = {ec.dev[0]->device, ec.dev[1]->device};
-    if (pair[0] == pair[1]) { return false; }
+    if (ec.tp == 1) { return false; }
+    require_collective_devices(ec, "peer transport requires two or four distinct devices");
 
     PeerTransferProbe probe(ec);
     try {
-        std::string direct_failure = translated_iommu_domain(ec);
-        int forward = 0;
-        int reverse = 0;
+        const bool nvlink = active_nvlink_mesh(ec);
+        std::string direct_failure = nvlink ? std::string{} : translated_iommu_domain(ec);
         if (direct_failure.empty()) {
-            startup_check(cudaDeviceCanAccessPeer(&forward, pair[0], pair[1]),
-                          "cudaDeviceCanAccessPeer forward");
-            startup_check(cudaDeviceCanAccessPeer(&reverse, pair[1], pair[0]),
-                          "cudaDeviceCanAccessPeer reverse");
+            for (int rank = 0; rank < ec.tp; ++rank) {
+                for (int other = 0; other < ec.tp; ++other) {
+                    if (rank == other) { continue; }
+                    int accessible = 0;
+                    startup_check(cudaDeviceCanAccessPeer(&accessible, ec.dev[rank]->device,
+                                                          ec.dev[other]->device),
+                                  "cudaDeviceCanAccessPeer");
+                    if (!accessible) { direct_failure = "peer access unavailable"; }
+                }
+            }
         }
-        const bool supported = direct_failure.empty() && forward != 0 && reverse != 0;
+        const bool supported = direct_failure.empty();
         if (supported) {
-            for (int rank = 0; rank < 2; ++rank) {
+            for (int rank = 0; rank < ec.tp; ++rank) {
                 probe.set_device(rank);
-                const cudaError_t status = cudaDeviceEnablePeerAccess(pair[1 - rank], 0);
-                if (status == cudaErrorPeerAccessAlreadyEnabled) {
-                    (void)cudaGetLastError();
-                } else {
-                    startup_check(status, "cudaDeviceEnablePeerAccess");
+                for (int other = 0; other < ec.tp; ++other) {
+                    if (rank == other) { continue; }
+                    const cudaError_t status = cudaDeviceEnablePeerAccess(ec.dev[other]->device, 0);
+                    if (status == cudaErrorPeerAccessAlreadyEnabled) {
+                        (void)cudaGetLastError();
+                    } else {
+                        startup_check(status, "cudaDeviceEnablePeerAccess");
+                    }
                 }
             }
         } else {
@@ -285,6 +366,9 @@ bool enable_peer_access(const ExecutionContext& ec) {
         if (supported) {
             direct_failure = probe.qualify();
             if (direct_failure.empty()) {
+                if (nvlink) {
+                    std::fprintf(stderr, "[ninfer] verified direct NVLink P2P across %d ranks\n", ec.tp);
+                }
                 return true;
             }
             probe.disable_peer_access();
@@ -312,14 +396,15 @@ bool enable_peer_access(const ExecutionContext& ec) {
     }
 }
 
-PeerEvents::PeerEvents(const ExecutionContext& ec) {
-    require_two_devices(ec, "PeerEvents: requires an ExecutionContext with two distinct devices");
+PeerEvents::PeerEvents(const ExecutionContext& ec, bool direct_peer_access)
+    : direct_peer_access_(direct_peer_access), ranks_(ec.tp) {
+    require_collective_devices(ec, "PeerEvents: requires two or four distinct devices");
     const CurrentDeviceGuard guard;
     // Create through a local table so a mid-way failure destroys what was already created instead
     // of leaking it; only a fully constructed set is published into the members.
-    cudaEvent_t created[4] = {nullptr, nullptr, nullptr, nullptr};
-    for (int slot = 0; slot < 4; ++slot) {
-        const int rank             = slot % 2;
+    std::array<cudaEvent_t, 2 * kMaximumExecutionDevices> created{};
+    for (int slot = 0; slot < 2 * ec.tp; ++slot) {
+        const int rank             = slot % ec.tp;
         const cudaError_t creation = cudaSetDevice(ec.dev[rank]->device);
         cudaError_t status         = creation;
         if (status == cudaSuccess) {
@@ -331,23 +416,25 @@ PeerEvents::PeerEvents(const ExecutionContext& ec) {
                                      cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
         }
     }
-    inputs_ready_ = {created[0], created[1]};
-    pull_done_    = {created[2], created[3]};
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        inputs_ready_[rank] = created[rank];
+        pull_done_[rank] = created[ec.tp + rank];
+    }
     // Seed pull_done with completed events so the first collective may use the same inter-call
     // lifetime edge as every later one.
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CurrentDeviceGuard::set(ec.dev[rank]->device);
         CUDA_CHECK(cudaEventRecord(pull_done_[static_cast<std::size_t>(rank)],
                                    ec.dev[rank]->stream));
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CurrentDeviceGuard::set(ec.dev[rank]->device);
         CUDA_CHECK(cudaStreamSynchronize(ec.dev[rank]->stream));
     }
 }
 
 PeerEvents::~PeerEvents() {
-    for (std::array<cudaEvent_t, 2>* group : {&inputs_ready_, &pull_done_}) {
+    for (auto* group : {&inputs_ready_, &pull_done_}) {
         for (cudaEvent_t& event : *group) {
             if (event == nullptr) { continue; }
             const cudaError_t status = cudaEventDestroy(event);
@@ -361,9 +448,12 @@ PeerEvents::~PeerEvents() {
 }
 
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
-    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_) {
-    other.inputs_ready_ = {nullptr, nullptr};
-    other.pull_done_    = {nullptr, nullptr};
+    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_),
+      direct_peer_access_(other.direct_peer_access_), ranks_(other.ranks_) {
+    other.inputs_ready_ = {};
+    other.pull_done_    = {};
+    other.direct_peer_access_ = false;
+    other.ranks_ = 0;
 }
 
 PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
@@ -371,14 +461,17 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     // held, in exactly one place.
     inputs_ready_.swap(other.inputs_ready_);
     pull_done_.swap(other.pull_done_);
+    std::swap(direct_peer_access_, other.direct_peer_access_);
+    std::swap(ranks_, other.ranks_);
     return *this;
 }
 
-void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
+void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
                    const ExecutionContext& ec, const PeerEvents& events) {
-    require_two_devices(ec,
-                        "allreduce_sum: requires an ExecutionContext with two distinct devices");
-    for (int rank = 0; rank < 2; ++rank) {
+    require_collective_devices(ec, "allreduce_sum: requires two or four distinct devices");
+    require(buffer.size() == static_cast<std::size_t>(ec.tp) && staging.size() == buffer.size(),
+            "allreduce_sum: tensor spans must have one entry per active rank");
+    for (int rank = 0; rank < ec.tp; ++rank) {
         require(buffer[rank].dtype == DType::BF16 && staging[rank].dtype == DType::BF16,
                 "allreduce_sum: buffer/staging must be BF16");
         require(buffer[rank].data != nullptr && staging[rank].data != nullptr,
@@ -386,30 +479,43 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
         require(buffer[rank].is_contiguous() && staging[rank].is_contiguous(),
                 "allreduce_sum: buffer/staging must be contiguous");
         for (int d = 0; d < 4; ++d) {
-            require(buffer[rank].ne[d] == buffer[0].ne[d] && staging[rank].ne[d] == buffer[0].ne[d],
-                    "allreduce_sum: buffer/staging shapes must match on both devices");
+            require(buffer[rank].ne[d] == buffer[0].ne[d],
+                    "allreduce_sum: buffer shapes must match on all devices");
+            if (ec.tp == 2) {
+                require(staging[rank].ne[d] == buffer[0].ne[d],
+                        "allreduce_sum: TP2 staging shape must match the buffer");
+            }
+        }
+        if (ec.tp == 4) {
+            require(staging[rank].numel() >= 4 * buffer[0].numel(),
+                    "allreduce_sum: TP4 staging must hold four full contributions");
         }
     }
-    require(events.live(), "allreduce_sum: events must be live");
+    require(events.live() && events.ranks() == ec.tp, "allreduce_sum: events must match active ranks");
 
     const std::size_t bytes = buffer[0].bytes();
     if (bytes == 0) { return; }
 
 #ifndef NDEBUG
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         require_resident_on(buffer[rank].data, ec.dev[rank]->device,
                             "allreduce_sum: buffer[r] must be resident on ec.dev[r]");
         require_resident_on(staging[rank].data, ec.dev[rank]->device,
                             "allreduce_sum: staging[r] must be resident on ec.dev[r]");
-        require_disjoint(buffer[rank].data, bytes, staging[rank].data, bytes,
+        require_disjoint(buffer[rank].data, bytes, staging[rank].data, staging[rank].bytes(),
                          "allreduce_sum: staging[r] must not overlap buffer[r]");
     }
 #endif
 
     const CurrentDeviceGuard guard;
 
+    // Direct reads are legal only after startup qualification. Long payloads keep DMA: the
+    // measured small-message launch-latency benefit reverses for wide prefill transfers.
+    bool direct_sum = events.direct_peer_access() && bytes <= 81920;
+    for (int rank = 0; rank < ec.tp; ++rank) { direct_sum &= ec.dev[rank]->sm() == 70; }
+
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
         CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
@@ -419,33 +525,74 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
     // translated IOMMU domains the driver transparently stages this copy through host memory;
     // keeping it as one captured D2D node avoids the extra D2H/H2D event chain and is materially
     // faster on the V100 PCIe bridge.
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
-        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
-        CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
+        for (int other = 0; other < ec.tp; ++other) {
+            if (other != rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(other), 0));
+            }
+        }
+        if (direct_sum) {
+            if (ec.tp == 2) {
+                detail::allreduce_peer_sum_launch(buffer[rank], buffer[1 - rank], staging[rank],
+                                                  local.stream);
+            } else {
+                const std::array<Tensor, 4> inputs{buffer[0], buffer[1], buffer[2], buffer[3]};
+                Tensor sum = buffer[rank];
+                sum.data = staging[rank].data;
+                detail::allreduce_sum4_launch(inputs, sum, local.stream);
+            }
+        } else {
+            if (ec.tp == 2) {
+                CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
+            } else {
+                for (int source = 0; source < ec.tp; ++source) {
+                    CUDA_CHECK(pull_peer(byte_offset(staging[rank].data, source * bytes),
+                                         buffer[source].data, bytes, local.stream));
+                }
+            }
+        }
         CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
     }
 
     // Phase C: the in-place combine may only overwrite buffer[rank] once the peer has finished
     // reading it. That same wait is what makes the next call's phase B safe.
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
-        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
-        Tensor accumulator = buffer[rank];
-        detail::residual_add_launch(staging[rank], accumulator, local.stream);
+        for (int other = 0; other < ec.tp; ++other) {
+            if (other != rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(other), 0));
+            }
+        }
+        if (direct_sum) {
+            CUDA_CHECK(cudaMemcpyAsync(buffer[rank].data, staging[rank].data, bytes,
+                                       cudaMemcpyDeviceToDevice, local.stream));
+        } else if (ec.tp == 2) {
+            Tensor accumulator = buffer[rank];
+            detail::residual_add_launch(staging[rank], accumulator, local.stream);
+        } else {
+            std::array<Tensor, 4> inputs;
+            for (int source = 0; source < ec.tp; ++source) {
+                inputs[source] = buffer[rank];
+                inputs[source].data = byte_offset(staging[rank].data, source * bytes);
+            }
+            detail::allreduce_sum4_launch(inputs, buffer[rank], local.stream);
+        }
     }
 }
 
-void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
+void allgather_rows(std::span<const Tensor> destination, std::span<const Tensor> part,
                     const ExecutionContext& ec, const PeerEvents& events) {
-    require_two_devices(ec,
-                        "allgather_rows: requires an ExecutionContext with two distinct devices");
+    require_collective_devices(ec, "allgather_rows: requires two or four distinct devices");
+    require(destination.size() == static_cast<std::size_t>(ec.tp) && part.size() == destination.size(),
+            "allgather_rows: tensor spans must have one entry per active rank");
     const DType dtype             = destination[0].dtype;
     const std::int32_t row_length = destination[0].ne[0];
     const std::int32_t total_rows = destination[0].ne[1];
-    for (int rank = 0; rank < 2; ++rank) {
+    std::int64_t contributed_rows = 0;
+    for (int rank = 0; rank < ec.tp; ++rank) {
         require(destination[rank].dtype == dtype && part[rank].dtype == dtype,
                 "allgather_rows: destination/part must share one dtype");
         require(destination[rank].data != nullptr && part[rank].data != nullptr,
@@ -459,18 +606,23 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
         require(destination[rank].ne[2] == 1 && destination[rank].ne[3] == 1 &&
                     part[rank].ne[2] == 1 && part[rank].ne[3] == 1,
                 "allgather_rows: destination/part must be two-dimensional [C, R]");
+        contributed_rows += part[rank].ne[1];
     }
-    require(part[0].ne[1] + part[1].ne[1] == total_rows,
+    require(contributed_rows == total_rows,
             "allgather_rows: owned row counts must sum to the destination row count");
-    require(events.live(), "allgather_rows: events must be live");
+    require(events.live() && events.ranks() == ec.tp, "allgather_rows: events must match active ranks");
 
     const std::size_t row_bytes = static_cast<std::size_t>(row_length) * dtype_size(dtype);
-    const std::size_t block[2]  = {row_bytes * static_cast<std::size_t>(part[0].ne[1]),
-                                   row_bytes * static_cast<std::size_t>(part[1].ne[1])};
-    const std::size_t offset[2] = {0, block[0]};
+    std::array<std::size_t, kMaximumExecutionDevices> block{}, offset{};
+    std::size_t cursor = 0;
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        offset[rank] = cursor;
+        block[rank] = row_bytes * static_cast<std::size_t>(part[rank].ne[1]);
+        cursor += block[rank];
+    }
 
 #ifndef NDEBUG
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         require_resident_on(destination[rank].data, ec.dev[rank]->device,
                             "allgather_rows: destination[r] must be resident on ec.dev[r]");
         require_resident_on(part[rank].data, ec.dev[rank]->device,
@@ -483,39 +635,51 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     const CurrentDeviceGuard guard;
 
     // Phase A: publish "my block is complete".
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
         CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
     }
 
     // Phase B: rank r writes its own block locally and pulls the peer block, both on its stream.
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
-        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
+        for (int other = 0; other < ec.tp; ++other) {
+            if (other != rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(other), 0));
+            }
+        }
         CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination[rank].data, offset[rank]),
                                    part[rank].data, block[rank], cudaMemcpyDeviceToDevice,
                                    local.stream));
-        CUDA_CHECK(pull_peer(byte_offset(destination[rank].data, offset[1 - rank]),
-                             part[1 - rank].data, block[1 - rank], local.stream));
+        for (int source = 0; source < ec.tp; ++source) {
+            if (source == rank) { continue; }
+            CUDA_CHECK(pull_peer(byte_offset(destination[rank].data, offset[source]),
+                                 part[source].data, block[source], local.stream));
+        }
         CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
     }
 
     // Phase C: the Op writes nothing else, but the caller (or the next call) will overwrite
     // part[rank]. Ordering each stream after the peer's read is what makes that safe without a
     // host synchronization.
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
-        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
+        for (int other = 0; other < ec.tp; ++other) {
+            if (other != rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(other), 0));
+            }
+        }
     }
 }
 
-void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>& part,
+void gather_columns_rank0(const Tensor& destination, std::span<const Tensor> part,
                           const ExecutionContext& ec, const PeerEvents& events) {
-    require_two_devices(
-        ec, "gather_columns_rank0: requires an ExecutionContext with two distinct devices");
+    require_collective_devices(ec, "gather_columns_rank0: requires two or four distinct devices");
+    require(part.size() == static_cast<std::size_t>(ec.tp),
+            "gather_columns_rank0: tensor span must have one entry per active rank");
     const DType dtype             = destination.dtype;
     const std::int32_t full_width = destination.ne[0];
     const std::int32_t columns    = destination.ne[1];
@@ -525,30 +689,36 @@ void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>
             "gather_columns_rank0: destination must be contiguous and non-null");
     require(destination.ne[2] == 1 && destination.ne[3] == 1,
             "gather_columns_rank0: destination must be two-dimensional [C,T]");
-    for (int rank = 0; rank < 2; ++rank) {
+    std::int64_t contributed_width = 0;
+    for (int rank = 0; rank < ec.tp; ++rank) {
         require(part[rank].dtype == dtype && part[rank].data != nullptr &&
                     part[rank].is_contiguous(),
                 "gather_columns_rank0: parts must share dtype and be contiguous/non-null");
         require(part[rank].ne[1] == columns && part[rank].ne[0] > 0 &&
                     part[rank].ne[2] == 1 && part[rank].ne[3] == 1,
                 "gather_columns_rank0: parts must be two-dimensional [C_r,T]");
+        contributed_width += part[rank].ne[0];
     }
-    require(part[0].ne[0] + part[1].ne[0] == full_width,
+    require(contributed_width == full_width,
             "gather_columns_rank0: owned widths must sum to destination width");
-    require(events.live(), "gather_columns_rank0: events must be live");
+    require(events.live() && events.ranks() == ec.tp,
+            "gather_columns_rank0: events must match active ranks");
 
     const std::size_t element_bytes = dtype_size(dtype);
     const std::size_t destination_pitch =
         static_cast<std::size_t>(full_width) * element_bytes;
-    const std::size_t block[2] = {
-        static_cast<std::size_t>(part[0].ne[0]) * element_bytes,
-        static_cast<std::size_t>(part[1].ne[0]) * element_bytes};
-    const std::size_t offset[2] = {0, block[0]};
+    std::array<std::size_t, kMaximumExecutionDevices> block{}, offset{};
+    std::size_t cursor = 0;
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        offset[rank] = cursor;
+        block[rank] = static_cast<std::size_t>(part[rank].ne[0]) * element_bytes;
+        cursor += block[rank];
+    }
 
 #ifndef NDEBUG
     require_resident_on(destination.data, ec.dev[0]->device,
                         "gather_columns_rank0: destination must be resident on rank 0");
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         require_resident_on(part[rank].data, ec.dev[rank]->device,
                             "gather_columns_rank0: part must be resident on its rank");
         require_disjoint(destination.data, destination.bytes(), part[rank].data, part[rank].bytes(),
@@ -558,59 +728,69 @@ void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>
 
     const CurrentDeviceGuard guard;
     const DeviceContext& rank0 = *ec.dev[0];
-    const DeviceContext& rank1 = *ec.dev[1];
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), ec.dev[rank]->stream));
+    }
     CurrentDeviceGuard::set(rank0.device);
-    CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), rank0.stream));
-    CurrentDeviceGuard::set(rank1.device);
-    CUDA_CHECK(cudaEventRecord(events.inputs_ready(1), rank1.stream));
-
-    CurrentDeviceGuard::set(rank0.device);
-    CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(0), 0));
-    CUDA_CHECK(cudaMemcpy2DAsync(destination.data, destination_pitch, part[0].data, block[0],
-                                 block[0], static_cast<std::size_t>(columns),
-                                 cudaMemcpyDeviceToDevice, rank0.stream));
-    CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(1), 0));
-    CUDA_CHECK(cudaMemcpy2DAsync(byte_offset(destination.data, offset[1]), destination_pitch,
-                                 part[1].data, block[1], block[1],
-                                 static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
-                                 rank0.stream));
+    for (int source = 0; source < ec.tp; ++source) {
+        if (source != 0) {
+            CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(source), 0));
+        }
+        CUDA_CHECK(cudaMemcpy2DAsync(byte_offset(destination.data, offset[source]), destination_pitch,
+                                     part[source].data, block[source], block[source],
+                                     static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
+                                     rank0.stream));
+    }
     CUDA_CHECK(cudaEventRecord(events.pull_done(0), rank0.stream));
 
     // Rank 1 may overwrite its proposal shard only after rank 0 has consumed it.  No reciprocal
     // destination write is needed because the selector and all subsequent DFlash logic run on
     // rank 0.
-    CurrentDeviceGuard::set(rank1.device);
-    CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, events.pull_done(0), 0));
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[rank]->stream, events.pull_done(0), 0));
+    }
 }
 
-void broadcast_rank0(const Tensor& source, const Tensor& destination,
+void broadcast_rank0(const Tensor& source, std::span<const Tensor> destinations,
                      const ExecutionContext& ec, const PeerEvents& events) {
-    require_two_devices(ec, "broadcast_rank0: requires two devices");
-    require(events.live(), "broadcast_rank0: events must be live");
-    require(source.data != nullptr && destination.data != nullptr &&
-                source.dtype == destination.dtype && source.is_contiguous() &&
-                destination.is_contiguous(), "broadcast_rank0: invalid tensors");
-    for (int d = 0; d < 4; ++d) {
-        require(source.ne[d] == destination.ne[d], "broadcast_rank0: shapes must match");
+    require_collective_devices(ec, "broadcast_rank0: requires two or four devices");
+    require(events.live() && events.ranks() == ec.tp, "broadcast_rank0: events must match ranks");
+    require(destinations.size() == static_cast<std::size_t>(ec.tp - 1),
+            "broadcast_rank0: destinations must name every non-origin rank");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        const auto& destination = destinations[static_cast<std::size_t>(rank - 1)];
+        require(source.data != nullptr && destination.data != nullptr &&
+                    source.dtype == destination.dtype && source.is_contiguous() &&
+                    destination.is_contiguous(), "broadcast_rank0: invalid tensors");
+        for (int d = 0; d < 4; ++d) {
+            require(source.ne[d] == destination.ne[d], "broadcast_rank0: shapes must match");
+        }
+#ifndef NDEBUG
+        require_resident_on(source.data, ec.dev[0]->device, "broadcast_rank0: source is not on rank 0");
+        require_resident_on(destination.data, ec.dev[rank]->device,
+                            "broadcast_rank0: destination is not on its owning rank");
+#endif
     }
     const std::size_t bytes = source.bytes();
     if (bytes == 0) { return; }
-#ifndef NDEBUG
-    require_resident_on(source.data, ec.dev[0]->device, "broadcast_rank0: source is not on rank 0");
-    require_resident_on(destination.data, ec.dev[1]->device,
-                        "broadcast_rank0: destination is not on rank 1");
-#endif
     const CurrentDeviceGuard guard;
     const DeviceContext& origin = *ec.dev[0];
-    const DeviceContext& peer = *ec.dev[1];
     CurrentDeviceGuard::set(origin.device);
     CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), origin.stream));
-    CurrentDeviceGuard::set(peer.device);
-    CUDA_CHECK(cudaStreamWaitEvent(peer.stream, events.inputs_ready(0), 0));
-    CUDA_CHECK(pull_peer(destination.data, source.data, bytes, peer.stream));
-    CUDA_CHECK(cudaEventRecord(events.pull_done(1), peer.stream));
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        const auto& peer = *ec.dev[rank];
+        CurrentDeviceGuard::set(peer.device);
+        CUDA_CHECK(cudaStreamWaitEvent(peer.stream, events.inputs_ready(0), 0));
+        CUDA_CHECK(pull_peer(destinations[static_cast<std::size_t>(rank - 1)].data,
+                             source.data, bytes, peer.stream));
+        CUDA_CHECK(cudaEventRecord(events.pull_done(rank), peer.stream));
+    }
     CurrentDeviceGuard::set(origin.device);
-    CUDA_CHECK(cudaStreamWaitEvent(origin.stream, events.pull_done(1), 0));
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        CUDA_CHECK(cudaStreamWaitEvent(origin.stream, events.pull_done(rank), 0));
+    }
 }
 
 } // namespace ninfer::ops

@@ -24,6 +24,7 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    bool ram_kv = false;
     LinearAttentionStatePoolSpec linear_attention;
 };
 

@@ -146,6 +146,17 @@ using Nvfp4MlpGateUpTp2ColumnGeometry     = Nvfp4GemvGeometry<17408, 5120>;
 using Nvfp4Residual6144Tp2RowGeometry     = Nvfp4GemvGeometry<5120, 3072>;
 using Nvfp4Residual17408Tp2RowGeometry    = Nvfp4GemvGeometry<5120, 8704>;
 
+#ifdef NINFER_VOLTA_BUILD
+using Nvfp4MlpGateUpTp4ColumnGeometry = Nvfp4GemvGeometry<8704, 5120>;
+// The registered four-way 27B shapes use the runtime-dimensioned SM70 QPN/CUTLASS leaf,
+// not an unqualified A4 or portable SIMT instantiation. This is a finite shape profile;
+// no arbitrary checkpoint geometry is admitted by the TP4 path.
+inline constexpr bool is_nvfp4_volta_tp4_problem(std::int32_t n, std::int32_t k) {
+    return (k == 5120 && (n == 3584 || n == 4096 || n == 8704)) ||
+           (n == 5120 && (k == 1536 || k == 4352));
+}
+#endif
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
@@ -243,6 +254,9 @@ using Nvfp4ParentGeometryType = typename Nvfp4ParentGeometry<Geometry>::Type;
     X(Residual17408Tp2Row, Nvfp4Residual17408Tp2RowGeometry)
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
+#ifdef NINFER_VOLTA_BUILD
+    if (is_nvfp4_volta_tp4_problem(output_rows, input_rows)) { return true; }
+#endif
 #define NINFER_NVFP4_MATCH(name, geometry)                                                         \
     if (output_rows == geometry::kOutputRows && input_rows == geometry::kInputRows) {              \
         return true;                                                                               \

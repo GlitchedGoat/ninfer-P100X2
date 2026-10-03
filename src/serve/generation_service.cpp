@@ -230,6 +230,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.device                   = options_.device;
     engine_options.tp                       = options_.tp;
     engine_options.devices                  = options_.devices;
+    engine_options.storage_device           = options_.storage_device;
     engine_options.max_context              = options_.max_context;
     engine_options.rope_mode                = options_.rope_mode;
     engine_options.yarn_factor              = options_.yarn_factor;
@@ -240,6 +241,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.ram_kv                   = options_.ram_kv;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;

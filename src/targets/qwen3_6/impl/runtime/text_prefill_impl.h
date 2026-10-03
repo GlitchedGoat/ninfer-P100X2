@@ -56,13 +56,10 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
-    std::optional<TpExecution> tp = tp_execution(state.execution);
-    if (tp) {
-        // The per-sequence MTP KV window is request state, so it comes from the PrefillContext
-        // rather than from the process-lifetime peer core: the MTP prefill appends and reads
-        // through the execution view, unlike the text prefill, which drives the batch cache.
-        tp->mtp_kv = state.mtp_kv_peer;
-        if (tp->mtp_kv.valid() != state.mtp_kv.valid()) {
+    auto tp = tp_execution(state.execution);
+    for (std::size_t index = 0; index < state.execution.peers.size(); ++index) {
+        tp[index].mtp_kv = state.mtp_kv_peers[index];
+        if (tp[index].mtp_kv.valid() != state.mtp_kv.valid()) {
             throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
         }
     }
@@ -71,7 +68,7 @@ PrefillChunkResult prefill_text_chunk(
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     tp ? &*tp : nullptr);
+                     std::span(tp).first(state.execution.peers.size()));
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -148,25 +145,20 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
-std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
+std::array<Tensor, kMaximumExecutionDevices>
+resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
     if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
         throw std::invalid_argument("prefix resume requires BF16 [hidden,1]");
     }
-    std::array<Tensor, 2> result{hidden, {}};
-    if (execution.peer == nullptr) { return result; }
-    const auto& peer = *execution.peer;
-    result[1] = peer.prefill_hidden->slice(1, 0, 1);
-    const CurrentDevice restore;
-    CUDA_CHECK(cudaSetDevice(execution.device.device));
-    CUDA_CHECK(cudaEventRecord(peer.events->inputs_ready(0), execution.device.stream));
-    CUDA_CHECK(cudaSetDevice(peer.device->device));
-    CUDA_CHECK(cudaStreamWaitEvent(peer.device->stream, peer.events->inputs_ready(0), 0));
-    CUDA_CHECK(cudaMemcpyAsync(result[1].data, hidden.data, hidden.bytes(),
-                               cudaMemcpyDeviceToDevice, peer.device->stream));
-    CUDA_CHECK(cudaEventRecord(peer.events->pull_done(1), peer.device->stream));
-    CUDA_CHECK(cudaSetDevice(execution.device.device));
-    CUDA_CHECK(cudaStreamWaitEvent(execution.device.stream, peer.events->pull_done(1), 0));
+    auto result = rank_views(execution, [&](int rank) {
+        return rank == 0 ? hidden : execution.peers[rank - 1].prefill_hidden->slice(1, 0, 1);
+    });
+    if (!execution.peers.empty()) {
+        const auto& peer = execution.peers[0];
+        ops::broadcast_rank0(hidden, std::span(result).subspan(1, execution.peers.size()),
+                             *peer.execution, *peer.events);
+    }
     return result;
 }
 
@@ -175,15 +167,19 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     const auto restored = resume_hidden(state.execution, hidden);
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    std::optional<TpExecution> tp = tp_execution(state.execution);
-    if (tp) {
-        tp->work->reset();
+    auto tp = tp_execution(state.execution);
+    if (!state.execution.peers.empty()) {
+        for (const auto& peer : state.execution.peers) { peer.work->reset(); }
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, state.text_kv,
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk,
-                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &*tp);
-        card.target_logits(restored, {logits, tp->io->logits.slice(1, 0, 1)});
+                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                         std::span(tp).first(state.execution.peers.size()));
+        const auto rank_logits = rank_views(state.execution, [&](int rank) {
+            return rank == 0 ? logits : state.execution.peers[rank - 1].io->logits.slice(1, 0, 1);
+        });
+        card.target_logits(restored, rank_logits);
     } else {
         ops::linear(hidden, state.execution.model.output_head, logits,
                      state.execution.device.stream);
@@ -195,7 +191,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
     state.execution.work.reset();
-    if (tp) { tp->work->reset(); }
+    for (const auto& peer : state.execution.peers) { peer.work->reset(); }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

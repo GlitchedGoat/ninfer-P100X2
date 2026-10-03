@@ -15,6 +15,7 @@ The storage registry contains exactly these identities:
 | `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | rank 2 `[N,K]` | 256 bytes |
+| `blockscale-m128-k128-v1` | tensor layout | `FP8_E4M3FN_BLOCK128_BF16S` | rank 2 `[N,K]`, both divisible by 128 | 256 bytes |
 | `ggml-k256-v1` | tensor layout | `GGML_K` | rank 2 `[N,K]`, `K % 256 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
@@ -378,3 +379,16 @@ GGUF GDN output columns when TP2 selects key-head groups from three tiled repeat
 requantizing any block. The materialization plan owns the generated descriptor
 prefix until its host-to-device transfer completes. `Weight.qhigh` points to the descriptor table
 and `Weight.qdata` to the code plane; scales remain inside the raw blocks.
+
+## 9. `blockscale-m128-k128-v1`
+
+Native FP8 codes are row-major bytes `[N,K]`; the BF16 scale plane is row-major
+`[N/128,K/128]`. Its offset is `align_up(N*K,256)` and its length is
+`2*(N/128)*(K/128)`. Internal padding is zero. There is no divisor or zero point.
+The exact represented value is `decode_e4m3fn(code[n,k])*scale[n/128,k/128]`.
+
+Row slicing, including fused disjoint row ranges, preserves complete 128-row blocks and
+copies the corresponding scale rows. Column slicing accepts one contiguous range with
+128-column-aligned boundaries, slicing each code row and each scale row together.
+Neither operation changes codes or scale words. The execution view uses
+`QuantLayout::BlockScale128`, `group=128`, BF16 scales and `scale_ne={K/128,N/128}`.

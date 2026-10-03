@@ -1,4 +1,5 @@
 #include "ninfer/ops/linear_add.h"
+#include "ops/linear/fp8/fp8_block.h"
 
 #include "ninfer/ops/residual_add.h"
 #include "ops/common/split_launch.h"
@@ -74,6 +75,14 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("linear_add: invalid compute policy");
 }
 
+bool is_volta_quarter_residual(std::int32_t rows, std::int32_t columns) {
+#ifdef NINFER_VOLTA_BUILD
+    return rows == 5120 && (columns == 1536 || columns == 4352);
+#else
+    return false;
+#endif
+}
+
 // The per-format validate+dispatch body linear_add() uses, factored out so
 // ops::linear_add_row_parallel's fused rank (NVFP4, Q5G64_F16S) can reach it directly with a
 // nullable `WorkspaceArena*` -- exactly the reason src/ops/linear/linear_dispatch.h exposes
@@ -88,6 +97,13 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
     require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
+    }
+    if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only || !ws) {
+            throw std::invalid_argument("FP8 block128 residual requires A16 workspace");
+        }
+        detail::fp8_block_add_launch(x, w, residual_out, *ws, stream);
+        return;
     }
 
     if (w.qtype == QType::GGML_K) {
@@ -166,7 +182,8 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      (w.n == detail::Nvfp4Residual6144Tp2RowGeometry::kOutputRows &&
                                       w.k == detail::Nvfp4Residual6144Tp2RowGeometry::kInputRows) ||
                                      (w.n == detail::Nvfp4Residual17408Tp2RowGeometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual17408Tp2RowGeometry::kInputRows);
+                                      w.k == detail::Nvfp4Residual17408Tp2RowGeometry::kInputRows) ||
+                                     is_volta_quarter_residual(w.n, w.k);
         if (!supported_shape) {
             throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
         }
@@ -191,7 +208,8 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      (w.n == detail::Fp8Residual6144Tp2RowGeometry::kOutputRows &&
                                       w.k == detail::Fp8Residual6144Tp2RowGeometry::kInputRows) ||
                                      (w.n == detail::Fp8Residual17408Tp2RowGeometry::kOutputRows &&
-                                      w.k == detail::Fp8Residual17408Tp2RowGeometry::kInputRows);
+                                      w.k == detail::Fp8Residual17408Tp2RowGeometry::kInputRows) ||
+                                     is_volta_quarter_residual(w.n, w.k);
         if (!supported_shape) {
             throw std::invalid_argument("fp8 linear_add: unsupported weight shape");
         }
@@ -223,6 +241,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
+    }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 residual requires A16");
+        }
+        return detail::fp8_block_add_workspace_bytes(output_rows, input_rows, min_tokens, max_tokens);
     }
     if (qtype == QType::GGML_K) {
         return linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy,
@@ -265,7 +289,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
             (output_rows == detail::Nvfp4Residual6144Tp2RowGeometry::kOutputRows &&
              input_rows == detail::Nvfp4Residual6144Tp2RowGeometry::kInputRows) ||
             (output_rows == detail::Nvfp4Residual17408Tp2RowGeometry::kOutputRows &&
-             input_rows == detail::Nvfp4Residual17408Tp2RowGeometry::kInputRows);
+             input_rows == detail::Nvfp4Residual17408Tp2RowGeometry::kInputRows) ||
+            is_volta_quarter_residual(output_rows, input_rows);
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
@@ -284,7 +309,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
             (output_rows == detail::Fp8Residual6144Tp2RowGeometry::kOutputRows &&
              input_rows == detail::Fp8Residual6144Tp2RowGeometry::kInputRows) ||
             (output_rows == detail::Fp8Residual17408Tp2RowGeometry::kOutputRows &&
-             input_rows == detail::Fp8Residual17408Tp2RowGeometry::kInputRows);
+             input_rows == detail::Fp8Residual17408Tp2RowGeometry::kInputRows) ||
+            is_volta_quarter_residual(output_rows, input_rows);
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear_add workspace: unsupported FP8 profile");
         }
@@ -305,40 +331,55 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     dispatch_linear_add(x, w, residual_out, policy, &ws, stream);
 }
 
-// --- Tensor-parallel split form (tp == 2) -------------------------------------------------------
+// --- Tensor-parallel split form (tp == 2 or 4) --------------------------------------------------
 //
 // See include/ninfer/ops/linear_add.h for the full design note. In one line: rank 0 evaluates
-// `residual = residual + partial_0` with a fused kernel, rank 1 evaluates the pure GEMM partial
-// `residual = partial_1`, and the one allreduce_sum that follows adds the residual exactly once.
+// `residual = residual + partial_0`, every other rank evaluates its pure GEMM partial, and the
+// one allreduce_sum that follows adds the residual exactly once.
 namespace {
 
-// Cross-rank agreement only a two-rank call can check; everything a single device can check is
+// Cross-rank agreement; everything a single device can check is
 // already checked by dispatch_linear_add / validate_linear_semantics per rank. The split axis's
 // own per-rank K extents are deliberately NOT required to match, matching linear_row_parallel.
-void validate_add_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_add_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                              const ExecutionContext& ec) {
     detail::require_split_context(
-        ec, "linear_add split: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
-        throw std::invalid_argument("linear_add split: both ranks must carry the same token count");
+        ec, "linear_add split: requires two or four distinct devices", ec.tp);
+    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        throw std::invalid_argument("linear_add split: argument width must equal TP width");
     }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
-        throw std::invalid_argument("linear_add split: both ranks must carry the same weight format");
-    }
-    if (w[0].n != w[1].n) {
-        throw std::invalid_argument(
-            "linear_add split: both ranks must produce the same output extent N");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (x[0].ne[1] != x[rank].ne[1]) {
+            throw std::invalid_argument("linear_add split: ranks must carry the same token count");
+        }
+        if (w[0].qtype != w[rank].qtype || w[0].layout != w[rank].layout) {
+            throw std::invalid_argument("linear_add split: ranks must carry the same weight format");
+        }
+        if (w[0].n != w[rank].n) {
+            throw std::invalid_argument("linear_add split: ranks must produce the same output extent N");
+        }
     }
 }
 
-void validate_add_split_residency(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                  const std::array<Tensor, 2>& residual,
+void validate_add_split_residency(std::span<const Tensor> x, std::span<const Weight> w,
+                                  std::span<const Tensor> residual,
                                   const ExecutionContext& ec) {
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, residual[slot].data,
             "linear_add split: every per-rank argument must be resident on ec.dev[rank]");
+    }
+}
+
+void validate_add_split_widths(std::span<const Tensor> residual,
+                               std::span<const Tensor> staging,
+                               std::span<WorkspaceArena* const> workspace,
+                               const ExecutionContext& ec, const PeerEvents& events) {
+    const auto width = static_cast<std::size_t>(ec.tp);
+    if (residual.size() != width || staging.size() != width || workspace.size() != width ||
+        !events.live() || events.ranks() != ec.tp) {
+        throw std::invalid_argument("linear_add split: output/staging/workspace/events must match TP width");
     }
 }
 
@@ -361,7 +402,7 @@ void issue_fused_rank(const Tensor& x, const Weight& w, Tensor& residual, Tensor
         return;
     }
     if (w.qtype == QType::GGML_K || w.qtype == QType::NVFP4 || w.qtype == QType::Q5G64_F16S ||
-        w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        w.qtype == QType::FP8_E4M3FN_ROW_BF16S || w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
         // FP8 reaches here through the same "shape alone selects the route" widening as NVFP4/Q5:
         // dispatch_linear_add's FP8 branch (above) already admits the tp2 row-shard extents, and
         // its own fp8_linear_add_dispatch resolves the halved-K geometry via resolve_fp8_problem.
@@ -372,7 +413,7 @@ void issue_fused_rank(const Tensor& x, const Weight& w, Tensor& residual, Tensor
                                 "FP8_E4M3FN_ROW_BF16S, or BF16_CTRL only)");
 }
 
-// Rank 1: residual = partial, the pure residual-free GEMM half, overwriting this rank's own copy
+// Non-primary rank: residual = partial, overwriting this rank's own copy
 // of the (replicated) residual -- its pre-call bytes are not needed again, since rank 0 already
 // carries the one copy that enters the sum. Every format issue_fused_rank above accepts is already
 // registered in ops::linear's own tp2 registry at this shard shape, so this is the same public
@@ -385,39 +426,43 @@ void issue_plain_rank(const Tensor& x, const Weight& w, Tensor& residual, Linear
 
 } // namespace
 
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, LinearPolicy policy,
-                             const std::array<WorkspaceArena*, 2>& workspace,
+void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                             std::span<const Tensor> residual,
+                             std::span<const Tensor> staging, LinearPolicy policy,
+                             std::span<WorkspaceArena* const> workspace,
                              const ExecutionContext& ec, const PeerEvents& events) {
     validate_policy(policy);
     validate_add_split_pair(x, w, ec);
+    validate_add_split_widths(residual, staging, workspace, ec, events);
     validate_add_split_residency(x, w, residual, ec);
 
-    std::array<Tensor, 2> target{residual[0], residual[1]};
-    std::array<Tensor, 2> scratch{staging[0], staging[1]};
+    std::array<Tensor, kMaximumExecutionDevices> target{};
+    for (int rank = 0; rank < ec.tp; ++rank) { target[rank] = residual[rank]; }
+    // TP4 staging contains four output contributions. Rank 0's BF16 decomposition needs only
+    // the first plane, before the collective has populated any staging data.
+    Tensor scratch(staging[0].data, staging[0].dtype, {w[0].n, x[0].ne[1]});
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot        = static_cast<std::size_t>(rank);
         const cudaStream_t s   = ec.dev[slot]->stream;
         if (rank == 0) {
-            issue_fused_rank(x[slot], w[slot], target[slot], scratch[slot], policy,
+            issue_fused_rank(x[slot], w[slot], target[slot], scratch, policy,
                              workspace[slot], s);
         } else {
             issue_plain_rank(x[slot], w[slot], target[slot], policy, workspace[slot], s);
         }
     });
-    // allreduce_sum checks staging's residency, shape and non-overlap against `residual` itself; not
-    // restated here. Its local combine is the same `x += y` computation issue_fused_rank's BF16
-    // branch already used, so the two extra roundings a split evaluation always carries (linear.h's
-    // row-parallel numerical note) are the only source of divergence from the tp1 fused kernel.
-    allreduce_sum(target, staging, ec, events);
+    // allreduce_sum owns staging residency, shape and non-overlap checks, and the selected
+    // reduction profile. Public numerical evidence compares directly with the complete formula.
+    allreduce_sum(std::span(target).first(ec.tp), staging, ec, events);
 }
 
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, const ExecutionContext& ec,
+void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                             std::span<const Tensor> residual,
+                             std::span<const Tensor> staging, const ExecutionContext& ec,
                              const PeerEvents& events) {
-    linear_add_row_parallel(x, w, residual, staging, LinearPolicy::A16Only, {nullptr, nullptr}, ec,
+    const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
+    linear_add_row_parallel(x, w, residual, staging, LinearPolicy::A16Only,
+                            std::span(workspace).first(ec.tp), ec,
                             events);
 }
 
@@ -426,13 +471,14 @@ void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
     detail::ggml_k_project_split(x, w, &residual, 1, true, stream, true, &workspace);
 }
 
-void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                       const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging,
-                       const std::array<WorkspaceArena*, 2>& workspace,
+void ggml_k_gdn_output(std::span<const Tensor> x, std::span<const Weight> w,
+                       std::span<const Tensor> residual,
+                       std::span<const Tensor> staging,
+                       std::span<WorkspaceArena* const> workspace,
                        const ExecutionContext& ec,
                        const PeerEvents& events) {
     validate_add_split_pair(x, w, ec);
+    validate_add_split_widths(residual, staging, workspace, ec, events);
     validate_add_split_residency(x, w, residual, ec);
     detail::for_each_rank(ec, [&](int rank) {
         detail::ggml_k_project_split(x[rank], w[rank], &residual[rank], 1, rank == 0,

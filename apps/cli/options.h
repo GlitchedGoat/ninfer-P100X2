@@ -29,12 +29,14 @@ struct Options {
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
     int tp                       = 1;
+    int storage_device           = -1;
     // Resolved device ids, one per tp rank. Always populated by parse_options() (from --devices,
     // or synthesized as {device} when --devices is omitted) so it is safe to forward directly to
     // EngineOptions::devices.
     std::vector<int> devices;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;

@@ -10,6 +10,9 @@ namespace ninfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 #ifdef NINFER_VOLTA_BUILD
+    if (k == 5120 && (n == 62080 || n == 32768) && t >= 1 && t <= 8) {
+        return launch_bf16_volta_qpn;
+    }
     // Narrow BF16 contractions use direct BF16 operands and FP32 accumulation.
     if (k == 5120 && (n == 1280 || n == 256) && t >= 1 && t <= 16) {
         return t == 1 ? launch_bf16_decode : launch_bf16_small_t;

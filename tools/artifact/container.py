@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence, TypeAlias
 
-from .layouts import align_up, encoded_size, get_layout, validate_ggml_k_payload
+from .layout_metadata import align_up, encoded_size, get_layout, validate_ggml_k_payload
 
 
 MAGIC = b"NINFER\x00\x02"

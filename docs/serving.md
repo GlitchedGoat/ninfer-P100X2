@@ -1,5 +1,15 @@
 # HTTP serving
 
+Optional native RAM-KV uses the same public Engine and HTTP protocols, not a llama.cpp backend.
+Add `--ram-kv-window 98304 --ram-kv-budget-bytes 32000000000` to a 27B SM70 TP2 Text/MTP
+launch with `--max-context 180000` or `262144`. It supports one active request and CUDA Graphs.
+Omit `--kv-capacity`, or set it equal to the resident window. This is **approximate lexical
+retrieval**, including long prefill, and can miss history. RAM archive bytes are lossless, but that
+does not establish quality equivalence. No Vision/DFlash/TP4 in this mode. The archive budget is
+not an entire-server RAM cap; apply cgroup MemoryMax and disable swap separately when required.
+Server-start JSON records identify the resident window and maximum archive bytes. Default full
+history behavior and the advertised OpenAI/Anthropic request schemas are unchanged.
+
 `build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
@@ -45,9 +55,16 @@ distinct device per rank. The 27B package supports `--spec mtp` and optional Qwe
 TP2, but rejects `--vision`. On the two 16 GB V100s, the qualified NVFP4 v3 DFlash2 profile uses
 `--max-context 98304 --prefill-chunk 1024 --kv-dtype int8 --spec dflash --draft-tokens 7`, without
 `--lm-head-draft`: its selector uses the full vocabulary. It does not fit the 180000-capacity MTP
-profile. The 35B-A3B package has no TP2 path.
+profile. The 35B-A3B package has no TP2 path, but it can use two GPUs as a single-device compute
+path plus an expert-only storage device. Keep `--tp 1`, select the compute GPU with `--device`,
+and pass the other GPU with `--storage-device`; this requires peer access and leaves attention,
+KV, GDN, and scheduling on the primary GPU.
 
 Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
+The new SM70 `--tp 4 --devices 0,1,2,3` route is limited to Qwen3.8-27B NVFP4/native FP8
+Text/MTP and has completed its four-card state, prefix and performance qualification. It uses
+the same Engine and HTTP protocols; it is not a separate serving backend. Native FP8 requires
+TP4, and Vision and DFlash are unavailable at that width.
 It applies transparently to the HTTP APIs: submit the normal conversation history. A matching
 resident frontier or saved turn/response checkpoint reuses its complete model state, prefilling only
 the suffix; an exact hit requires no prompt-token prefill. See the cache behavior below for matching
@@ -525,6 +542,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
 | `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
+| `--storage-device N` | 35B-A3B expert-only VMM backing GPU; keeps `--tp 1` | unset |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |

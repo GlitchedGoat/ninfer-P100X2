@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -51,7 +52,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * Single-parent GDN projection. Registered parent forms are:
  *
  * - W8G32_F16S RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
- * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
+ * - NVFP4 BlockScaleK16M128x4 or SM70 VoltaQpnPrepacked [16384,5120], with stored row counts
+ *   [2048,2048,6144,6144].
  * - FP8_E4M3FN_ROW_BF16S RowScale [16384,5120], with stored row counts
  *   [2048,2048,6144,6144].
  * - GGML_K GgmlK256 [16384,5120], preserving Q4_K/Q6_K rows and embedded scales in the same
@@ -61,15 +63,16 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 permits private activation
  * quantization at every positive T. FP8 admits A16Only and AllowA8 at every positive T; AllowA8
  * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
- * contraction at every T>=8. Every route writes the two independent final allocations directly.
+ * contraction at every T>=8. Narrow routes write the two final allocations directly; wide SM70
+ * routes may distribute rows from a rounded parent in caller-owned transient storage.
  * The complete projection is evaluated against the same exact-decode/naive-FP64 oracle;
  * activation quantization and the production reduction profile are private effects covered by the
  * selected criterion. x, both persistent weight planes, qkv, z, and the live workspace must be
  * mutually non-overlapping.
  *
  * The policy-bearing form uses caller-owned call-scoped transient storage sized by
- * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes. The convenience overload
- * selects A16Only and requires no transient workspace.
+ * gdn_input_proj_workspace_capacity_bytes(). Wide SM70 A16 uses transient projection storage.
+ * The convenience overload selects a scratch-free A16 implementation.
  */
 [[nodiscard]] std::size_t
 gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -102,6 +105,8 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
  * projection mechanism plus any projected BF16 plane selected by the complete-Op plan.
  * GGML_K [16384,5120] admits A16Only and always requires one BF16 [10240,B*W] projected plane.
+ * SM70 NVFP4 A16 likewise materializes that plane at every width, including decode; its
+ * projection consumes QPN-prepacked or checkpoint-native weights and needs extra scratch at B*W>=128.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -151,7 +156,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
 /**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are W8G32_F16S RowSplit
- * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16S RowScale
+ * [12288,2048], NVFP4 BlockScaleK16M128x4/SM70 VoltaQpnPrepacked [16384,5120], and
+ * FP8_E4M3FN_ROW_BF16S RowScale
  * [16384,5120], all in q/k/value/z row order. W8 admits A16Only, NVFP4 admits A16Only/AllowA4,
  * and FP8 admits A16Only/AllowA8. B=1 accepts every positive W for FP8; the batched domain is
  * B=2..8 and W=1..16. For FP8 B=1, A16 is fused at W=1..3 and W=7..10 and materialized
@@ -193,9 +199,9 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8
- * record-producing profile. Fused and materialized A16 routes require no storage. AllowA4/AllowA8
- * returns only the activation-quantization workspace selected by this complete-Op route;
- * conv_record is caller-owned.
+ * record-producing profile. Narrow A16 requires no projection scratch; wide SM70 A16 uses the
+ * complete projection workspace. AllowA4/AllowA8 includes its selected activation-quantization
+ * storage; conv_record is caller-owned.
  * GGML_K [16384,5120] admits A16Only, projects directly into conv_record and requires no scratch.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -284,26 +290,26 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
 // its sibling family.
 
 [[nodiscard]] std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(
-    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens, int tp = 2);
 
-void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                    const std::array<Weight, 2>& query_key_value_z_weight,
-                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+void gdn_input_proj_column_parallel(std::span<const Tensor> x,
+                                    std::span<const Weight> query_key_value_z_weight,
+                                    std::span<const Tensor> qkv, std::span<const Tensor> z,
                                     LinearPolicy policy,
-                                    const std::array<WorkspaceArena*, 2>& workspace,
+                                    std::span<WorkspaceArena* const> workspace,
                                     const ExecutionContext& ec);
 
 /** A16-only convenience overload, no policy/workspace. */
-void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                    const std::array<Weight, 2>& query_key_value_z_weight,
-                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+void gdn_input_proj_column_parallel(std::span<const Tensor> x,
+                                    std::span<const Weight> query_key_value_z_weight,
+                                    std::span<const Tensor> qkv, std::span<const Tensor> z,
                                     const ExecutionContext& ec);
 
 /** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. */
-void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                    const std::array<Weight, 2>& query_key_weight,
-                                    const std::array<Weight, 2>& value_z_weight,
-                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+void gdn_input_proj_column_parallel(std::span<const Tensor> x,
+                                    std::span<const Weight> query_key_weight,
+                                    std::span<const Weight> value_z_weight,
+                                    std::span<const Tensor> qkv, std::span<const Tensor> z,
                                     const ExecutionContext& ec);
 
 // --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair (tp == 2) -------------
@@ -347,49 +353,48 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
 
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
     QType qtype, LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width,
-    std::int32_t max_width);
+    std::int32_t max_width, int tp = 2);
 
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
     QType qtype, LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width,
-    std::int32_t max_width);
+    std::int32_t max_width, int tp = 2);
 
 void gdn_input_proj_conv_snapshot_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
-    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& z, LinearPolicy policy,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+    std::span<const Tensor> x, std::span<const Weight> query_key_value_z_weight,
+    std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,
+    std::span<const Tensor> valid_columns, std::span<const Tensor> initial_state_slots,
+    std::span<const Tensor> snapshot_base_slots, std::span<const Tensor> query,
+    std::span<const Tensor> key, std::span<const Tensor> value, std::span<const Tensor> z,
+    LinearPolicy policy, std::span<WorkspaceArena* const> workspace,
+    const ExecutionContext& ec);
 
 /** Q4G64_F16S/Q5G64_F16S split-storage two-weight snapshot form (A16 only). */
 void gdn_input_proj_conv_snapshot_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
-    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
-    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
-    const std::array<Tensor, 2>& initial_state_slots,
-    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& z, const std::array<WorkspaceArena*, 2>& workspace,
+    std::span<const Tensor> x, std::span<const Weight> query_key_weight,
+    std::span<const Weight> value_z_weight, std::span<const Tensor> conv_weight,
+    std::span<const Tensor> conv_states, std::span<const Tensor> valid_columns,
+    std::span<const Tensor> initial_state_slots, std::span<const Tensor> snapshot_base_slots,
+    std::span<const Tensor> query, std::span<const Tensor> key, std::span<const Tensor> value,
+    std::span<const Tensor> z, std::span<WorkspaceArena* const> workspace,
     const ExecutionContext& ec);
 
 void gdn_input_proj_conv_record_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
-    const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& z, LinearPolicy policy,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+    std::span<const Tensor> x, std::span<const Weight> query_key_value_z_weight,
+    std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,
+    std::span<const Tensor> valid_columns, std::span<const Tensor> initial_state_slots,
+    std::span<const Tensor> conv_record, std::span<const Tensor> query,
+    std::span<const Tensor> key, std::span<const Tensor> value, std::span<const Tensor> z,
+    LinearPolicy policy, std::span<WorkspaceArena* const> workspace,
+    const ExecutionContext& ec);
 
 /** Q4G64_F16S/Q5G64_F16S split-storage two-weight record form (A16 only). */
 void gdn_input_proj_conv_record_column_parallel(
-    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
-    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
-    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
-    const std::array<Tensor, 2>& initial_state_slots, const std::array<Tensor, 2>& conv_record,
-    const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& key,
-    const std::array<Tensor, 2>& value, const std::array<Tensor, 2>& z,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+    std::span<const Tensor> x, std::span<const Weight> query_key_weight,
+    std::span<const Weight> value_z_weight, std::span<const Tensor> conv_weight,
+    std::span<const Tensor> conv_states, std::span<const Tensor> valid_columns,
+    std::span<const Tensor> initial_state_slots, std::span<const Tensor> conv_record,
+    std::span<const Tensor> query, std::span<const Tensor> key, std::span<const Tensor> value,
+    std::span<const Tensor> z, std::span<WorkspaceArena* const> workspace,
+    const ExecutionContext& ec);
 
 } // namespace ninfer::ops

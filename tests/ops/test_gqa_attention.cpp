@@ -29,6 +29,7 @@ using namespace ninfer::test::gqa;
 constexpr Geometry kGeometries[] = {
     {"qwen3_6_27b", 24, 4},
     {"qwen3_6_35b_a3b", 16, 2},
+    {"qwen3_6_27b_tp4", 6, 1},
 };
 
 struct AttentionCase {

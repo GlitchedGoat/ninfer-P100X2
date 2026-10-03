@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
 #include <vector>
 
 namespace ninfer {
@@ -30,6 +31,9 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    Tensor read_indices; // Original logical page -> chronological resident-page index.
+    Tensor read_table;   // Chronological resident-page index -> physical page.
+    std::uint32_t read_capacity = 0;
 };
 
 /**
@@ -49,6 +53,9 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    Tensor read_indices;
+    Tensor read_tables;
+    std::uint32_t read_capacity = 0;
 };
 
 // A pool plane is storage-only. Consumers assign K/V/layer meaning to plane indices.
@@ -70,6 +77,7 @@ struct PagedKVPoolSpec {
     std::int32_t table_rows             = 0;
     PagedKVPlaneOrder plane_order       = PagedKVPlaneOrder::PageMajor;
     std::vector<PagedKVPlaneSpec> planes;
+    bool ram_enabled = false;
 };
 
 struct PagedKVPlaneLayout {
@@ -81,6 +89,8 @@ struct PagedKVPoolLayout {
     PagedKVPoolSpec spec;
     std::vector<PagedKVPlaneLayout> planes;
     TensorRegion block_tables;
+    TensorRegion read_indices;
+    TensorRegion read_tables;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
@@ -108,6 +118,10 @@ public:
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
+    [[nodiscard]] bool ram_enabled() const noexcept { return spec_.ram_enabled; }
+    [[nodiscard]] const Tensor& read_indices() const noexcept { return read_indices_; }
+    [[nodiscard]] const Tensor& read_tables() const noexcept { return read_tables_; }
+    [[nodiscard]] std::size_t ram_archive_bytes() const noexcept;
 
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
@@ -135,6 +149,8 @@ private:
     PagedKVPoolSpec spec_;
     std::vector<Tensor> planes_;
     Tensor block_tables_;
+    Tensor read_indices_;
+    Tensor read_tables_;
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
@@ -143,7 +159,7 @@ private:
 
 class PagedKVAllocation {
 public:
-    PagedKVAllocation() noexcept = default;
+    PagedKVAllocation() noexcept;
     ~PagedKVAllocation();
 
     PagedKVAllocation(const PagedKVAllocation&)            = delete;
@@ -172,6 +188,9 @@ public:
     [[nodiscard]] Tensor block_table() const;
 
     void release() noexcept;
+    // Ranking is storage-policy input supplied by the model family, not interpreted by core.
+    void prefer_pages(std::span<const std::int32_t> ranked_pages);
+    [[nodiscard]] std::uint64_t ram_transfer_bytes() const noexcept;
 
 private:
     friend class PagedKVPool;
@@ -185,6 +204,10 @@ private:
     std::vector<std::int32_t> page_ids_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
+    struct RamState;
+    std::unique_ptr<RamState> ram_;
+    void materialize_ram_pages(std::uint32_t pages, cudaStream_t stream);
+    void publish_ram_mapping(cudaStream_t stream) const;
 };
 
 struct PagedKVReservation {

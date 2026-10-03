@@ -43,7 +43,7 @@ std::vector<float> materialize(std::span<const std::uint16_t> bits) {
 
 std::vector<double> oracle_all_rows(const HostWeight& weight, std::span<const float> activation) {
     std::vector<double> result(static_cast<std::size_t>(weight.n));
-    const unsigned available   = std::max(1U, std::thread::hardware_concurrency());
+    const unsigned available   = std::min(8U, std::max(1U, std::thread::hardware_concurrency()));
     const std::int32_t threads = std::min(weight.n, static_cast<std::int32_t>(available));
     std::vector<std::thread> workers;
     workers.reserve(static_cast<std::size_t>(threads));
@@ -162,6 +162,20 @@ int run_bf16_linear() {
                                     17, 32, 128}) {
         failures += run_bf16_linear_case(conv_projection, tokens);
         failures += run_bf16_linear_case(selector_projection, tokens);
+    }
+    for (const std::int32_t rows : {32768, 62080}) {
+        HostWeight host = make_patterned(rows, 5120, 403U);
+        // Cover BF16 significands and exponents, including values below FP16's
+        // normal range. The oracle still consumes the original BF16 values.
+        for (std::size_t i = 0; i < host.bits.size(); ++i) {
+            const float value = bf16_to_f32(host.bits[i]);
+            host.bits[i] = f32_to_bf16(std::ldexp(value * 1.203125F,
+                                               -static_cast<int>((i * 17) % 15)));
+        }
+        DeviceWeight head(std::move(host));
+        for (const std::int32_t tokens : {1, 2, 3, 4, 7, 8, 9}) {
+            failures += run_bf16_linear_case(head, tokens);
+        }
     }
 #endif
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));

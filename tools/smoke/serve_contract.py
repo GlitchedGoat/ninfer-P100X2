@@ -323,7 +323,7 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
-def exercise(base_url: str, model: str) -> dict[str, Any]:
+def exercise(base_url: str, model: str, *, text_only: bool = False) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
@@ -465,12 +465,34 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
             ],
         }
     ]
-    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
-    if image_prompt_tokens <= input_tokens:
-        raise ContractError("image request did not expand the prompt through the Vision frontend")
+    image_prompt_tokens = None
+    if text_only:
+        # TP4 and registered text-only packages must reject unsupported media,
+        # rather than silently treating it as an ordinary text prompt.
+        req = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({"model": model, "messages": image_messages,
+                             "max_completion_tokens": 2}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as response:
+                response.read()
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise ContractError(f"unsupported image returned HTTP {error.code}, expected 400")
+            detail = json.loads(error.read())
+            if (detail.get("error") or {}).get("code") != "vision_disabled":
+                raise ContractError(f"unsupported image returned the wrong error: {detail!r}")
+        else:
+            raise ContractError("text-only deployment accepted an unsupported image")
+    else:
+        image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
+        image_prompt_tokens, _ = require_usage(
+            image_response.get("usage"), "prompt_tokens", "completion_tokens"
+        )
+        if image_prompt_tokens <= input_tokens:
+            raise ContractError("image request did not expand the prompt through the Vision frontend")
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
@@ -503,12 +525,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", required=True)
+    parser.add_argument("--text-only", action="store_true",
+                        help="check unsupported-image rejection instead of Vision generation")
     parser.add_argument("--health-timeout", type=float, default=300.0)
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     wait_for_health(base_url, args.health_timeout)
-    print(json.dumps(exercise(base_url, args.model), ensure_ascii=False, indent=2))
+    print(json.dumps(exercise(base_url, args.model, text_only=args.text_only),
+                     ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ struct Options {
 };
 
 void usage(const char* argv0) {
-    std::printf("usage: %s [--shape full|shortlist --cols N]\n", argv0);
+    std::printf("usage: %s [--shape full|shortlist|shard0|shard1 --cols N]\n", argv0);
 }
 
 int parse_int(std::string_view value, const char* name) {
@@ -70,22 +70,26 @@ Options parse_args(int argc, char** argv) {
         if (options.cols != 0) { throw std::invalid_argument("--cols requires --shape"); }
         return options;
     }
-    if (options.shape != "full" && options.shape != "shortlist") {
-        throw std::invalid_argument("--shape must be full or shortlist");
+    if (options.shape != "full" && options.shape != "shortlist" && options.shape != "shard0" &&
+        options.shape != "shard1") {
+        throw std::invalid_argument("--shape must be full, shortlist, shard0 or shard1");
     }
     if (options.cols == 0) { options.cols = 1; }
-    const int maximum_cols = options.shape == "full" ? 128 : 120;
+    const int maximum_cols = options.shape == "shortlist" ? 120 : 128;
     if (options.cols < 1 || options.cols > maximum_cols) {
         throw std::invalid_argument("--cols exceeds the production aggregate domain");
     }
     return options;
 }
 
-void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, const char* shape) {
+void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, const char* shape,
+               bool with_value = false) {
     DeviceBuffer logits = make_bf16(static_cast<std::size_t>(physical_rows) * kLogitSlots);
     DeviceBuffer out    = make_zeros(static_cast<std::size_t>(cols) * sizeof(std::int32_t));
     auto* logits_base   = static_cast<std::uint16_t*>(logits.p);
     Tensor tout(out.p, DType::I32, {cols});
+    DeviceBuffer values(static_cast<std::size_t>(cols) * sizeof(float));
+    Tensor tvalues(values.p, DType::FP32, {cols});
 
     const double bytes     = static_cast<double>(valid_rows) * 2.0 * static_cast<double>(cols);
     int launch             = 0;
@@ -95,11 +99,15 @@ void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, co
             const int slot = (launch++ % window_count) * cols;
             auto* window   = logits_base + static_cast<std::size_t>(slot) * physical_rows;
             Tensor tlogits(window, DType::BF16, {physical_rows, cols});
-            ops::argmax(tlogits, tout, valid_rows, stream);
+            if (with_value) {
+                ops::argmax_with_value(tlogits, tvalues, tout, valid_rows, stream);
+            } else {
+                ops::argmax(tlogits, tout, valid_rows, stream);
+            }
         },
         bytes);
 
-    const std::string label = std::string("argmax ") + shape +
+    const std::string label = std::string(with_value ? "argmax_with_value " : "argmax ") + shape +
                               " rows=" + std::to_string(valid_rows) + " C=" + std::to_string(cols) +
                               " route=public";
     print_result(label.c_str(), result);
@@ -126,8 +134,12 @@ int main(int argc, char** argv) {
             }
         } else if (options.shape == "full") {
             run_shape(kFullPhysicalRows, kFullValidRows, options.cols, "full");
-        } else {
+        } else if (options.shape == "shortlist") {
             run_shape(kShortlistRows, kShortlistRows, options.cols, "shortlist");
+        } else {
+            constexpr auto shard_rows = kFullPhysicalRows / 2;
+            run_shape(shard_rows, options.shape == "shard0" ? shard_rows : kFullValidRows - shard_rows,
+                       options.cols, options.shape.c_str(), true);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "ninfer_argmax_bench: %s\n", e.what());

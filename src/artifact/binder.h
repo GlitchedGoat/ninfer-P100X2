@@ -12,8 +12,9 @@
 
 namespace ninfer::artifact {
 
-// One process drives at most two devices (core/device.h ExecutionContext).
-inline constexpr std::size_t kMaximumDevices = 2;
+// Capacity agrees with core/device.h ExecutionContext; only active ranks are materialized.
+inline constexpr std::size_t kMaximumDevices = 4;
+inline constexpr std::size_t kVirtualStorageDevices = 2;
 
 enum class TensorPlacement : std::uint8_t {
     Device,
@@ -27,6 +28,10 @@ enum class ShardAxis : std::uint8_t {
     Replicated,
     Rows,
     Columns,
+    // The object is presented through one full logical virtual address range. Its row-split
+    // base/high/scale planes are mapped at their original offsets, while the backing pages live
+    // on both GPUs.
+    VirtualRows,
 };
 
 struct ObjectHandle {
@@ -56,6 +61,26 @@ struct DeviceMaterialization {
     std::vector<std::byte> prefix;
 };
 
+// A two-device virtual placement.  Segments describe physical allocations mapped at their
+// original offsets in one full logical payload.  This matters for row-split tensors: their base,
+// high-bit, and scale planes are not laid out as two standalone row shards concatenated together.
+// The public object view is therefore the original full payload, while each segment's backing
+// pages may live on either GPU. This is intentionally separate from TP sharding: it does not
+// change the logical shape or execution width of the tensor.
+struct VirtualDeviceSegment {
+    int device = 0;
+    std::uint64_t virtual_offset = 0;
+    std::uint64_t bytes = 0;
+    std::vector<PlaneCopy> copies;
+    std::vector<std::byte> prefix;
+};
+
+struct VirtualDeviceMaterialization {
+    ObjectHandle object;
+    std::uint64_t virtual_bytes = 0;
+    std::vector<VirtualDeviceSegment> segments;
+};
+
 struct HostMaterialization {
     ObjectHandle object;
 };
@@ -65,8 +90,13 @@ struct MaterializationPlan {
     // Devices this plan targets; device_capacity_bytes[d] is valid for d < device_count.
     int device_count = 1;
     std::array<std::uint64_t, kMaximumDevices> device_capacity_bytes{};
+    // Bytes assigned to ordinary DeviceArena placements.  Virtual placements contribute only to
+    // device_capacity_bytes because their physical backing is allocated by the VMM mapper.
+    std::array<std::uint64_t, kMaximumDevices> device_arena_capacity_bytes{};
+    std::array<std::uint64_t, kMaximumDevices> virtual_capacity_bytes{};
     // One entry per (object, device) pair that receives bytes; ascending by device within object.
     std::vector<DeviceMaterialization> device_objects;
+    std::vector<VirtualDeviceMaterialization> virtual_objects;
     std::vector<HostMaterialization> host_objects;
 };
 
@@ -76,7 +106,7 @@ public:
     // tp > 1; when absent (the tp1 path) every device tensor is placed whole on device 0.
     using ShardResolver = std::function<ShardPlacement(std::string_view)>;
 
-    explicit Binder(const Reader& reader, int device_count = 1);
+    explicit Binder(const Reader& reader, int device_count = 1, bool storage_only = false);
 
     // How many device arenas this binder plans for. A target that binds a shard map must check
     // this against its own tp: a tp2 shard map fed to a one-device binder would place only device
@@ -96,6 +126,14 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
+    // Places one complete tensor only on the selected materialization device.  Used by storage
+    // mode for weights that remain primary-device resident while the virtual expert banks carry
+    // the cross-device capacity.
+    void materialize_on_device(ObjectHandle handle, int device);
+    // Places a row-splittable tensor as a full-shape virtual view backed by one set of physical
+    // plane slices per device. The two ranges must cover the complete row domain in order.
+    void materialize_virtual_rows(ObjectHandle handle,
+                                  std::array<SliceRange, kVirtualStorageDevices> ranges);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     void validate_unconsumed_matching(std::string_view prefix = "");
@@ -105,11 +143,13 @@ private:
     ObjectHandle find_unconsumed(std::string_view name);
     void place(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
                std::vector<PlaneCopy> copies);
+    void place_on_device(ObjectHandle handle, int device);
 
     const Reader& reader_;
     std::vector<bool> consumed_;
     std::vector<bool> planned_;
     ShardResolver shard_resolver_;
+    bool storage_only_ = false;
     MaterializationPlan materialization_;
 };
 

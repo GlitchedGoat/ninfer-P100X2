@@ -1,6 +1,7 @@
 # NInfer 小规模并发推理架构
 
-本文定义 NInfer 在单 GPU、单模型实例下支持少量并发请求的执行架构。典型
+本文定义 NInfer 在单 resident model instance 下支持少量并发请求的执行架构。
+设备域为单 GPU、27B TP2 或 SM70 Qwen3.8-27B NVFP4/原生 FP8 Text/MTP TP4；典型
 `max_concurrency` 为 2–8。
 
 设计目标不是让多个请求轮流执行，而是让所有处于 decode 阶段的请求形成一次真正的 batched
@@ -17,7 +18,7 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 ### 1.1 Supported workload
 
-- 单 GPU、单 resident model instance；
+- 单 resident model instance，启动时固定单 GPU、TP2 或已注册 TP4 设备域；
 - 启动时固定 `max_concurrency=C`，典型 `C=2..8`；
 - 运行时 `0..C` 个 admitted requests；
 - Text 与 image/video prompt；
@@ -30,7 +31,7 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 - request preemption、swap 或 pause/resume；
 - 多请求 batched prefill 或 prefill/decode mixed forward；
-- 多 GPU 或 distributed inference；
+- 跨节点 distributed inference，或未注册的 tensor-parallel 设备域；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；
 - 面向数十至数百请求的通用 continuous batching；
 - serving 期间为新 shape 动态捕获 CUDA Graph。
@@ -721,11 +722,11 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
 Rewrite-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
-27B TP2 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
-和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到 rank 1 已有的
-prefill buffer，不为每个 lane 增加第二份 hidden ledger。两个 rank 分别捕获、恢复自身的 GDN shard。
-Exact hit 经两卡 vocabulary-sharded output head 和 logit gather 完成采样；MTP bridge 再按两卡 MTP
-schedule 恢复 draft continuation。后续 prefill 覆盖 staging buffer 前须完成两卡 bridge，decode hot path
+27B TP2/TP4 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
+和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到各 peer 已有的
+prefill buffer，不为每个 lane 增加 peer hidden ledger。各 rank 分别捕获、恢复自身的 GDN shard。
+Exact hit 经 vocabulary-sharded output head 和 logit gather 完成采样；MTP bridge 再按对应 TP 宽度的 MTP
+schedule 恢复 draft continuation。后续 prefill 覆盖 staging buffer 前须完成所有 ranks 的 bridge，decode hot path
 不增加每轮 hidden 镜像。
 
 Checkpoint kind 不是 reuse compatibility bit。Planner 总是先按 token、position、media identity 和完整
@@ -1145,6 +1146,12 @@ ragged work。
 Context profile 不能把 active set 分成 cohorts，也不能使用 request identity 或 active-slot combination 建
 key。无法同时表示任意合法 per-row lengths 的 profile 不能作为 concurrent decode route；必须使用能
 保持 whole-batch execution 的 route。
+
+MTP/DFlash 另外预捕获 greedy-target 与 full-logit 两种 topology。只有整个 compact batch 的 temperature
+都不大于零时选择前者；TP2/TP4 先在各 rank 的合法词表 shard 内求最大值，再合并 FP32 value/I32 index，
+同分选择较小的全局 token ID，广播目标 token。只要有一行采样，就为整批保留完整 logits 路径及原有
+penalty-counter 更新。两种 topology 共享持久状态和 workspace，启动 reservation 包括两者的 graph
+definitions/executables；请求切换采样配置不触发 capture。
 
 Prefill 是 single-request work，可以使用 target-specific fixed execution profile。它不改变 decode-batch
 graph model，也不能在 serving 时触发会阻塞 active decode 的 graph capture。

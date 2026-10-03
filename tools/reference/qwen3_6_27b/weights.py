@@ -9,7 +9,7 @@ import warnings
 
 import torch
 
-from tools.artifact import (
+from tools.artifact.layouts import (
     decode_direct,
     dequantize_row_split,
     gather_row_planes,

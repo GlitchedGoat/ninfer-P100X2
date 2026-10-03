@@ -269,7 +269,7 @@ void require_shape(const Weight& w, const char* name) {
 
 // The tp2 column shard's own shape (24 of the parent's 48 rows, K unchanged).
 void require_shard_shape(const Weight& w, const char* name) {
-    if (w.n != kShardN || w.k != kK || w.shape[0] != kShardN || w.shape[1] != kK) {
+    if ((w.n != 24 && w.n != 12) || w.k != kK || w.shape[0] != w.n || w.shape[1] != kK) {
         throw std::invalid_argument(std::string("gdn_gating_proj column-parallel: ") + name +
                                     " requires contiguous BF16 [24,5120]");
     }
@@ -409,13 +409,14 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
 // --- tp2 column-shard forms (24 rows/GPU). See the kShardN comment above for why the
 // MMA route is out of scope and every T routes through gemv (T=1) or small-T-split10 (T>=2). ---
 
-void bf16_gdn_gating_proj_gemv_shard_launch(const Tensor& x, const Weight& a_weight,
+template <int Heads>
+void gemv_shard(const Tensor& x, const Weight& a_weight,
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
     require_shard_shape(a_weight, "a_weight");
     require_shard_shape(b_weight, "b_weight");
-    bf16_gdn_gating_proj_gemv_kernel<kShardN><<<2 * kShardN, kThreads, 0, stream>>>(
+    bf16_gdn_gating_proj_gemv_kernel<Heads><<<2 * Heads, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(a_weight.qdata),
         static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
@@ -424,14 +425,15 @@ void bf16_gdn_gating_proj_gemv_shard_launch(const Tensor& x, const Weight& a_wei
     CUDA_CHECK(cudaGetLastError());
 }
 
-void bf16_gdn_gating_proj_small_t_split10_shard_launch(const Tensor& x, const Weight& a_weight,
+template <int Heads>
+void split10_shard(const Tensor& x, const Weight& a_weight,
                                                         const Weight& b_weight, const Tensor& A_log,
                                                         const Tensor& dt_bias, void* workspace,
                                                         std::size_t workspace_bytes, Tensor& g,
                                                         Tensor& beta, cudaStream_t stream) {
     require_shard_shape(a_weight, "a_weight");
     require_shard_shape(b_weight, "b_weight");
-    constexpr int kShardLogicalRows = 2 * kShardN;
+    constexpr int kShardLogicalRows = 2 * Heads;
     const std::int32_t t            = x.ne[1];
     const std::size_t required      = static_cast<std::size_t>(kSmallTSplits) *
                                  static_cast<std::size_t>(t) *
@@ -445,7 +447,7 @@ void bf16_gdn_gating_proj_small_t_split10_shard_launch(const Tensor& x, const We
     dim3 partial_grid(div_up(kShardLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
                       div_up(t, kSmallTMax));
     bf16_gdn_gating_proj_small_t_partial_kernel<kSmallTMax, kSmallTKSlice, kSmallTRowsPerBlock,
-                                                kShardN>
+                                                Heads>
         <<<partial_grid, partial_block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(a_weight.qdata),
@@ -453,14 +455,29 @@ void bf16_gdn_gating_proj_small_t_split10_shard_launch(const Tensor& x, const We
     CUDA_CHECK(cudaGetLastError());
 
     constexpr int kReduceThreads = 128;
-    const int reduce_elems       = kShardN * t;
+    const int reduce_elems       = Heads * t;
     const int reduce_blocks      = div_up(reduce_elems, kReduceThreads);
-    bf16_gdn_gating_proj_small_t_reduce_kernel<kShardN>
+    bf16_gdn_gating_proj_small_t_reduce_kernel<Heads>
         <<<reduce_blocks, kReduceThreads, 0, stream>>>(
             static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),
             static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
             static_cast<float*>(beta.data), t);
     CUDA_CHECK(cudaGetLastError());
+}
+
+
+void bf16_gdn_gating_proj_gemv_shard_launch(
+    const Tensor& x, const Weight& a, const Weight& b, const Tensor& a_log,
+    const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    if (a.n == 12) { gemv_shard<12>(x, a, b, a_log, dt_bias, g, beta, stream); }
+    else { gemv_shard<24>(x, a, b, a_log, dt_bias, g, beta, stream); }
+}
+void bf16_gdn_gating_proj_small_t_split10_shard_launch(
+    const Tensor& x, const Weight& a, const Weight& b, const Tensor& a_log,
+    const Tensor& dt_bias, void* workspace, std::size_t bytes, Tensor& g,
+    Tensor& beta, cudaStream_t stream) {
+    if (a.n == 12) { split10_shard<12>(x, a, b, a_log, dt_bias, workspace, bytes, g, beta, stream); }
+    else { split10_shard<24>(x, a, b, a_log, dt_bias, workspace, bytes, g, beta, stream); }
 }
 
 void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
@@ -477,9 +494,10 @@ void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
                                                        workspace, workspace_bytes, g, beta, stream);
 }
 
-std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens) {
+std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens, std::int32_t heads) {
     if (tokens <= 1) { return 0; }
-    constexpr int kShardLogicalRows = 2 * kShardN;
+    if (heads != 24 && heads != 12) { throw std::invalid_argument("unsupported GDN head shard"); }
+    const int kShardLogicalRows = 2 * heads;
     return static_cast<std::size_t>(kSmallTSplits) * static_cast<std::size_t>(tokens) *
            static_cast<std::size_t>(kShardLogicalRows) * sizeof(float);
 }

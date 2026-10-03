@@ -2,6 +2,12 @@
 
 [English](README.md) · [详细评测方法](docs/performance.md) · [HTTP API](docs/serving.md)
 
+原生 RAM-KV 实验入口：`--ram-kv-window N`，支持 27B SM70、TP1/TP2、单请求 Text/MTP。
+首版采用免训练 **token 匹配检索**，并非 KVMem 的 Q/K 向量检索移植。RAM 无损存储 packed KV，
+但未选中的历史页不参与注意力，长 prefill 也会淘汰，可能漏召回；默认完整历史路径不变。
+详见 [存储与状态合同](docs/maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment) 和
+[启动选项](docs/cli.md)。外部 KVMem 成绩不能当作这条原生路径的性能数据。
+
 性能数据分为 [P2P 开启](#性能p2p-开启) 和 [P2P 关闭](#性能p2p-关闭) 两区；
 构建、模型准备和 [API 启动命令](#cli-和-api-启动) 在下方统一说明。
 
@@ -34,15 +40,183 @@ Decode 只统计已提交输出，不把被拒绝的草稿算入吞吐。NVFP4 �
   3072-token TP2 的 GDN scratch 为 24 MiB。
 - TP2 通信：图可捕获的 UVA D2D copy 加双向事件顺序；启动时检查双向精确传输。
   支持 direct P2P 和经过验证的 CUDA-managed staging，不另设显式 pinned-host 通信分支。
+  PCIe 对卡仍受 translated IOMMU 限制；实际启用的 NVLink mesh 通过 NVML 远端 PCI
+  端点确认后单独验证，不再被 PCIe 的 IOMMU 防护误禁用，也不修改系统配置。
+  已验证 P2P 的 SM70 小消息（≤80 KiB）直接读取对卡并求和到本卡 staging，
+  两卡读完才覆盖原输入；宽 prefill 和 P2P 关闭时继续走 DMA。
 - Volta 残差路径：Q5 与 BF16 TP2 row-shard 使用可在 SM70 执行的 kernel，并通过独立数值检查。
 - NVFP4 v3：读取官方 `NINFER\x00\x03` 单文件容器，映射到已注册的
   `qwen3.8-27b/nvfp4` 身份，不重打包权重字节；使用容器原始 chat template。
   容器可选的五层 DFlash2 组件已绑定为 text-only TP2 实验路径。
-- DFlash 双卡词表传输：greedy target 验证只交换各分片的 argmax 值和 ID；
-  草稿 selector 合并各卡的精确 top-16，不搬运完整词表 logits。采样验证仍保留完整 logits 路径。
+- MTP / DFlash 双卡词表传输：greedy target 验证只交换各分片的 argmax 值和 ID；
+  DFlash 草稿 selector 合并各卡的精确 top-16，不搬运完整词表 logits。
+  采样或混合 batch 的验证仍保留完整 logits 路径。
   V100 的窄 BF16 草稿投影直接读取 BF16，以 FP32 SIMT 累加，避免小矩阵的 CUTLASS 开销。
 - 前缀复用：TP2 与 optimized MTP3 可以恢复当前前沿或完整 turn/response checkpoint，
   只计算后续新增提示；支持重复恢复、精确命中和提前停止后的继续生成。
+
+## NVLink 远端部署：TP2 阶段
+
+2026-10-02 在朋友的四卡机器上实测：4×V100-SXM2 16 GB，全部两两 NV2，300 W/卡，
+驱动 580.178.04，CUDA 12.8 / SM70。**下表 NInfer 只使用 0,1 两张卡，TP2；另外两卡空闲。**
+真实 NVLink P2P 在主机 IOMMU 为 DMA-FQ 时仍通过验证，本次未修改 GRUB、驱动或重启。
+它不是本机 PCIe P2P 的同硬件 A/B 对照。
+
+官方 Qwen3.8-27B NVFP4 v3、完整 INT8 group-64 KV、180000 容量（分配 180032），
+prefill chunk=2560、greedy optimized MTP3、CUDA Graph。每档两轮冷提示，无前缀复用、
+无额外请求 warmup；加载及图预热不计入请求。每轮输出 1 个 prefill token＋512 个计时 decode token，
+保存的输入保留最后的代码任务和 assistant 后缀。均值 ± 样本标准差：
+
+| 实际输入 tokens | Prefill tok/s | 已提交 decode tok/s | Wall decode tok/s | MTP 接受率 |
+|---:|---:|---:|---:|---:|
+| 3072 | 2101.49 ± 4.03 | 111.19 ± 0.01 | 111.10 ± 0.01 | 72.16% |
+| 8192 | 2114.14 ± 6.82 | 109.04 ± 0.03 | 108.91 ± 0.03 | 70.67% |
+| 16384 | 2050.33 ± 1.22 | 104.46 ± 0.02 | 104.34 ± 0.02 | 69.00% |
+| 32768 | 1887.71 ± 0.55 | 101.99 ± 0.07 | 101.89 ± 0.08 | 74.47% |
+| 65536 | 1604.61 ± 3.27 | 90.28 ± 0.03 | 90.23 ± 0.03 | 76.39% |
+| 85000 | 1463.73 ± 4.35 | 85.53 ± 0.04 | 85.50 ± 0.05 | 77.11% |
+
+每档重复输出的 513 个 token ID 及草稿统计全部一致，计时窗口没有 EOS/EOG。
+这只是固定代码输出窗口的性能测量，不是完整代码评分。
+远端报告位于 `results/tp2-nvlink/`；[bench_tp.py](tools/v100/bench_tp.py) 通过公开
+`ninfer_bench` 顺序执行实际占用、容量和无 MTP 对照矩阵。
+
+容量对照固定相同的 **512 输入**、chunk=1024、MTP3，每档两轮、**256 个计时 decode token**。
+1024 容量放不下 512 输入再加 512 个计时输出，因此全档统一使用 256。各档实际 KV 分配
+等于标称容量，重复的 257 个输出 ID 与草稿统计均一致，接受率均为 70.33%。这不是长输入测试。
+
+| 最大上下文容量 | Prefill tok/s | 已提交 decode tok/s | Wall decode tok/s |
+|---:|---:|---:|---:|
+| 1024 | 1669.31 ± 29.44 | 112.60 ± 0.04 | 112.56 ± 0.03 |
+| 2048 | 1676.79 ± 30.19 | 112.86 ± 0.01 | 112.82 ± 0.01 |
+| 4096 | 1666.35 ± 33.44 | 112.70 ± 0.02 | 112.66 ± 0.02 |
+| 8192 | 1670.13 ± 31.18 | 112.71 ± 0.02 | 112.67 ± 0.02 |
+| 16384 | 1669.02 ± 34.89 | 112.91 ± 0.03 | 112.86 ± 0.03 |
+| 32768 | 1668.32 ± 37.79 | 112.81 ± 0.04 | 112.75 ± 0.03 |
+| 65536 | 1670.67 ± 27.88 | 112.97 ± 0.01 | 112.90 ± 0.02 |
+
+无草稿对照使用相同保存输入、180000 容量、chunk=2560、512 个计时输出，
+改用 `--spec none --draft-tokens 0`，不加载 optimized draft head：
+
+| 实际输入 | 无 MTP prefill tok/s | 无 MTP decode tok/s | MTP3 decode tok/s |
+|---:|---:|---:|---:|
+| 3072 | 2132.37 ± 8.53 | 39.584 ± 0.004 | 111.19 ± 0.01 |
+| 85000 | 1480.16 ± 4.93 | 28.349 ± 0.003 | 85.53 ± 0.04 |
+
+各对照内部重复输出一致；85K 的 MTP/无 MTP 输出一致，3K 则不一致，不能把速度倍率
+当作普遍 token 一致或不降智的证明。[分阶段耗时](docs/performance.md#separate-nvlink-deployment-tp2-stage)
+另列加载、准备、prefill 与 decode。
+
+### NVLink 部署：NInfer TP4
+
+2026-10-03 在上述四卡 NV2 主机实测，四张卡全部参与计算。官方 Qwen3.8-27B NVFP4 v3，
+180000 容量（分配 180032）、INT8 group-64 KV、chunk 2560、greedy 优化草稿头 MTP3、
+CUDA Graphs。每点两次冷请求，无前缀复用或额外 warmup；输出为一个 prefill token 加
+512 个已提交计时 decode token。加载/图预热不计入请求耗时。均值 ± 样本标准差：
+
+| 实际输入 token | Prefill tok/s | 已提交 decode tok/s | Wall decode tok/s | MTP 接受率 |
+|---:|---:|---:|---:|---:|
+| 3072 | 2381.83 ± 37.81 | 125.68 ± 0.08 | 125.42 ± 0.08 | 73.13% |
+| 8192 | 2415.01 ± 15.32 | 136.81 ± 0.07 | 136.61 ± 0.07 | 80.62% |
+| 16384 | 2381.76 ± 9.29 | 124.09 ± 0.08 | 123.82 ± 0.09 | 72.31% |
+| 32768 | 2279.47 ± 2.72 | 117.96 ± 0.02 | 117.73 ± 0.02 | 74.47% |
+| 65536 | 2072.25 ± 0.66 | 109.12 ± 0.13 | 108.99 ± 0.13 | 79.30% |
+| 85000 | 1957.93 ± 2.16 | 102.60 ± 0.08 | 102.51 ± 0.08 | 78.56% |
+
+全部重复运行的 513 个输出 ID 和草稿计数一致，无 EOS/EOG。85K 比此前同机 TP2 快照
+的 prefill/decode 分别提升 33.76% / 19.95%。接受率和运算分组不同，因此这不是只改变
+TP 宽度的严格 A/B，也不代表不同宽度的输出逐 token 相同。远端报告位于
+`results/tp4-nvfp4/`；固定窗口吞吐不是完整代码任务的质量评分。
+
+四卡 NVFP4 graph/eager、采样切换、B=2 MTP 和全部 64 个严格 teacher-forced 输出位置
+通过，argmax 零分歧。缓存 checkpoint、连续追加、exact frontier、轮内截断均通过精确
+状态对照。缓存/冷启动在第 28 个输出位置的一处分歧是 BF16 并列最大值，logit 差距为 0；
+stop 截断与输出预算截断随后追加的输出、logits 和接受计数完全一致。不宣称冷启动重新
+prefill 与保留状态计算逐位相同。
+
+### 四卡 1Cat/vLLM 对照
+
+朋友机器上的隔离启动脚本位于 `/home/z/1cat-vllm-v100`，使用全部四张 NV2 V100-SXM2，
+复用已有 OneCat Studio 模型目录，监听 loopback 6100/6101；原有 8888 UI 没有改动。
+180000 最大容量、MTP3、1570-token 短提示、流式输出 256 token 的实际结果：
+
+| 1Cat 模型 | TTFT | 流式 decode |
+|---|---:|---:|
+| Qwen3.8-27B NVFP4 | 0.955 s | 83.03 tok/s |
+| Qwen3.8-27B FP8 | 1.590 s | 83.23 tok/s |
+
+这是短提示单请求 HTTP 测试，不是 85K 占用上下文，也不是 NInfer TP4 成绩。脚本调用模型
+自带的 FP8/NVFP4 kernel；NInfer 原生 block-scaled FP8 已单独完成测评。对照完成后已停止
+1Cat 进程，并启动 NInfer TP4 API 到 loopback 6200。
+
+远端仓库内的 `bash tools/v100/serve-tp4.sh /home/z/Models/ninfer/qwen3_8_27b_nvfp4.ninfer`
+启动四卡 loopback `6200` API：180K 容量、MTP3、单请求、默认最大输出 65536、前缀复用开启。
+文本 OpenAI/Responses/Anthropic 契约、不支持图像的拒绝以及重复提示恢复 turn checkpoint 均已验证。
+通过 SSH 隧道访问，API 没有直接暴露到公网：
+
+```bash
+ssh -N -L 6200:127.0.0.1:6200 -p 12031 z@你的主机地址
+curl http://127.0.0.1:6200/health
+```
+
+图形启动器运行 `bash tools/v100/ninfer-gui.sh`。PyQt 控制台可调 artifact、TP/设备、
+上下文/KV 容量、prefill chunk、MTP/DFlash 草稿窗口、CUDA Graph/前缀缓存、并发、输出
+上限和采样默认值，并在启动前拦截不支持的组合。详见 [`docs/gui.md`](docs/gui.md)。
+
+**NVFP4 与原生 block-128 FP8 的 TP4 整模型/状态门、前缀复用、容量/普通解码对照和
+TP4 HTTP 部署均已完成。**
+
+原生 FP8 TP4 实际输入阶梯（同为 180K 容量、INT8 KV、MTP3、两次冷请求、512 个已提交
+decode token）如下：
+
+| 实际输入 | Prefill tok/s | 已提交 Decode tok/s | Wall decode tok/s | 接受率 |
+|---:|---:|---:|---:|---:|
+| 3072 | 2415.00 ± 13.42 | 98.75 ± 0.02 | 98.59 ± 0.02 | 80.04% |
+| 8192 | 2445.95 ± 5.48 | 100.16 ± 0.01 | 100.07 ± 0.02 | 80.44% |
+| 16384 | 2404.93 ± 4.30 | 95.48 ± 0.01 | 95.31 ± 0.02 | 77.27% |
+| 32768 | 2298.05 ± 0.04 | 89.15 ± 0.01 | 89.02 ± 0.01 | 74.68% |
+| 65536 | 2089.18 ± 1.61 | 85.05 ± 0.11 | 84.99 ± 0.11 | 80.22% |
+| 85000 | 1972.43 ± 2.89 | 81.53 ± 0.09 | 81.47 ± 0.09 | 80.58% |
+
+原生 FP8 容量阶梯（512 输入、256 输出、chunk 1024）完整数据如下：
+
+| 容量 | Prefill tok/s | Decode phase tok/s | Decode wall tok/s |
+|---:|---:|---:|---:|
+| 1024 | 2003.40 ± 38.05 | 101.52 ± 0.06 | 101.49 ± 0.07 |
+| 2048 | 1996.61 ± 50.16 | 101.43 ± 0.08 | 101.40 ± 0.08 |
+| 4096 | 1997.52 ± 47.56 | 101.48 ± 0.01 | 101.45 ± 0.01 |
+| 8192 | 1986.08 ± 56.70 | 101.12 ± 0.05 | 101.10 ± 0.05 |
+| 16384 | 1990.54 ± 54.50 | 101.55 ± 0.01 | 101.52 ± 0.01 |
+| 32768 | 2000.66 ± 49.85 | 101.33 ± 0.20 | 101.29 ± 0.20 |
+| 65536 | 1999.82 ± 41.27 | 101.26 ± 0.06 | 101.20 ± 0.06 |
+
+所有容量分配、输出 ID 和草稿计数均重复一致。
+无 MTP 对照为 3K 40.98、85K 33.12 tok/s。FP8 teacher-force 门记录 3 个草稿 argmax
+差异，最大 emitted-logit deficit 0.125；ordinary 冷重算为 1 个、同为 0.125。这是文档中
+规定的数值包络，不是逐 token 完全无损声明。
+
+同一台四卡机器已通过生产通信集（直连 NVLink 与 staged fallback、非均匀 gather、broadcast、
+图重放）以及 BF16 四分片投影/恰好一次 residual 测试：10 个几何/阶段组合，eager 与 CUDA
+Graph replay 均零失败。四卡 NVFP4/row-FP8/原生分块 FP8 注意力与 GDN 投影，以及
+T=1/4/128/2560 的 BF16 四分片 GDN 控制，已通过独立 FP64 检查。四卡 NVFP4 普通 eager
+短请求已正常输出代码；这只是冒烟检查，不是吞吐或质量评分。新增原生分块 FP8 的 Linear、
+融合 SwiGLU/残差独立 FP64 oracle、TP4 精确字节分片、6Q/1KV 注意力、4QK/12V GDN replay
+已在本机 SM70 通过；这些是算子验证，不是四卡整模型成绩。
+
+Q4 优化草稿头的四分片形状已补齐并通过 FP64 检查。并行草稿选词现在只合并每卡
+FP32 最大值和 I32 token ID，不再收集完整草稿词表；采样仍使用完整 target logits。
+修改后的本机 TP2 MTP graph/eager、采样切换、B=2 状态与全部 64 个 teacher-forced
+输出位置检查通过，argmax 零分歧。四卡图内存已采用独立启动预算，并已通过真实四卡
+NVFP4 MTP 启动/状态检查。
+
+朋友机器现有 OneCat FP8 源已转换为独立 `qwen3.8-27b/fp8` 产物：31.30GB（十进制），
+保留 E4M3 权重和全部 128×128 BF16 乘数，不重新量化；embedding、输出头和 MTP stem
+保持 BF16。它与 NVFP4 包中的 row-scaled FP8 不是同一种格式。
+[原生 FP8 产物说明](docs/maintainer/qwen3.8-27b-artifact.md#native-block-128-fp8-textmtp-package)。
+
+TP4 当前选择 SM70 的 Qwen3.8-27B NVFP4/原生 FP8 Text/MTP；原生 FP8 要求 TP4，
+四卡均不开放 Vision/DFlash。上述 graph/eager、MTP 提交、前缀缓存、HTTP 和上下文阶梯
+已在独立四卡机器上验证；上面的 TP2、1Cat 数据不会改名成 TP4 成绩。
 
 ## 性能：P2P 开启
 
@@ -53,6 +227,103 @@ NInfer 自动启用已有 direct P2P 路径。**这是 PCIe P2P，不是 NVLink�
 两区使用同一套启动命令；NInfer 在启动时依据实际双向通信检查自动选择路径。
 `iommu=pt` 本身不是 P2P 成功证明，`nvidia-smi topo -m` 的 PHB 标签也不是。
 
+### QUASAR NVFP4 试跑
+
+新增独立的 `qwen3.8-27b/quasar-nvfp4` 实验配置，用公开 Engine 加载
+[QUASAR NInfer v3 成品](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)。
+开放 SM70 TP2 Text/普通解码/MTP/DFlash，不替换默认模型；保留原始 codes/scales 和全部
+256 对激活缩放参数。QUASAR 是 QAT，不是数学上的无损压缩；成品转换也含 BF16/W8
+精度边界，详见 [模型存储合同](docs/maintainer/qwen3.8-27b-artifact.md#13-quasar-trial-artifact)。
+
+Attention/GDN 输入与输出权重现已和 MLP 一样，加载时进入 Volta QPN 布局；窄输入直接
+写最终输出，宽输入每次调用只反量化一次权重供 CUTLASS 使用，再分发 BF16 结果。
+不改变文件中的权重／divisor，没有开启 A4 激活量化或裁剪历史注意力。
+
+2026-10-03 本机双 V100：PCIe P2P、**无 NVLink**、各 300 W、CUDA 12.8；保存的代码
+输入，chunk 2560、完整 INT8 group-64 KV、greedy optimized-head MTP3、CUDA Graph。
+每行测两次，无前缀复用；3072 输入无额外预热，85000 输入先完整预热一次。每次输出
+一个 prefill token，加 **512 个已提交 decode token**。下表 decode 用提交数量除以首
+token 后的请求 wall 时间，不计加载／图预热；均值 ± 样本标准差。
+
+| 路径 | 实际输入 / 容量 | Prefill tok/s | 已提交 wall decode tok/s | 接受率 |
+|---|---:|---:|---:|---:|
+| 接入 QPN 输入路径前 | 3072 / 8192 | 376.71 ± 0.77 | 102.02 ± 0.06 | 85.78% |
+| QPN / MTP3 | 3072 / 8192 | 1751.55 ± 30.90 | 139.80 ± 0.08 | 85.19% |
+| QPN / MTP3，热请求 | 85000 / 180000 | 1315.28 ± 2.61 | 100.34 ± 0.05 | 86.62% |
+
+短输入配对收益为 **prefill 4.65 倍、decode 1.37 倍**，接受率反而略降。85K 热请求平均
+prefill/decode 阶段／完整请求为 64.625/5.100/69.729 秒；Engine decode 阶段吞吐为
+100.40 tok/s。MTP 每卡权重仍为 **8.66 GiB**。
+各路径两次输出和草稿计数一致；新旧短输入路径从第 270 个输出 token 起不同，数值路线
+变化不代表逐 token 保持，也不能当作不降智证明。独立 FP64 输入投影检查覆盖实际 TP1/TP2
+形状及 QPN/CUTLASS 边界；公开 Engine 的 MTP、DFlash 各通过 64 个严格 teacher-forced
+位置及 graph/eager 采样检查。尚未做 BF16 质量评分或满占用 180K/256K 测量。
+本轮报告位于 `profiles/bench/quasar-qpn-projections/`，初始未优化对照保留在
+`profiles/bench/quasar-v3-tp2-comparison/`。
+
+同机 **QUASAR DFlash7 JSONL**：容量 98304、chunk 1024、完整 INT8 KV、full proposal head、
+greedy CUDA Graph，无前缀复用。复用此前的 32 条 JSONL 任务和不同技术文档背景；每行先
+完整预热一次，再测两次。启用模型默认停止；六次答案各发布 1190 token（扣首 token 后
+计时 1189），全部自然结束，记录内容／算术／字段顺序检查全过。每行两次输出 ID 和
+草稿计数一致。
+
+| JSONL 实际输入 token | Prefill tok/s | 已提交 wall decode tok/s | DFlash 接受率 |
+|---:|---:|---:|---:|
+| 118（原生提示） | 564.22 ± 0.33 | 249.00 ± 0.08 | 99.05% |
+| 4096 | 1577.84 ± 1.11 | 235.97 ± 0.04 | 99.05% |
+| 85000 | 1184.19 ± 1.07 | 153.12 ± 0.02 | 98.30% |
+
+85K JSONL 平均 prefill/decode wall／完整请求为 **71.779/7.765/79.546 秒**。这是高接受率
+结构化输出成绩，不代表普通代码／故事也能达到 249 tok/s；上面的 MTP 代码表是另一种
+任务，不能拿来算 DFlash 的配对增益。保留完整历史注意力，没有用近似 RAM-KV 提速。
+报告：`profiles/bench/quasar-qpn-projections/jsonl-dflash7.json`；
+[复测工具与精确答案检查](bench/README.md#stop-aware-v100-task-probes)。
+
+**QUASAR 完整任务矩阵**：同一份保存的输入，容量 98304、chunk 1024、完整 INT8 KV；
+每项先完整预热一次，比较 optimized-head MTP3 与 full-head DFlash7。80 次正式测量
+均在 2048 输出上限前自然停止，无前缀复用。下表 **D/M = DFlash7 / MTP3 已提交 wall
+decode tok/s**；原生提示为两次均值，其余每个任务／长度／后端仅测一次，不是稳定均值。
+
+| 实际输入 token | 中文故事 D/M | 英译中 D/M | 32 条 JSONL D/M | 逻辑题 D/M |
+|---:|---:|---:|---:|---:|
+| 原生：129 / 395 / 118 / 417 | 56.45 / 89.58 | 162.90 / 143.66 | 247.73 / 163.33 | 204.68 / 152.93 |
+| 1024 | 59.98 / 89.34 | 154.45 / 143.26 | 242.15 / 161.98 | 185.00 / 143.35 |
+| 2048 | 58.38 / 85.06 | 149.46 / 140.75 | 232.84 / 158.92 | 193.55 / 151.54 |
+| 4096 | 53.75 / 83.76 | 144.89 / 138.87 | 234.86 / 158.91 | 151.70 / 137.03 |
+| 8192 | 55.62 / 82.65 | 145.07 / 139.49 | 229.81 / 156.56 | 195.49 / 143.77 |
+| 16384 | 58.74 / 85.15 | 124.65 / 129.88 | 221.85 / 151.38 | 177.22 / 139.75 |
+| 32768 | 48.32 / 77.06 | 124.26 / 124.26 | 198.65 / 139.45 | 162.39 / 132.71 |
+| 65536 | 41.32 / 64.82 | 98.82 / 102.86 | 165.74 / 119.52 | 135.01 / 112.12 |
+| 85000 | 39.26 / 61.28 | 87.06 / 93.29 | 152.72 / 111.73 | 127.43 / 105.94 |
+
+85K 的 DFlash JSONL／逻辑 decode 分别快 36.69%／20.28%，但故事、翻译更慢；prefill
+也更慢，为 1176.69–1186.82，对比 MTP 的 1226.43–1238.87 tok/s。JSONL 完整请求只从
+79.895 秒变为 79.794 秒，逻辑题完整请求反而更慢，不能宣称普遍端到端提速。
+所有 JSONL 精确记录／顺序、逻辑映射／CHECK 检查通过；翻译只检查章节和词汇表结构，
+未独立评分翻译准确性。故事只在 8K／16K／64K 满足要求的字数范围。
+**36 组配对有 31 组完整输出 IDs 一致**，85K 四组均一致，不代表通用逐 token 一致或无损。
+本轮遭遇意外整机重启，已保留完成项并只补缺失项；最后续跑采用约十分钟负载／三分钟
+休息，不能据此证明持续负载稳定。
+[完整阶段耗时、接受率、输出数及质量限制](docs/performance.md#quasar-v3-stop-aware-task-matrix)。
+
+QUASAR 当前已是纯文本加载：**两张卡均不上传任何视觉对象**，视觉请求会被拒绝。
+原模型文件保持不变；文件中仅供验证的视觉数据占磁盘，不占 GPU 权重显存。
+因此物理删掉这部分不会继续降低当前纯文本配置的显存，也不能解释速度提升。
+
+模型保存在 `/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer`，18.42 GiB，
+已核对发布者 SHA256。本次编译目录为 `build-v100-tp4`，下面实际使用的仍是 **TP2**：
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64" \
+  build-v100-tp4/apps/ninfer /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 --max-context 8192 --kv-dtype int8 --prefill-chunk 2560 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --no-thinking --greedy \
+  --max-new 512 --prompt '用 C++ 编写一个有界阻塞队列。'
+```
+
+DFlash 改用 `--max-context 98304 --prefill-chunk 1024 --spec dflash --draft-tokens 7`，
+去掉 `--lm-head-draft`，即可匹配上面 full-head 的测量配置。
+
 ### NVFP4 v3：实际上下文占用
 
 官方 NVFP4 v3、TP2、完整 INT8 group-64 KV、greedy（temperature=0）、MTP3、
@@ -60,6 +331,7 @@ optimized draft head、CUDA Graph。容量统一 180000（实际 KV 分配 18003
 每档两轮冷提示，无前缀复用、无额外请求 warmup；图预热在计时之外。
 每轮生成 513 token，其中首个来自 prefill，后续 **512 个是计时 decode 输出**。
 吞吐为均值 ± 样本标准差。
+此表早于下方 greedy / 小消息通信更新，其他上下文档位尚未按新实现重测。
 
 | 实际输入 token | Prefill tok/s | 已提交 Decode tok/s | MTP 接受率 |
 |---:|---:|---:|---:|
@@ -91,6 +363,26 @@ optimized draft head、CUDA Graph。容量统一 180000（实际 KV 分配 18003
 测试时桌面显存占用使更大 chunk 无法通过启动余量检查，因此采用 2560；
 上面的旧 3072-chunk 表不是这项改动的配对控制组。独立数值判据未放宽，
 本轮没有达到交付条件的新有损注意力入口。
+
+### 精确 greedy 与小消息 P2P 更新
+
+同一份实际 85000-token 输入、180000 容量、chunk=2560、官方 NVFP4 v3、INT8 KV、
+greedy optimized MTP3、CUDA Graph，各实现测两轮冷请求：
+
+| 实现 | Prefill tok/s | 已提交 Decode tok/s |
+|---|---:|---:|
+| 控制组，完整 logits 验证 | 1315.36 ± 2.45 | 81.80 ± 0.08 |
+| 精确分片 winner | 1312.31 ± 3.15 | 82.40 ± 0.04 |
+| 并行分片 argmax | 1312.38 ± 1.68 | 82.43 ± 0.13 |
+| 再加入小消息 direct-peer 求和 | 1311.95 ± 3.70 | **85.21 ± 0.06** |
+
+组合 decode 提升 **4.17%**，其中通信这一步相对上一版提升 3.37%；
+单独 argmax 的整段增量在噪声内，不宣称 prefill 提升。
+所有轮次的 513 个输出 IDs 和完整接受统计一致：每轮接受 357/463 drafts、155 rounds，
+接受率 77.11%。权重、完整历史注意力、KV 精度和舍入边界不变；采样仍保留完整 logits 与原有 penalty 更新。
+新实现的 resident 请求平均 prefill 64.789 秒、decode 6.009 秒，总计 70.803 秒。
+不能拿上面的旧 chunk=3072 表计算这轮增益。
+[阶段耗时和验证限制](docs/performance.md#exact-greedy-and-small-message-p2p-update)。
 
 ### NVFP4 v3：最大容量，固定 512-token 输入
 
@@ -363,11 +655,14 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 对照过 [plus1998/Ninfer-V100-Duo](https://github.com/plus1998/Ninfer-V100-Duo)；prefill 调研参考
 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。DFlash2 实验参考
 [Inco AI](https://inco.ai/blog/dflash2/) 及其[草稿模型](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)。
-[KVMem](https://github.com/kvmem/kvmem-llama.cpp) 已调研但未集成：按查询检索部分历史会改变
-完整上下文注意力语义，本配置没有悄悄替换成这种近似方案。
+[KVMem](https://github.com/kvmem/kvmem-llama.cpp) 为可选 RAM-KV 实验提供了参考。
+原生原型采用 token 匹配检索，不是其 Q/K 向量检索移植；只让部分历史参与注意力是近似模式，
+必须显式开启，默认完整上下文注意力不变。
 
 模型来自 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)，NVFP4 的混合 FP8/NVFP4
 权重来自 [Unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)，容器由
 [Neroued](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) 打包。
+QUASAR 试跑使用 [QUASAR-QAT 的模型](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)，
+以及 [MirkoCovizzi 的 NInfer 转换成品](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)。
 
 本项目采用 [Apache-2.0](LICENSE)；归属声明见 [NOTICE](NOTICE)，第三方依赖保留各自许可。

@@ -224,13 +224,13 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                        std::int32_t last) {
     validate_token_interval(first, last);
     return 0;
 }
 
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                 std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
@@ -239,7 +239,7 @@ std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t fir
     return layout.peak_bytes(1);
 }
 
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
@@ -248,7 +248,7 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
     return layout.peak_bytes(1);
 }
 
-std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile, int,
                                                                    qwen3_6::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
@@ -256,7 +256,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         QType::W8G32_F16S, 9216, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile, int,
                                                                           qwen3_6::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
@@ -265,7 +265,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(Weight
                                                     ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile, int,
                                                                    qwen3_6::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
@@ -273,7 +273,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
         QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile, int,
                                                                             qwen3_6::TextPhase,
                                                                             std::int32_t batch_size,
                                                                             std::int32_t first,
@@ -282,7 +282,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(Weig
         TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile, int,
                                                                           qwen3_6::TextPhase,
                                                                           std::int32_t batch_size,
                                                                           std::int32_t first,
@@ -293,7 +293,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(Weight
                         first, last));
 }
 
-std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile, int,
                                                                     qwen3_6::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
@@ -303,12 +303,12 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
 }
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(
-    WeightsProfile, std::int32_t first, std::int32_t last) {
+    WeightsProfile, int, std::int32_t first, std::int32_t last) {
     return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
                                                               TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, int, qwen3_6::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
     return std::max(
         ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S, first, last),
@@ -316,7 +316,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6
                                                  last));
 }
 
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                              std::int32_t last) {
     return ops::sparse_moe_workspace_capacity_bytes(QType::W8G32_F16S, QType::W8G32_F16S, first,
                                                     last);
@@ -332,101 +332,101 @@ namespace {
 
 } // namespace
 
-void Variant::attention_projection(const std::array<Tensor, 2>&,
-                                   const std::array<const FullAttentionProjectionWeights*, 2>&,
-                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::attention_projection(std::span<const Tensor>,
+                                   std::span<const FullAttentionProjectionWeights* const>,
+                                   std::span<const Tensor>, std::span<const Tensor>,
+                                   std::span<const Tensor>, std::span<const Tensor>,
+                                   qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
                                    const ExecutionContext&) {
     reject_tensor_parallel("attention_projection");
 }
 
-void Variant::attention_output_projection(const std::array<Tensor, 2>&,
-                                          const std::array<Weight, 2>&,
-                                          const std::array<Tensor, 2>&,
-                                          const std::array<Tensor, 2>&, qwen3_6::TextPhase,
-                                          const std::array<WorkspaceArena*, 2>&,
+void Variant::attention_output_projection(std::span<const Tensor>,
+                                          std::span<const Weight>,
+                                          std::span<const Tensor>,
+                                          std::span<const Tensor>, qwen3_6::TextPhase,
+                                          std::span<WorkspaceArena* const>,
                                           const ExecutionContext&, const ops::PeerEvents&) {
     reject_tensor_parallel("attention_output_projection");
 }
 
-void Variant::gdn_input_projection(const std::array<Tensor, 2>&,
-                                   const std::array<const GdnProjectionWeights*, 2>&,
-                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::gdn_input_projection(std::span<const Tensor>,
+                                   std::span<const GdnProjectionWeights* const>,
+                                   std::span<const Tensor>, std::span<const Tensor>,
+                                   qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
                                    const ExecutionContext&) {
     reject_tensor_parallel("gdn_input_projection");
 }
 
 void Variant::gdn_input_projection_snapshot(
-    const std::array<Tensor, 2>&, const std::array<const GdnProjectionWeights*, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    std::span<const Tensor>, std::span<const GdnProjectionWeights* const>,
+    std::span<const Tensor>, std::span<const Tensor>, std::span<const Tensor>,
+    std::span<const Tensor>, std::span<const Tensor>, std::span<const Tensor>,
+    std::span<const Tensor>, std::span<const Tensor>, std::span<const Tensor>,
+    qwen3_6::TextPhase, std::span<WorkspaceArena* const>, const ExecutionContext&) {
     reject_tensor_parallel("gdn_input_projection_snapshot");
 }
 
-void Variant::gdn_output_projection(const std::array<Tensor, 2>&, const std::array<Weight, 2>&,
-                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::gdn_output_projection(std::span<const Tensor>, std::span<const Weight>,
+                                    std::span<const Tensor>, std::span<const Tensor>,
+                                    qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
                                     const ExecutionContext&, const ops::PeerEvents&) {
     reject_tensor_parallel("gdn_output_projection");
 }
 
-void Variant::gdn_control_projection(const std::array<Tensor, 2>&,
-                                     const std::array<const GdnProjectionWeights*, 2>&,
-                                     const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                     const std::array<WorkspaceArena*, 2>&,
+void Variant::gdn_control_projection(std::span<const Tensor>,
+                                     std::span<const GdnProjectionWeights* const>,
+                                     std::span<const Tensor>, std::span<const Tensor>,
+                                     std::span<WorkspaceArena* const>,
                                      const ExecutionContext&) {
     reject_tensor_parallel("gdn_control_projection");
 }
 
-void Variant::post_mixer(const std::array<Tensor, 2>&,
-                         const std::array<const PostMixerWeights*, 2>&,
-                         const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                         qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+void Variant::post_mixer(std::span<const Tensor>,
+                         std::span<const PostMixerWeights* const>,
+                         std::span<const Tensor>, std::span<const Tensor>,
+                         qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
                          const ExecutionContext&, const ops::PeerEvents&) {
     reject_tensor_parallel("post_mixer");
 }
 
 void Variant::gdn_input_projection_record(
-    const std::array<Tensor, 2>&, const std::array<const GdnProjectionWeights*, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    std::span<const Tensor>, std::span<const GdnProjectionWeights* const>,
+    std::span<const Tensor>, std::span<const Tensor>, std::span<const Tensor>,
+    std::span<const Tensor>, std::span<const Tensor>, std::span<const Tensor>,
+    std::span<const Tensor>, std::span<const Tensor>, std::span<const Tensor>,
+    qwen3_6::TextPhase, std::span<WorkspaceArena* const>, const ExecutionContext&) {
     reject_tensor_parallel("gdn_input_projection_record");
 }
 
-void Variant::mtp_attention_projection(const std::array<Tensor, 2>&,
-                                       const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                       const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                       const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                       const std::array<WorkspaceArena*, 2>&,
+void Variant::mtp_attention_projection(std::span<const Tensor>,
+                                       std::span<const MtpAttentionProjectionWeights* const>,
+                                       std::span<const Tensor>, std::span<const Tensor>,
+                                       std::span<const Tensor>, std::span<const Tensor>,
+                                       std::span<WorkspaceArena* const>,
                                        const ExecutionContext&) {
     reject_tensor_parallel("mtp_attention_projection");
 }
 
-void Variant::mtp_kv_projection(const std::array<Tensor, 2>&,
-                                const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+void Variant::mtp_kv_projection(std::span<const Tensor>,
+                                std::span<const MtpAttentionProjectionWeights* const>,
+                                std::span<const Tensor>, std::span<const Tensor>,
+                                std::span<WorkspaceArena* const>, const ExecutionContext&) {
     reject_tensor_parallel("mtp_kv_projection");
 }
 
-void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>&,
-                                    const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                    const std::array<WorkspaceArena*, 2>&,
+void Variant::mtp_q_gate_projection(std::span<const Tensor>,
+                                    std::span<const MtpAttentionProjectionWeights* const>,
+                                    std::span<const Tensor>, std::span<const Tensor>,
+                                    std::span<WorkspaceArena* const>,
                                     const ExecutionContext&) {
     reject_tensor_parallel("mtp_q_gate_projection");
 }
 
-void Variant::mtp_post_mixer(const std::array<Tensor, 2>&,
-                             const std::array<const MtpPostMixerWeights*, 2>&,
-                             const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                             const std::array<WorkspaceArena*, 2>&, const ExecutionContext&,
+void Variant::mtp_post_mixer(std::span<const Tensor>,
+                             std::span<const MtpPostMixerWeights* const>,
+                             std::span<const Tensor>, std::span<const Tensor>,
+                             std::span<WorkspaceArena* const>, const ExecutionContext&,
                              const ops::PeerEvents&) {
     reject_tensor_parallel("mtp_post_mixer");
 }

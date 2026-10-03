@@ -16,6 +16,10 @@ import sqlite3
 
 
 def category(short, full):
+    if short.startswith("allreduce_peer_sum_"):
+        return "communication.peer_sum"
+    if "argmax" in short:
+        return "token_decision.argmax"
     if short == "Kernel" and "cutlass" in full:
         return "projection.CUTLASS"
     if short.startswith("fp8_volta_qpn"):

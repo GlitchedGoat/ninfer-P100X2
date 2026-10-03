@@ -116,14 +116,12 @@ public:
     void debug_enable_logit_capture(bool enabled);
     [[nodiscard]] std::vector<std::uint16_t> debug_last_round_logits_bf16() const;
 
-    // Debug-only, OFF by default: at tp == 2 with MTP, compare rank 1's speculative egress record
-    // (licensed tokens/counts, accepted drafts, next proposal) with rank 0's after every round.
-    // Both ranks run the acceptance Op over bit-identical inputs, which is why rank 1's copy is
-    // never read in production; this turns that argument into a measurement. Returns {rounds
-    // compared, field mismatches}, cumulative since the engine was created; a healthy tp2 MTP run
-    // reports a positive round count and zero mismatches. No-op at tp1 or without MTP. Added to
-    // harden the tp2 MTP lockstep induction -- that both ranks derive the same speculative egress
-    // independently -- and not wire-facing.
+    // Debug-only, OFF by default: with parallel MTP, compare each non-root rank's licensed
+    // tokens/counts, accepted drafts and next extents against rank 0 after every round.
+    // All ranks run acceptance over identical inputs; production consumes rank 0's egress.
+    // Returns {peer-round comparisons, field mismatches}, cumulative since Engine creation.
+    // A healthy parallel MTP run reports positive comparisons and zero mismatches.
+    // No-op at tp1 or without MTP; not wire-facing.
     void debug_enable_peer_egress_check(bool enabled);
     [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> debug_peer_egress_check_counts() const;
 

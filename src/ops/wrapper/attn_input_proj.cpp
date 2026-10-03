@@ -9,8 +9,12 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/attn_input_proj/volta_tp4.h"
+#endif
 
 #include <array>
 #include <cstddef>
@@ -189,6 +193,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     }
 
     switch (parent_qtype) {
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
     case QType::GGML_K:
         return linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
                                                 policy, min_tokens, max_tokens);
@@ -203,7 +208,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_attn_input_workspace_capacity_bytes(parent_rows, policy,
+                                                                 min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16S:
         if (parent_rows != detail::Fp8AttnInputGeometry::kOutputRows ||
             input_rows != detail::Fp8AttnInputGeometry::kInputRows) {
@@ -296,17 +302,26 @@ constexpr std::int32_t kShardSplitRows = 3584; // query_key / gate_value shard r
 
 void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, const Tensor& q,
                                           const Tensor& gate, const Tensor& k, const Tensor& v,
-                                          LinearPolicy policy) {
+                                          LinearPolicy policy, int tp) {
     validate_policy(policy);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj column-parallel: T must be positive"); }
     require_matrix(x, kShardHidden, cols, "x");
-    require_matrix(q, kShardQueryRows, cols, "q");
-    require_matrix(gate, kShardQueryRows, cols, "gate");
-    require_matrix(k, kShardKeyRows, cols, "k");
-    require_matrix(v, kShardKeyRows, cols, "v");
+    require_matrix(q, 6144 / tp, cols, "q");
+    require_matrix(gate, 6144 / tp, cols, "gate");
+    require_matrix(k, 1024 / tp, cols, "k");
+    require_matrix(v, 1024 / tp, cols, "v");
+    if (tp == 4) {
+        (void)attn_input_proj_column_parallel_workspace_capacity_bytes(w.qtype, policy,
+                                                                       cols, cols, tp);
+    }
 
-    if (w.qtype == QType::GGML_K) {
+    if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (tp != 4 || policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 attention currently requires TP4/A16");
+        }
+        detail::validate_fp8_block_weight(w);
+    } else if (w.qtype == QType::GGML_K) {
         (void)linear_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, cols, cols);
     } else if (w.qtype == QType::NVFP4) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
@@ -324,7 +339,7 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
         throw std::invalid_argument(
             "attn_input_proj column-parallel: unsupported fused weight format");
     }
-    if (w.n != kShardFusedRows || w.k != kShardHidden) {
+    if (w.n != 14336 / tp || w.k != kShardHidden) {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: unsupported weight shard shape");
     }
@@ -333,22 +348,37 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
 // Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
 // validate_fused_column_rank_semantics. Mirrors linear_swiglu's own validate_swiglu_split_pair
 // (src/ops/wrapper/linear_swiglu.cpp).
-void validate_fused_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_fused_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                                const ExecutionContext& ec) {
     detail::require_split_context(
         ec,
-        "attn_input_proj column-parallel: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
+        "attn_input_proj column-parallel: requires two or four distinct devices", ec.tp);
+    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        throw std::invalid_argument("attn_input_proj: input/weight width must equal TP width");
+    }
+    for (int rank = 1; rank < ec.tp; ++rank) {
+    if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: both ranks must carry the same token count");
     }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
+    if (w[0].qtype != w[rank].qtype || w[0].layout != w[rank].layout) {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: both ranks must carry the same weight format");
     }
-    if (w[0].k != w[1].k) {
+    if (w[0].k != w[rank].k) {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: both ranks must consume the same input extent K");
+    }
+    }
+}
+
+void require_destination_width(std::span<const Tensor> q, std::span<const Tensor> gate,
+                                std::span<const Tensor> k, std::span<const Tensor> v,
+                                std::span<WorkspaceArena* const> workspace, int tp) {
+    const auto width = static_cast<std::size_t>(tp);
+    if (q.size() != width || gate.size() != width || k.size() != width || v.size() != width ||
+        workspace.size() != width) {
+        throw std::invalid_argument("attn_input_proj: output/workspace width must equal TP width");
     }
 }
 
@@ -367,9 +397,9 @@ void validate_split_storage_column_rank_semantics(const Tensor& x, const Weight&
     require_rowsplit(gate_value_w, QType::Q5G64_F16S, kShardSplitRows, "gate/value weight shard");
 }
 
-void validate_split_storage_split_pair(const std::array<Tensor, 2>& x,
-                                       const std::array<Weight, 2>& query_key_w,
-                                       const std::array<Weight, 2>& gate_value_w,
+void validate_split_storage_split_pair(std::span<const Tensor> x,
+                                       std::span<const Weight> query_key_w,
+                                       std::span<const Weight> gate_value_w,
                                        const ExecutionContext& ec) {
     detail::require_split_context(
         ec,
@@ -393,15 +423,25 @@ void validate_split_storage_split_pair(const std::array<Tensor, 2>& x,
 
 std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                       std::int32_t min_tokens,
-                                                                      std::int32_t max_tokens) {
+                                                                      std::int32_t max_tokens, int tp) {
+    if (tp == 4) {
+#ifdef NINFER_VOLTA_BUILD
+        if (policy == LinearPolicy::A16Only && min_tokens > 0 && max_tokens >= min_tokens) {
+            return detail::attn_input_volta_tp4_workspace_bytes(qtype, max_tokens);
+        }
+#endif
+        throw std::invalid_argument("TP4 attention admits only the SM70 NVFP4/FP8-row A16 profile");
+    }
+    if (tp != 2) { throw std::invalid_argument("attention: unsupported TP width"); }
     if (qtype == QType::GGML_K) {
         return linear_workspace_capacity_bytes(qtype, kShardFusedRows, kShardHidden,
                                                 policy, min_tokens, max_tokens);
     }
-    // The W4A4/A8 activation-quantize workspace is a pure function of (tokens, K), and K=5120 is
-    // unchanged by the shard (only the output row count N halves) -- the tp1 query is exact here.
+    // Quantized-activation scratch keeps the same K. Wide SM70 NVFP4 A16 additionally sizes
+    // transient weights/results from the actual shard output width.
     if (qtype == QType::NVFP4) {
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_attn_input_workspace_capacity_bytes(kShardFusedRows, policy,
+                                                                 min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -416,66 +456,81 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype
         "attn_input_proj column-parallel workspace: unsupported weight format");
 }
 
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> query_key_gate_value_weight,
+                                     std::span<const Tensor> q, std::span<const Tensor> gate,
+                                     std::span<const Tensor> k, std::span<const Tensor> v,
                                      LinearPolicy policy,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec) {
     validate_fused_split_pair(x, query_key_gate_value_weight, ec);
+    require_destination_width(q, gate, k, v, workspace, ec.tp);
     // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+    for (std::size_t slot = 0; slot < x.size(); ++slot) {
         validate_fused_column_rank_semantics(x[slot], query_key_gate_value_weight[slot], q[slot],
-                                             gate[slot], k[slot], v[slot], policy);
+                                             gate[slot], k[slot], v[slot], policy, ec.tp);
+        const auto bytes = attn_input_proj_column_parallel_workspace_capacity_bytes(
+            query_key_gate_value_weight[slot].qtype, policy, x[slot].ne[1], x[slot].ne[1], ec.tp);
+        if (bytes && workspace[slot] == nullptr) {
+            throw std::invalid_argument("attn_input_proj: this profile requires workspace");
+        }
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_gate_value_weight[slot].payload, q[slot].data,
             "attn_input_proj column-parallel: every per-rank argument must be resident on "
             "ec.dev[rank]");
     }
-    std::array<Tensor, 2> q_dst{q[0], q[1]};
-    std::array<Tensor, 2> gate_dst{gate[0], gate[1]};
-    std::array<Tensor, 2> k_dst{k[0], k[1]};
-    std::array<Tensor, 2> v_dst{v[0], v[1]};
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
         const Weight& w  = query_key_gate_value_weight[slot];
+        Tensor q_dst = q[slot], gate_dst = gate[slot], k_dst = k[slot], v_dst = v[slot];
+#ifdef NINFER_VOLTA_BUILD
+        if (ec.tp == 4) {
+            detail::attn_input_volta_tp4_launch(x[slot], w, q_dst, gate_dst, k_dst, v_dst,
+                                               workspace[slot], ec.dev[slot]->stream);
+            return;
+        }
+#endif
         if (w.qtype == QType::GGML_K) {
-            const Tensor outputs[]{q_dst[slot], k_dst[slot], gate_dst[slot], v_dst[slot]};
+            const Tensor outputs[]{q_dst, k_dst, gate_dst, v_dst};
             detail::ggml_k_project_split(x[slot], w, outputs, 4, false,
                                          ec.dev[slot]->stream, false, workspace[slot]);
         } else if (w.qtype == QType::NVFP4) {
-            detail::nvfp4_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],
-                                                    k_dst[slot], v_dst[slot], policy,
+            detail::nvfp4_attn_input_dispatch_shard(x[slot], w, q_dst, gate_dst,
+                                                    k_dst, v_dst, policy,
                                                     workspace[slot], ec.dev[slot]->stream);
         } else {
-            detail::fp8_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],
-                                                  k_dst[slot], v_dst[slot], policy, workspace[slot],
+            detail::fp8_attn_input_dispatch_shard(x[slot], w, q_dst, gate_dst,
+                                                  k_dst, v_dst, policy, workspace[slot],
                                                   ec.dev[slot]->stream);
         }
     });
 }
 
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
+void attn_input_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> query_key_gate_value_weight,
+                                     std::span<const Tensor> q, std::span<const Tensor> gate,
+                                     std::span<const Tensor> k, std::span<const Tensor> v,
                                      const ExecutionContext& ec) {
+    const std::array<WorkspaceArena*, 4> workspace{};
     attn_input_proj_column_parallel(x, query_key_gate_value_weight, q, gate, k, v,
-                                    LinearPolicy::A16Only, {nullptr, nullptr}, ec);
+                                    LinearPolicy::A16Only, std::span(workspace).first(ec.tp), ec);
 }
 
-void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& query_key_weight,
-                                     const std::array<Weight, 2>& gate_value_weight,
-                                     const std::array<Tensor, 2>& q, const std::array<Tensor, 2>& gate,
-                                     const std::array<Tensor, 2>& k, const std::array<Tensor, 2>& v,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+void attn_input_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> query_key_weight,
+                                     std::span<const Weight> gate_value_weight,
+                                     std::span<const Tensor> q, std::span<const Tensor> gate,
+                                     std::span<const Tensor> k, std::span<const Tensor> v,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec) {
+    if (x.size() != 2 || query_key_weight.size() != 2 || gate_value_weight.size() != 2) {
+        throw std::invalid_argument("Q4/Q5 attention: argument width must equal two");
+    }
     validate_split_storage_split_pair(x, query_key_weight, gate_value_weight, ec);
+    require_destination_width(q, gate, k, v, workspace, ec.tp);
     for (std::size_t slot = 0; slot < 2; ++slot) {
         if (workspace[slot] == nullptr) {
             throw std::invalid_argument("Q4/Q5 attention shard requires a workspace arena");

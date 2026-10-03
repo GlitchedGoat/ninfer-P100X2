@@ -37,6 +37,14 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
 // can fall back to the tp2 shard table. It is consulted FIRST, so a geometry that is
 // both registered here and listed as a shard extent keeps its tuned tp1 launcher.
 Q4Launch select_q4_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
+#ifdef NINFER_VOLTA_BUILD
+    // Qwen3.8 NVFP4's exact Q4 optimized proposal-head quarter shard.
+    if (n == 32768 && k == 5120) {
+        if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+        if (t <= 4) { return launch_q4_simt_r8_c4; }
+        return launch_q4_simt_r8_c8;
+    }
+#endif
     switch (k) {
     case 5120:
         switch (n) {

@@ -85,7 +85,9 @@ void verify_payloads(const std::filesystem::path& path, const Reader& reader) {
 void verify_plans(const Reader& reader) {
     for (bool enabled : {false, true}) {
         Binder binder(reader, 2);
-        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38Nvfp4,
+        const auto profile = reader.identity().weights_id == "quasar-nvfp4"
+            ? WeightsProfile::Qwen38QuasarNvfp4 : WeightsProfile::Qwen38Nvfp4;
+        const auto plan = bind_artifact(binder, profile,
             {.speculative = enabled ? ninfer::SpeculativeBackend::DFlash
                                     : ninfer::SpeculativeBackend::None}, 2);
         require(plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,

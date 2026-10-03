@@ -531,6 +531,7 @@ int run_embedding_replication_case(const ExecutionContext& ec) {
         Tensor out_tensor(out_dev.data(), DType::BF16, {kSmallD, tokens});
 
         retire_staging(ec);
+        set_device(ec, rank);
         // The device-0 assumption this leg is built to catch would show up here: rank 1's call
         // uses ec.dev[1]->stream and rank 1's own table/out buffers throughout.
         ops::embedding(ids_tensor, table, out_tensor, ec.dev[rank]->stream);
@@ -630,7 +631,7 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, peer_access);
 
     failures += run_embedding_replication_case(ec);
 

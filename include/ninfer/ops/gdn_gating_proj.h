@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -124,22 +125,22 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 gdn_gating_proj_column_parallel_workspace_capacity_bytes(std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
 
-void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& a_weight,
-                                     const std::array<Weight, 2>& b_weight,
-                                     const std::array<Tensor, 2>& A_log,
-                                     const std::array<Tensor, 2>& dt_bias,
-                                     const std::array<WorkspaceArena*, 2>& ws,
-                                     const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta,
+void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> a_weight,
+                                     std::span<const Weight> b_weight,
+                                     std::span<const Tensor> A_log,
+                                     std::span<const Tensor> dt_bias,
+                                     std::span<WorkspaceArena* const> ws,
+                                     std::span<const Tensor> g, std::span<const Tensor> beta,
                                      const ExecutionContext& ec);
 
 /** Fused-parent form: `ab_weight` is BF16_CTRL or GGML_K [96,5120], A in rows [0,48), B in [48,96). */
-void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& ab_weight,
-                                     const std::array<Tensor, 2>& A_log,
-                                     const std::array<Tensor, 2>& dt_bias,
-                                     const std::array<WorkspaceArena*, 2>& ws,
-                                     const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta,
+void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> ab_weight,
+                                     std::span<const Tensor> A_log,
+                                     std::span<const Tensor> dt_bias,
+                                     std::span<WorkspaceArena* const> ws,
+                                     std::span<const Tensor> g, std::span<const Tensor> beta,
                                      const ExecutionContext& ec);
 
 } // namespace ninfer::ops

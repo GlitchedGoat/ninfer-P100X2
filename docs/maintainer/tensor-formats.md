@@ -1,13 +1,13 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the eleven persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. Container framing, physical byte layouts, checkpoint
 assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly eleven registered persistent numeric tensor formats.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -47,6 +47,14 @@ The row-scaled floating-point weight format is:
 |---|---|---|---|
 | `FP8_E4M3FN_ROW_BF16S` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 
+`FP8_E4M3FN_BLOCK128_BF16S` retains the native FP8 checkpoint's E4M3FN code and one BF16
+multiplier per 128×128 block. For logical `[N,K]`, both dimensions are divisible by 128:
+`W[n,k]=decode_e4m3fn(code[n,k])*decode_bf16(scale[n/128,k/128])`.
+Codes use the same finite E4M3FN semantics as the row format; multipliers are finite and
+nonnegative. The source name `weight_scale_inv` is the multiplicative dequantization scale,
+not a request to reciprocate it. This format is not interchangeable with row-scaled FP8.
+No canonical requantizer is defined: conversion preserves source words and moves whole blocks.
+
 This is a closed registry, not a template from which arbitrary scalar types, bit widths, and group
 sizes may be constructed. In particular, `FP16`, bare `FP8_E4M3FN`, `I64`, `Q4G32_F16S`,
 `Q6G128_F16S`, and `W8G64_F16S` do not become valid merely because their components look familiar.
@@ -81,7 +89,8 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-the block-scaled `NVFP4` format, and the row-scaled `FP8_E4M3FN_ROW_BF16S` format. It does not
+the block-scaled `NVFP4` and `FP8_E4M3FN_BLOCK128_BF16S` formats, the preserved `GGML_K`
+codec, and the row-scaled `FP8_E4M3FN_ROW_BF16S` format. It does not
 identify a tensor's model role, physical byte layout, or supported consumer.
 
 ### 2.2 Direct scalar format
@@ -104,7 +113,7 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The six quantized names above identify schemes in this sense. Their meanings are immutable: a
+The eight non-direct names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -163,7 +172,7 @@ exactly the same direct words or logical codes and scales. The currently registe
 `contiguous-le-v1` for direct words, `row-split-k128-v1` for grouped signed-integer formats, and
 `blockscale-k16-m128x4-v1` for `NVFP4`, and `row-scale-v1` for
 `FP8_E4M3FN_ROW_BF16S`. Their byte order, plane packing, padding, swizzle, divisor placement, and
-alignment rules belong to the layout registry, not to these nine numeric formats.
+alignment rules belong to the layout registry, not to these eleven numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -711,7 +720,7 @@ meanings defined here.
 
 ## 9. Checkpoint and model boundary
 
-This registry does not say where any of the nine formats are used. A checkpoint numeric-format
+This registry does not say where any of the eleven formats are used. A checkpoint numeric-format
 document must separately define, for every persisted source tensor or derived tensor:
 
 - its source checkpoint identity and source tensor or derivation;

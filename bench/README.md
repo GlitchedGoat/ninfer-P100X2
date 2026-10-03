@@ -47,7 +47,7 @@ ninfer_bench --weights <artifact.ninfer>
           [--kv-dtype <bf16|int8>]
           [--spec <none|mtp|dflash>] [--draft-tokens <n>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
-          [--device <id>] [--tp <1|2>] [--devices <id[,id]>]
+          [--device <id>] [--tp <1|2|4>] [--devices <id,...>]
           [--no-cuda-graph] [--profile-measured]
           [--capture-generation]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -73,7 +73,8 @@ must contain one distinct ordinal per rank; an explicit `--device` must match it
 Schema-v13 JSON records the actual Engine `tp` and ordered `devices` in `environment`, together with
 the selected speculative backend and draft window; table, CSV,
 and matrix summaries also identify the selected devices. The existing memory summary reports the
-primary device, so its byte counts are not the sum across both GPUs.
+primary device, so its byte counts are not the sum across active GPUs. Graph residency also
+reports one observed byte count per active rank.
 
 `--capture-generation --output json` preserves each measured repetition's output token IDs,
 raw text, and reasoning in `reps[].generation`. Capture happens after generation returns and does
@@ -89,6 +90,41 @@ separately accumulated Program decode phase.
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
+
+## Stop-aware V100 task probes
+
+`ninfer_v100_task_bench` uses the public Engine and saved exact-token workload cases, selected
+by task and occupancy (`all` selects every matching case). It uses TP2, 98304 capacity, chunk
+1024, full INT8 KV, text-only greedy CUDA Graphs, one complete warmup per case, the corpus's
+repetition count and no prefix reuse. Model-default stopping is enabled. JSONL answers are
+checked for exactly 32 JSON records,
+field order and the requested numeric/string values. `decode_tok_s` counts committed output
+after the first token over request wall time; `decode_phase_tok_s` retains the Engine phase rate.
+
+```bash
+cmake --build build-v100-tp4 --target ninfer_v100_task_bench -j4
+build-v100-tp4/bench/ninfer_v100_task_bench \
+  /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  profiles/bench/other_inputs_20261001/cases.json \
+  profiles/bench/quasar-qpn-projections/all-dflash7.json dflash all all 600 180
+```
+
+The cases file is an existing local measurement prerequisite, not a downloaded model. Use
+`mtp` instead of `dflash` and another report path for matched MTP3. For a single probe, replace
+`all all` with e.g. `structured_jsonl 85000`. Both modes preserve output
+IDs, content, checks, acceptance counts and phase times. A failed task check returns nonzero
+after saving measurements, so high throughput cannot silently qualify malformed JSONL answers.
+Other tasks retain their content for task-specific evaluation; throughput is not a quality score.
+The final arguments bound the active window and rest interval. At request boundaries, the runner
+reserves 120 seconds for the next request, then rests outside inference timing (600/180 means
+roughly 8–10 minutes active, three minutes idle). Reports are atomically replaced and synced after
+each measured request. An existing matching report resumes only its missing repetitions; a
+different artifact/backend/runtime profile is rejected instead of mixing results.
+JSON event lines on stdout identify load, graph priming, each warmup and measured request,
+and cooldown boundaries with UTC epoch and monotonic timestamps. Per-second cumulative Engine counters
+show actual prefill/decode progress without additional CUDA synchronization. Attach the read-only
+[`health_log.py`](../tools/v100/health_log.py) collector to the benchmark PID to preserve GPU,
+host and workload-thread telemetry alongside these events.
 
 ## Linear Op benchmark
 
@@ -678,11 +714,17 @@ The G1 benchmark calls public `argmax` for the Qwen3.6-35B full physical vocabul
 valid rows through `C=128`, and for the 131072-row shortlist through `C=120`. With no arguments it
 covers every B=1 full-vocabulary width, both T1 routes, and both aggregate maxima:
 
+`--shape shard0|shard1` calls public `argmax_with_value` for the two 124160-row TP2 physical
+shards, with 124160/123917 valid rows respectively. These return the represented winning value
+and lowest local index, rather than timing a private selector or transport.
+
 ```bash
 cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_select_bench
 ./build/bench/ninfer_argmax_bench
 ./build/bench/ninfer_argmax_bench --shape full --cols 128
 ./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
+./build/bench/ninfer_argmax_bench --shape shard0 --cols 4
+./build/bench/ninfer_argmax_bench --shape shard1 --cols 64
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence

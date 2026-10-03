@@ -461,6 +461,9 @@ int main() {
     failures += run_case(8, 24, 2, 1, {}, 1751U);
     failures += run_case(8, 24, 4, 1, {3}, 1761U);
     failures += run_case(8, 24, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 1771U);
+    failures += run_case(4, 12, 2, 1, {}, 1781U);
+    failures += run_case(4, 12, 4, 1, {3}, 1782U);
+    failures += run_case(4, 12, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 1783U);
     failures += oracle_shard_case(6, 1801U);
     failures += oracle_shard_case(4, 1811U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";

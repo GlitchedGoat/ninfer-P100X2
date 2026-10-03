@@ -25,6 +25,14 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     if (tokens <= 0 || !is_nvfp4_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (is_nvfp4_volta_tp4_problem(output_rows, input_rows)) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("nvfp4 TP4 SM70 linear admits only A16");
+        }
+        return Nvfp4LinearRoute::A16;
+    }
+#endif
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear: unsupported policy");

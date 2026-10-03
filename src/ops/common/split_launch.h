@@ -61,10 +61,18 @@ private:
     int previous_ = 0;
 };
 
-inline void require_split_context(const ExecutionContext& ec, const char* message) {
-    if (ec.tp != 2 || !ec.dev[0].has_value() || !ec.dev[1].has_value() ||
-        ec.dev[0]->device == ec.dev[1]->device) {
+inline void require_split_context(const ExecutionContext& ec, const char* message,
+                                  int expected_ranks = 2) {
+    if ((ec.tp != 2 && ec.tp != 4) || ec.tp != expected_ranks) {
         throw std::invalid_argument(message);
+    }
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        if (!ec.dev[rank].has_value()) { throw std::invalid_argument(message); }
+        for (int other = 0; other < rank; ++other) {
+            if (ec.dev[rank]->device == ec.dev[other]->device) {
+                throw std::invalid_argument(message);
+            }
+        }
     }
 }
 
@@ -106,7 +114,7 @@ inline void require_rank_residency([[maybe_unused]] const ExecutionContext& ec,
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDeviceScope scope;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CurrentDeviceScope::set(ec.dev[rank]->device);
         body(rank);
     }

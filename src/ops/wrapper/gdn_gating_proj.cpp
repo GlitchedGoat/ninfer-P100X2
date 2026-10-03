@@ -246,13 +246,15 @@ void validate_column_rank_semantics(const Tensor& x, const Weight& a_weight,
     constexpr const char* op   = "gdn_gating_proj column-parallel";
     const std::int32_t tokens  = x.ne[1];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
+    const int heads = a_weight.n;
+    if (heads != 24 && heads != 12) { throw std::invalid_argument("unsupported GDN head shard"); }
     require_sequence_tensor(x, DType::BF16, kShardHidden, tokens, op, "x");
-    require_vector_tensor(A_log, DType::FP32, kShardHeads, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, kShardHeads, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, kShardHeads, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, kShardHeads, tokens, op, "beta");
-    require_control_weight(a_weight, kShardHeads, kShardHidden, "a_weight shard");
-    require_control_weight(b_weight, kShardHeads, kShardHidden, "b_weight shard");
+    require_vector_tensor(A_log, DType::FP32, heads, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, heads, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, heads, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, heads, tokens, op, "beta");
+    require_control_weight(a_weight, heads, kShardHidden, "a_weight shard");
+    require_control_weight(b_weight, heads, kShardHidden, "b_weight shard");
     if (a_weight.qtype != b_weight.qtype) {
         throw std::invalid_argument("gdn_gating_proj column-parallel: control formats disagree");
     }
@@ -261,13 +263,19 @@ void validate_column_rank_semantics(const Tensor& x, const Weight& a_weight,
 // Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
 // validate_column_rank_semantics. Mirrors attn_input_proj's own validate_fused_split_pair
 // (src/ops/wrapper/attn_input_proj.cpp).
-void validate_split_pair(const std::array<Tensor, 2>& x, const ExecutionContext& ec) {
+void validate_split_pair(std::span<const Tensor> x, const ExecutionContext& ec) {
     detail::require_split_context(
-        ec, "gdn_gating_proj column-parallel: requires an ExecutionContext with two distinct "
-            "devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
+        ec, "gdn_gating_proj column-parallel: requires an ExecutionContext with two or four distinct "
+            "devices", ec.tp);
+    if (x.size() != static_cast<std::size_t>(ec.tp)) {
+        throw std::invalid_argument(
+            "gdn_gating_proj column-parallel: argument width must equal TP width");
+    }
+    for (int rank = 1; rank < ec.tp; ++rank) {
+      if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "gdn_gating_proj column-parallel: both ranks must carry the same token count");
+      }
     }
 }
 
@@ -295,7 +303,7 @@ void dispatch_shard(const Tensor& x, const Weight& a_weight, const Weight& b_wei
         return;
     }
     const std::int32_t tokens        = x.ne[1];
-    const std::size_t required_bytes = detail::bf16_gdn_gating_shard_workspace_bytes(tokens);
+    const std::size_t required_bytes = detail::bf16_gdn_gating_shard_workspace_bytes(tokens, a_weight.n);
     if (required_bytes == 0) {
         Tensor g_mut(g);
         Tensor beta_mut(beta);
@@ -324,20 +332,28 @@ std::size_t gdn_gating_proj_column_parallel_workspace_capacity_bytes(std::int32_
     return detail::bf16_gdn_gating_shard_workspace_bytes(max_tokens);
 }
 
-void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& a_weight,
-                                     const std::array<Weight, 2>& b_weight,
-                                     const std::array<Tensor, 2>& A_log,
-                                     const std::array<Tensor, 2>& dt_bias,
-                                     const std::array<WorkspaceArena*, 2>& ws,
-                                     const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta,
+void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> a_weight,
+                                     std::span<const Weight> b_weight,
+                                     std::span<const Tensor> A_log,
+                                     std::span<const Tensor> dt_bias,
+                                     std::span<WorkspaceArena* const> ws,
+                                     std::span<const Tensor> g, std::span<const Tensor> beta,
                                      const ExecutionContext& ec) {
     validate_split_pair(x, ec);
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+    if (a_weight.size() != x.size() || b_weight.size() != x.size() || A_log.size() != x.size() ||
+        dt_bias.size() != x.size() || ws.size() != x.size() || g.size() != x.size() ||
+        beta.size() != x.size()) {
+        throw std::invalid_argument("gdn_gating_proj column-parallel: argument width mismatch");
+    }
+    for (std::size_t slot = 0; slot < x.size(); ++slot) {
+        if (a_weight[slot].n != 48 / ec.tp || b_weight[slot].n != 48 / ec.tp) {
+            throw std::invalid_argument("GDN control shard does not match TP width");
+        }
         validate_column_rank_semantics(x[slot], a_weight[slot], b_weight[slot], A_log[slot],
                                        dt_bias[slot], g[slot], beta[slot]);
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, a_weight[slot].payload, g[slot].data,
@@ -351,29 +367,34 @@ void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
     });
 }
 
-void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& ab_weight,
-                                     const std::array<Tensor, 2>& A_log,
-                                     const std::array<Tensor, 2>& dt_bias,
-                                     const std::array<WorkspaceArena*, 2>& ws,
-                                     const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta,
+void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
+                                     std::span<const Weight> ab_weight,
+                                     std::span<const Tensor> A_log,
+                                     std::span<const Tensor> dt_bias,
+                                     std::span<WorkspaceArena* const> ws,
+                                     std::span<const Tensor> g, std::span<const Tensor> beta,
                                      const ExecutionContext& ec) {
     validate_split_pair(x, ec);
-    std::array<Weight, 2> a_weight{};
-    std::array<Weight, 2> b_weight{};
-    for (std::size_t slot = 0; slot < 2; ++slot) {
+    if (ab_weight.size() != x.size() || A_log.size() != x.size() || dt_bias.size() != x.size() ||
+        ws.size() != x.size() || g.size() != x.size() || beta.size() != x.size()) {
+        throw std::invalid_argument("gdn_gating_proj column-parallel: argument width mismatch");
+    }
+    const int heads = 48 / ec.tp;
+    std::array<Weight, kMaximumExecutionDevices> a_weight{};
+    std::array<Weight, kMaximumExecutionDevices> b_weight{};
+    for (std::size_t slot = 0; slot < x.size(); ++slot) {
         const Weight& parent = ab_weight[slot];
-        if (parent.n != 2 * kShardHeads || parent.k != kShardHidden) {
+        if (parent.n != 2 * heads || parent.k != kShardHidden) {
             throw std::invalid_argument(
                 "gdn_gating_proj column-parallel: unsupported ab_weight shard geometry");
         }
-        require_control_weight(parent, 2 * kShardHeads, kShardHidden, "ab_weight shard");
-        a_weight[slot] = control_row_view(parent, 0, kShardHeads);
-        b_weight[slot] = control_row_view(parent, kShardHeads, kShardHeads);
+        require_control_weight(parent, 2 * heads, kShardHidden, "ab_weight shard");
+        a_weight[slot] = control_row_view(parent, 0, heads);
+        b_weight[slot] = control_row_view(parent, heads, heads);
         validate_column_rank_semantics(x[slot], a_weight[slot], b_weight[slot], A_log[slot],
                                        dt_bias[slot], g[slot], beta[slot]);
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, ab_weight[slot].payload, g[slot].data,

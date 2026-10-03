@@ -1,15 +1,16 @@
 #pragma once
 
-// ninfer::ops - two-device collectives.
+// ninfer::ops - two- and four-device collectives.
 //
-// These are the cross-device primitives every tensor-parallel (tp == 2) forward pass needs: one
+// These are the cross-device primitives tensor-parallel forward passes need: one
 // summing reduction for row-parallel projections, one row gather for the vocabulary-split output
-// head. Both operate on an ExecutionContext holding exactly two DeviceContexts and use each
+// head. Both operate on an ExecutionContext holding two or four DeviceContexts and use each
 // device's own compute stream; no stream parameter is accepted, because "the stream a device
 // executes on" is already a property of its DeviceContext and a second, disagreeing stream story
 // would break the ordering guarantees documented below.
 //
-// TRANSPORT. Payloads move with cudaMemcpyAsync(cudaMemcpyDeviceToDevice) over unified virtual
+// TRANSPORT. Gather and large/fallback reduction payloads move with
+// cudaMemcpyAsync(cudaMemcpyDeviceToDevice) over unified virtual
 // addresses, which every 64-bit Linux CUDA context has: a device pointer already names its
 // device, so this one entry point expresses a cross-device transfer as well as a local one. When
 // the driver grants peer access and startup validates it, the copy is a direct device-to-device
@@ -18,11 +19,17 @@
 // exact UVA D2D route in either case. The collectives never allocate or copy through an explicit
 // host buffer, and callers need no peer-access branch; enable_peer_access() only reports whether
 // direct peer access was qualified.
+// Small qualified SM70 allreduces may read the peer operand directly in a sum kernel, writing
+// only their own staging. Both reads retire before either original operand is overwritten.
 //
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
 // tensor-parallel decode program uncapturable. See src/ops/common/allreduce.cu's pull_peer().
 //
+// The pairwise choreography below describes TP2. TP4 waits for every other rank's
+// inputs_ready before reading and every other rank's pull_done before overwriting
+// a source. Both routes retain the operands until all reads retire; TP4 sums in
+// global rank order so replicated residuals remain bit-identical across ranks.
 // ORDERING. Every transfer is a PULL: rank r reads the peer's source into storage that rank r
 // alone owns, on rank r's own stream. Nothing a rank owns is ever written by the peer's stream, so
 // the classic push hazard -- the peer overwriting a staging buffer that this rank has not finished
@@ -81,13 +88,16 @@
 
 #include <array>
 #include <cstddef>
+#include <span>
 
 namespace ninfer::ops {
 
 // Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
 // devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ prevent
-// direct P2P, so the function leaves peer access disabled and validates CUDA's UVA D2D fallback
-// instead. Otherwise, when both directions advertise peer access, enable them and check two
+// PCIe P2P. An active direct NVLink mesh is checked via NVML's real remote PCI endpoints and
+// does not traverse that host IOMMU; the restriction is bypassed only for this verified mesh.
+// Otherwise leave peer access disabled and validate CUDA's UVA D2D fallback instead.
+// When all directed pairs advertise peer access, enable them and check distinct
 // distinct 16 KiB patterns with the collectives' UVA D2D API on their destination compute streams.
 // Returns true only when direct peer access is enabled and both copies are exact. If direct P2P is
 // unavailable or fails qualification, it is disabled and the same UVA D2D route is qualified with
@@ -97,7 +107,8 @@ namespace ninfer::ops {
 // Call once during setup, before graph capture or concurrent inference. This function allocates
 // temporary probe buffers, synchronizes each compute stream, and releases its buffers while
 // restoring the caller's current device. Peer-access changes are context-level operations;
-// none of this setup is graph-capturable or belongs in a hot path. A non-TP2 context returns false.
+// none of this setup is graph-capturable or belongs in a hot path. A TP1 context returns false;
+// TP4 qualifies every directed device pair and requires a complete direct-peer mesh.
 bool enable_peer_access(const ExecutionContext& ec);
 
 // The reusable cross-device ordering events: two per device, created on that device with timing
@@ -115,7 +126,8 @@ bool enable_peer_access(const ExecutionContext& ec);
 // moved-from instance holds no events and must not be passed to a collective (the ops reject it).
 class PeerEvents {
 public:
-    explicit PeerEvents(const ExecutionContext& ec);
+    // direct_peer_access is the result of enable_peer_access(ec), not advertised capability.
+    PeerEvents(const ExecutionContext& ec, bool direct_peer_access);
     ~PeerEvents();
 
     PeerEvents(const PeerEvents&)            = delete;
@@ -131,49 +143,66 @@ public:
         return pull_done_[static_cast<std::size_t>(rank)];
     }
 
+    [[nodiscard]] bool direct_peer_access() const noexcept { return direct_peer_access_; }
+    [[nodiscard]] int ranks() const noexcept { return ranks_; }
+
     // False for a moved-from instance.
     [[nodiscard]] bool live() const noexcept {
-        return inputs_ready_[0] != nullptr && inputs_ready_[1] != nullptr &&
-               pull_done_[0] != nullptr && pull_done_[1] != nullptr;
+        if (ranks_ != 2 && ranks_ != 4) { return false; }
+        for (int r = 0; r < ranks_; ++r) {
+            if (inputs_ready_[r] == nullptr || pull_done_[r] == nullptr) { return false; }
+        }
+        return true;
     }
 
 private:
-    std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
-    std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
+    std::array<cudaEvent_t, kMaximumExecutionDevices> inputs_ready_{};
+    std::array<cudaEvent_t, kMaximumExecutionDevices> pull_done_{};
+    bool direct_peer_access_ = false;
+    int ranks_ = 0;
 };
 
 /**
- * Two-device summing all-reduce, in place:
+ * Summing all-reduce over two or four devices, in place:
  *
- *   ideal[i] = buffer_rank0[i] + buffer_rank1[i]   for every i,
+ *   ideal[i] = sum_r buffer_rank_r[i]   for every i,
  *
- * written back to both `buffer[0]` and `buffer[1]`, which afterwards hold the identical sum.
+ * written back to all active buffers, which afterwards hold the identical sum.
  *
  * `buffer[r]` is a contiguous BF16 tensor resident on `ec.dev[r]`; both ranks carry the same
- * shape. `staging[r]` is scratch of the same dtype and shape, also resident on `ec.dev[r]`, and
- * must not overlap `buffer[r]`; it receives the peer's contribution and its contents after the
- * call are unspecified. Rank r's stream is the only stream that ever touches `staging[r]`.
+ * shape. `staging[r]` is BF16 scratch, also resident on `ec.dev[r]`, and
+ * must not overlap `buffer[r]`; it holds either the peer contribution or the local sum, and
+ * its contents after the call are unspecified. TP2 staging has the same shape as its buffer;
+ * TP4 staging holds at least four full contributions. Rank r's stream is the only stream that ever
+ * touches `staging[r]`.
  *
  * The oracle evaluates `ideal` in FP64 from the represented BF16 inputs; the observable BF16
- * output is that value rounded once to BF16 storage, and the local combine is the qualified
- * residual_add computation body (FP32 accumulation of the two BF16 operands, one
- * round-to-nearest-even on store). The Op holds no persistent state and allocates nothing.
+ * output is that value rounded once to BF16 storage. Both DMA/local-combine and direct-peer
+ * sum routes use FP32 accumulation and one round-to-nearest-even on
+ * store. The Op holds no persistent state and allocates nothing.
  *
- * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
+ * Requires `ec.tp` in {2,4} and live events for the same rank count. Consecutive calls need no
  * host synchronization between them.
  */
-void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
+// Both spans have ec.tp entries. TP4 staging is contiguous BF16 with at least
+// 4 * buffer[r].numel() elements: the DMA route retains all contributions until
+// every source read has retired, then reduces once in rank order 0,1,2,3.
+// The independent oracle is the FP64 sum of all represented BF16 operands;
+// TP4 accumulates in FP32 and rounds only the final sum to BF16. All ranks use
+// the same association, including the direct-P2P route.
+void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
                    const ExecutionContext& ec, const PeerEvents& events);
 
 /**
- * Two-device row gather, exact (no arithmetic). The gathered axis is `ne[1]`, so each rank
+ * Row gather, exact (no arithmetic). The gathered axis is `ne[1]`, so each rank
  * contributes one contiguous block of a `[C, R]` tensor (`ne[0] == C` is the row length,
  * `ne[1] == R` the row count, `ne[2] == ne[3] == 1`):
  *
  *   destination[r][c, row] = part[0][c, row]                    for row <  part[0].ne[1]
  *   destination[r][c, row] = part[1][c, row - part[0].ne[1]]    otherwise
  *
- * for both r, so each device ends up holding the identical full image. `part[r]` is the row range
+ * This is the TP2 formula; TP4 concatenates four blocks in global rank order.
+ * Each device ends up holding the identical full image. `part[r]` is the row range
  * owned by `ec.dev[r]`: rank 0 owns the leading rows and rank 1 the trailing rows, and the two
  * counts must sum to the destination row count. `destination[r]` and `part[r]` are contiguous,
  * share one dtype, agree on `ne[0]`, live on `ec.dev[r]`, and must not overlap. A caller whose
@@ -184,10 +213,10 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
  * pulls the peer's block. The transformation is a pure relocation of storage, so it is verified by
  * exact byte comparison. The Op holds no persistent state and allocates nothing.
  *
- * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
+ * Requires `ec.tp` in {2,4} and live events for the same rank count. Consecutive calls need no
  * host synchronization between them.
  */
-void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
+void allgather_rows(std::span<const Tensor> destination, std::span<const Tensor> part,
                     const ExecutionContext& ec, const PeerEvents& events);
 
 /**
@@ -198,13 +227,14 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
  * The source lifetime edge still orders rank 1 after rank 0 has finished importing its shard,
  * so the same work buffers may be reused by the next graph round.
  */
-void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>& part,
+void gather_columns_rank0(const Tensor& destination, std::span<const Tensor> part,
                           const ExecutionContext& ec, const PeerEvents& events);
 
-// Exact one-way relocation from rank 0 to rank 1. Both tensors have the same contiguous
+// Exact relocation from rank 0 to each other active rank. Destinations are indexed by
+// rank minus one and contain ec.tp - 1 entries. All tensors have the same contiguous
 // dtype and shape. Uses the qualified UVA D2D transport and orders rank 0's next overwrite after
 // rank 1 has consumed the source, including under CUDA Graph capture.
-void broadcast_rank0(const Tensor& source, const Tensor& destination,
+void broadcast_rank0(const Tensor& source, std::span<const Tensor> destinations,
                      const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

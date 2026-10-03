@@ -111,7 +111,18 @@ with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and 
 builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
 measurements of this target. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, and `qwen3.6-35b-a3b/groupwise-int`.
+`qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
+`qwen3.6-35b-a3b/groupwise-int`.
+The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
+SM70 TP2 Text/None/MTP/DFlash. It registers the published QUASAR v3 container identity, preserves its
+256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
+controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
+This artifact's QAT/conversion quality is not established by inference smoke tests.
+The explicitly requested remote extension targets four NVLink-connected V100-SXM2 16 GB cards,
+single-request TP4 Text/MTP on Qwen3.8-27B NVFP4 and native block-128 FP8. Native FP8 preserves
+source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
+TP4 Vision/DFlash and other TP4 identities are not admitted. Operator checks on the local two
+cards do not substitute for four-card whole-model/state or end-to-end performance evidence.
 The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
 directory, 180000-token context capacity, INT8 group-64 KV, CUDA Graphs, and MTP with at most
 three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
@@ -128,7 +139,15 @@ including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 a
 The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
-One Engine owns one resident model, with one device or TP2 on the 27B package and a startup-fixed
+The explicit RAM-KV experiment is optional SM70 27B TP1/TP2 single-request Text/None/MTP.
+It stores original packed KV in a bounded RAM archive and uses lexical-256 retrieval with
+chronological resident page tables. This is approximate attention (also during long prefill),
+not full-history semantic equivalence or KVMem Q/K-vector retrieval. The default route is unchanged.
+RAM archive budget and whole-process RSS/cgroup limits are distinct; external llama.cpp results
+do not establish native NInfer performance. See docs/maintainer/paged-kv-cache.md section 15.
+
+One Engine owns one resident model, with one device, TP2, or the selected TP4 domain on the 27B
+package and a startup-fixed
 one to eight active requests. The V100X2 acceptance workload is one active request on two cards.
 The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
@@ -327,6 +346,10 @@ Keep aggregate host CPU usage below the user's approximately 85% ceiling while l
 headroom for the session. Choose build concurrency or an external process quota accordingly; this
 user constraint supersedes the inherited unrestricted-build rule. Low CPU use during CUDA waits
 does not by itself indicate throttling, and busy waiting is not a performance objective.
+For local GPU stress/benchmark campaigns, use active periods of at most approximately ten minutes
+followed by three minutes idle. Rest at completed-request boundaries, leaving enough margin for the
+next request, and rest between backend runs. Exclude cooldowns from request measurements and
+resume only missing saved cases after interruption. Do not change power limits or clocks.
 
 These are conventional project resources, not a checklist of resources every task must use:
 

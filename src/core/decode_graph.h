@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <span>
 
 namespace ninfer {
 
@@ -77,11 +78,11 @@ public:
 
     // Single-device capture: `stream` is both the origin and the only stream captured.
     void capture(cudaStream_t stream, const std::function<void()>& body);
-    // Dual-device capture: `stream` is the origin (device 0) and `peer` names device 1's stream,
-    // which is forked into the same capture for the duration of `body` and joined back before the
-    // capture ends. A null `peer.bridge` is the single-device form above.
+    // Every peer stream is enrolled into the same origin capture before body and joined before
+    // EndCapture. The active rank count is fixed for this graph's lifetime; peers have distinct
+    // devices and share one origin. An empty span is the single-device form.
     void capture(cudaStream_t stream, const std::function<void()>& body,
-                 const DecodeGraphPeerCapture& peer);
+                 std::span<const DecodeGraphPeerCapture> peers);
     [[nodiscard]] bool ready() const noexcept;
     // Node count of the captured graph, 0 when empty. Cross-device event edges are edges, not
     // nodes, so this counts real device work on BOTH devices.

@@ -74,8 +74,13 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    const bool expert_storage = binder.device_count() == 2 && options.tp == 1;
+    if (binder.device_count() != 1 && !expert_storage) {
+        throw std::invalid_argument("qwen3_6_35b_a3b accepts either one device or expert storage mode");
+    }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile,
+        detail::bind_artifact(binder, qwen3_6::startup_features(options), expert_storage)));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -112,7 +117,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
     if (execution.tp != 1) {
         throw std::invalid_argument("qwen3_6_35b_a3b has no tensor-parallel execution path");
     }
-    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, nullptr,
+    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, {},
                                                    model.impl_->weights_profile, std::move(plan),
                                                    execution);
 }

@@ -42,10 +42,16 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
-ExecutionContext::ExecutionContext(const std::vector<int>& device_ids) {
-    if (device_ids.empty() || device_ids.size() > dev.size()) {
-        throw std::runtime_error("ExecutionContext requires 1 or 2 device ids, got " +
+ExecutionContext::ExecutionContext(const std::vector<int>& device_ids)
+    : ExecutionContext(device_ids, -1) {}
+
+ExecutionContext::ExecutionContext(const std::vector<int>& device_ids, int storage_device) {
+    if (device_ids.size() != 1 && device_ids.size() != 2 && device_ids.size() != 4) {
+        throw std::runtime_error("ExecutionContext requires 1, 2 or 4 device ids, got " +
                                  std::to_string(device_ids.size()));
+    }
+    if (storage_device >= 0 && device_ids.size() != 1) {
+        throw std::runtime_error("a storage-only weight device requires tp == 1");
     }
     tp = static_cast<int>(device_ids.size());
     // Distinct ids are a correctness precondition, not a preference: every tensor-parallel op
@@ -64,15 +70,25 @@ ExecutionContext::ExecutionContext(const std::vector<int>& device_ids) {
     for (std::size_t i = 0; i < device_ids.size(); ++i) {
         dev[i].emplace(device_ids[i]); // validates existence internally
     }
-    if (tp == 2) {
+    if (storage_device >= 0) {
+        if (storage_device == device_ids.front()) {
+            throw std::runtime_error("storage device must differ from the primary device");
+        }
+        storage.emplace(storage_device);
+        if (storage->sm() != dev[0]->sm()) {
+            throw std::runtime_error(
+                "storage device must share the primary device's compute capability");
+        }
+    }
+    for (int rank = 1; rank < tp; ++rank) {
         const cudaDeviceProp& p0 = dev[0]->props;
-        const cudaDeviceProp& p1 = dev[1]->props;
+        const cudaDeviceProp& p1 = dev[rank]->props;
         if (p0.major != p1.major || p0.minor != p1.minor) {
             throw std::runtime_error(
                 "ExecutionContext requires all devices to share the same compute capability "
                 "(device " +
                 std::to_string(dev[0]->device) + " is sm_" + std::to_string(p0.major) +
-                std::to_string(p0.minor) + ", device " + std::to_string(dev[1]->device) +
+                std::to_string(p0.minor) + ", device " + std::to_string(dev[rank]->device) +
                 " is sm_" + std::to_string(p1.major) + std::to_string(p1.minor) + ")");
         }
     }

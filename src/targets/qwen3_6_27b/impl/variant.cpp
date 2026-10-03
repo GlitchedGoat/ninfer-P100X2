@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -66,6 +67,17 @@ ops::LinearPolicy text_policy(const Weight& weight) {
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
+QType tp4_projection_type(WeightsProfile profile) {
+    switch (profile) {
+    case WeightsProfile::Qwen38Nvfp4:
+        return QType::FP8_E4M3FN_ROW_BF16S;
+    case WeightsProfile::Qwen38Fp8:
+        return QType::FP8_E4M3FN_BLOCK128_BF16S;
+    default:
+        throw std::invalid_argument("TP4 text projection requires Qwen3.8 NVFP4 or native FP8");
+    }
+}
+
 std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
                                          const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
@@ -104,18 +116,23 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
 
 std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
                                        ops::LinearPolicy policy, std::int32_t first,
-                                       std::int32_t last) {
+                                       std::int32_t last, int tp) {
+    const std::int32_t intermediate = TextConfig::intermediate / tp;
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+    (void)layout.alloc(DType::BF16, {intermediate, last});
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last));
+        const auto bytes = tp == 1
+            ? ops::linear_swiglu_workspace_capacity_bytes(
+                  gate_up_qtype, 2 * intermediate, TextConfig::hidden, policy, first, last)
+            : ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
+                  gate_up_qtype, policy, first, last, tp);
+        if (bytes != 0) { (void)layout.alloc_bytes(bytes); }
     }
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+            down_qtype, TextConfig::hidden, intermediate, policy, first, last));
     }
     return layout.peak_bytes(1);
 }
@@ -337,39 +354,62 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     ops::residual_add(delta, residual, stream);
 }
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                        std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
+    if (profile == WeightsProfile::Qwen38Fp8) {
+        const auto bytes = ops::linear_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, TextConfig::mtp_attention_input_rows / tp,
+            TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
+        if (bytes) { (void)layout.alloc_bytes(bytes); }
+    }
     return layout.peak_bytes(1);
 }
 
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                 std::int32_t last) {
     validate_token_interval(first, last);
+    if (profile == WeightsProfile::Qwen38Fp8) {
+        return ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+            TextConfig::kv_size / tp, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
+    }
     return 0;
 }
 
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
+    if (profile == WeightsProfile::Qwen38Fp8) {
+        return ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+            TextConfig::query_size / tp, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
+    }
     return 0;
 }
 
-std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                                    qwen3_6::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only, first, last, tp);
+    }
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
+    case WeightsProfile::Qwen38Fp8:
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, 14336, TextConfig::hidden,
+            ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen38GgmlK:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::GGML_K, 14336, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
@@ -380,9 +420,17 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile weights_profile, int tp, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return ops::linear_add_workspace_capacity_bytes(
+            tp4_projection_type(weights_profile), TextConfig::hidden, TextConfig::query_size / tp,
+            ops::LinearPolicy::A16Only, first, last);
+    }
     switch (weights_profile) {
+    case WeightsProfile::Qwen38Fp8:
+        return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+            TextConfig::hidden, TextConfig::value_dim, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen38GgmlK:
         return ops::linear_add_workspace_capacity_bytes(
             QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
@@ -393,6 +441,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
                                                         TextConfig::query_size,
                                                         ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
                                                         first, last);
@@ -404,12 +453,19 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     throw std::logic_error("invalid 27B weights profile");
 }
 
-std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                                    qwen3_6::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
+            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only, first, last, tp);
+    }
     switch (weights_profile) {
+    case WeightsProfile::Qwen38Fp8:
+        return ops::gdn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+            16384, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen38GgmlK:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::GGML_K, 16384, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
@@ -417,6 +473,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
@@ -427,10 +484,20 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
+    WeightsProfile weights_profile, int tp, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
     std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return ops::gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only, batch_size, first,
+            last, tp);
+    }
     switch (weights_profile) {
+    case WeightsProfile::Qwen38Fp8:
+        return std::max(kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_BLOCK128_BF16S, 16384, TextConfig::hidden,
+                ops::LinearPolicy::A16Only, batch_size, first, last));
     case WeightsProfile::Qwen38GgmlK:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -443,6 +510,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
@@ -457,10 +525,21 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
+    WeightsProfile weights_profile, int tp, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
     std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+                            tp4_projection_type(weights_profile), ops::LinearPolicy::A16Only,
+                            batch_size, first, last, tp));
+    }
     switch (weights_profile) {
+    case WeightsProfile::Qwen38Fp8:
+        return std::max(kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_BLOCK128_BF16S, 16384, TextConfig::hidden,
+                ops::LinearPolicy::A16Only, batch_size, first, last));
     case WeightsProfile::Qwen38GgmlK:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -473,6 +552,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
@@ -486,12 +566,20 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     throw std::logic_error("invalid 27B weights profile");
 }
 
-std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                                     qwen3_6::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return ops::linear_add_workspace_capacity_bytes(
+            tp4_projection_type(weights_profile), TextConfig::hidden, TextConfig::value_dim / tp,
+            ops::LinearPolicy::A16Only, first, last);
+    }
     switch (weights_profile) {
+    case WeightsProfile::Qwen38Fp8:
+        return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+            TextConfig::hidden, TextConfig::value_dim, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen38GgmlK:
         return ops::linear_add_workspace_capacity_bytes(
             QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
@@ -502,6 +590,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                         TextConfig::value_dim,
                                                         ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
@@ -513,8 +602,11 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
 }
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, std::int32_t first, std::int32_t last) {
+    WeightsProfile weights_profile, int tp, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
+    if (tp == 4) {
+        return ops::gdn_gating_proj_column_parallel_workspace_capacity_bytes(first, last);
+    }
     if (weights_profile == WeightsProfile::Qwen38GgmlK) {
         return ops::linear_workspace_capacity_bytes(
             QType::GGML_K, TextConfig::gdn_value_heads, TextConfig::hidden,
@@ -524,26 +616,30 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(
                                                               TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, int tp,
                                                          qwen3_6::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen38Fp8:
+        return post_mixer_workspace_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+            QType::FP8_E4M3FN_BLOCK128_BF16S, ops::LinearPolicy::A16Only, first, last, tp);
     case WeightsProfile::Qwen38GgmlK:
         return post_mixer_workspace_bytes(QType::GGML_K, QType::GGML_K,
-                                          ops::LinearPolicy::A16Only, first, last);
+                                          ops::LinearPolicy::A16Only, first, last, tp);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
-                                          ops::LinearPolicy::A16Only, first, last);
+                                          ops::LinearPolicy::A16Only, first, last, tp);
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
-                                          last);
+                                          last, tp);
     case WeightsProfile::Qwen38Nvfp4: {
         const std::size_t nvfp4 =
-            post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
+            post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last, tp);
         const std::size_t fp8 = post_mixer_workspace_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last);
+            QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last, tp);
         return std::max(nvfp4, fp8);
     }
     }
@@ -561,17 +657,49 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
 namespace {
 
 template <class Payload, class Weights>
-std::array<const Payload*, 2> require_same_alternative(const std::array<const Weights*, 2>& w,
-                                                       const char* label) {
-    const auto* a = std::get_if<Payload>(w[0]);
-    const auto* b = std::get_if<Payload>(w[1]);
-    if (a == nullptr || b == nullptr) {
-        throw std::logic_error(std::string(label) + ": tp2 ranks disagree on weight storage form");
+std::array<const Payload*, kMaximumExecutionDevices>
+require_same_alternative(std::span<const Weights* const> w, const char* label) {
+    std::array<const Payload*, kMaximumExecutionDevices> out{};
+    for (std::size_t rank = 0; rank < w.size(); ++rank) {
+        out[rank] = std::get_if<Payload>(w[rank]);
+        if (out[rank] == nullptr) {
+            throw std::logic_error(std::string(label) + ": ranks disagree on weight storage form");
+        }
     }
-    return {a, b};
+    return out;
 }
 
-std::array<Weight, 2> pair_of(const Weight& a, const Weight& b) { return {a, b}; }
+template <class T, std::size_t N>
+auto active(const std::array<T, N>& values, const ExecutionContext& ec) {
+    return std::span(values).first(ec.tp);
+}
+
+template <class Range, class Payload>
+std::array<Weight, kMaximumExecutionDevices>
+weight_shards(const Range& payloads, Weight Payload::* member, const ExecutionContext& ec) {
+    std::array<Weight, kMaximumExecutionDevices> out{};
+    for (int rank = 0; rank < ec.tp; ++rank) { out[rank] = payloads[rank]->*member; }
+    return out;
+}
+
+template <class Weights, class Payload>
+std::array<const Payload*, kMaximumExecutionDevices>
+payload_shards(std::span<const Weights* const> weights, Payload Weights::* member) {
+    std::array<const Payload*, kMaximumExecutionDevices> out{};
+    for (std::size_t rank = 0; rank < weights.size(); ++rank) {
+        out[rank] = &(weights[rank]->*member);
+    }
+    return out;
+}
+
+std::array<std::optional<WorkspaceArena::Scope>, kMaximumExecutionDevices>
+workspace_scopes(std::span<WorkspaceArena* const> workspace) {
+    std::array<std::optional<WorkspaceArena::Scope>, kMaximumExecutionDevices> out{};
+    for (std::size_t rank = 0; rank < workspace.size(); ++rank) {
+        out[rank].emplace(workspace[rank]->scope());
+    }
+    return out;
+}
 
 // Current-device save/restore around a per-rank kernel issue. Only ONE tp2 leaf below needs it --
 // `mtp_attention_projection`, whose second stage (`ops::mtp_split_attn_in`) is a purely
@@ -595,7 +723,7 @@ private:
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDevice restore;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < ec.tp; ++rank) {
         CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
         body(rank);
     }
@@ -604,7 +732,8 @@ void for_each_rank(const ExecutionContext& ec, Body&& body) {
 // Both registered MTP codecs use A16 projections without transient Linear storage.
 void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
     if (a.qtype != b.qtype ||
-        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K)) {
+        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K &&
+         a.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S)) {
         throw std::logic_error(std::string(label) +
                                ": unsupported or inconsistent tp2 MTP weight format");
     }
@@ -615,102 +744,101 @@ void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
 
 } // namespace
 
-void Variant::attention_projection(const std::array<Tensor, 2>& hidden,
-                                   const std::array<const FullAttentionProjectionWeights*, 2>& w,
-                                   const std::array<Tensor, 2>& query,
-                                   const std::array<Tensor, 2>& gate,
-                                   const std::array<Tensor, 2>& key,
-                                   const std::array<Tensor, 2>& value, qwen3_6::TextPhase,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::attention_projection(std::span<const Tensor> hidden,
+                                   std::span<const FullAttentionProjectionWeights* const> w,
+                                   std::span<const Tensor> query,
+                                   std::span<const Tensor> gate,
+                                   std::span<const Tensor> key,
+                                   std::span<const Tensor> value, qwen3_6::TextPhase,
+                                   std::span<WorkspaceArena* const> workspace,
                                    const ExecutionContext& ec) {
     if (std::holds_alternative<SplitAttentionProjectionPayload>(*w[0])) {
         const auto split = require_same_alternative<SplitAttentionProjectionPayload>(
             w, "attention projection");
         ops::attn_input_proj_column_parallel(
-            hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->gate_value, split[1]->gate_value), query, gate, key, value,
+            hidden, active(weight_shards(split, &SplitAttentionProjectionPayload::query_key, ec), ec),
+            active(weight_shards(split, &SplitAttentionProjectionPayload::gate_value, ec), ec), query, gate, key, value,
             workspace, ec);
         return;
     }
     const auto fused =
         require_same_alternative<FusedAttentionProjectionPayload>(w, "attention projection");
     ops::attn_input_proj_column_parallel(
-        hidden, pair_of(fused[0]->query_key_gate_value, fused[1]->query_key_gate_value), query,
+        hidden, active(weight_shards(fused, &FusedAttentionProjectionPayload::query_key_gate_value, ec), ec), query,
         gate, key, value, text_policy(fused[0]->query_key_gate_value), workspace, ec);
 }
 
-void Variant::attention_output_projection(const std::array<Tensor, 2>& attention,
-                                          const std::array<Weight, 2>& weight,
-                                          const std::array<Tensor, 2>& residual,
-                                          const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
-                                          const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::attention_output_projection(std::span<const Tensor> attention,
+                                          std::span<const Weight> weight,
+                                          std::span<const Tensor> residual,
+                                          std::span<const Tensor> staging, qwen3_6::TextPhase,
+                                          std::span<WorkspaceArena* const> workspace,
                                           const ExecutionContext& ec, const ops::PeerEvents& ev) {
     ops::linear_add_row_parallel(attention, weight, residual, staging, text_policy(weight[0]),
                                  workspace, ec, ev);
 }
 
-void Variant::gdn_input_projection(const std::array<Tensor, 2>& hidden,
-                                   const std::array<const GdnProjectionWeights*, 2>& w,
-                                   const std::array<Tensor, 2>& qkv,
-                                   const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::gdn_input_projection(std::span<const Tensor> hidden,
+                                   std::span<const GdnProjectionWeights* const> w,
+                                   std::span<const Tensor> qkv,
+                                   std::span<const Tensor> output_gate, qwen3_6::TextPhase,
+                                   std::span<WorkspaceArena* const> workspace,
                                    const ExecutionContext& ec) {
     // The caller holds `z` as [head_dim, value_heads, T]; the Op wants the flat [value_dim, T],
     // exactly as the tp1 leaf above does. The shard's value_dim is read off the tensor rather than
     // assumed, so this stays correct if the head split ever changes.
-    const std::array<Tensor, 2> output_gate_flat = {
-        output_gate[0].view({output_gate[0].ne[0] * output_gate[0].ne[1], hidden[0].ne[1]}),
-        output_gate[1].view({output_gate[1].ne[0] * output_gate[1].ne[1], hidden[1].ne[1]})};
-    const std::array<const GdnInputProjectionPayload*, 2> input = {&w[0]->input_projection,
-                                                                   &w[1]->input_projection};
+    std::array<Tensor, kMaximumExecutionDevices> output_gate_flat{};
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        output_gate_flat[rank] = output_gate[rank].view(
+            {output_gate[rank].ne[0] * output_gate[rank].ne[1], hidden[rank].ne[1]});
+    }
+    const auto input = payload_shards(w, &GdnProjectionWeights::input_projection);
     if (std::holds_alternative<SplitGdnInputProjectionPayload>(*input[0])) {
         const auto split =
-            require_same_alternative<SplitGdnInputProjectionPayload>(input, "GDN input projection");
+            require_same_alternative<SplitGdnInputProjectionPayload>(active(input, ec), "GDN input projection");
         ops::gdn_input_proj_column_parallel(hidden,
-                                            pair_of(split[0]->query_key, split[1]->query_key),
-                                            pair_of(split[0]->value_z, split[1]->value_z), qkv,
-                                            output_gate_flat, ec);
+                                            active(weight_shards(split, &SplitGdnInputProjectionPayload::query_key, ec), ec),
+                                            active(weight_shards(split, &SplitGdnInputProjectionPayload::value_z, ec), ec), qkv,
+                                            active(output_gate_flat, ec), ec);
         return;
     }
     const auto fused =
-        require_same_alternative<FusedGdnInputProjectionPayload>(input, "GDN input projection");
+        require_same_alternative<FusedGdnInputProjectionPayload>(active(input, ec), "GDN input projection");
     ops::gdn_input_proj_column_parallel(
-        hidden, pair_of(fused[0]->query_key_value_z, fused[1]->query_key_value_z), qkv,
-        output_gate_flat, text_policy(fused[0]->query_key_value_z), workspace, ec);
+        hidden, active(weight_shards(fused, &FusedGdnInputProjectionPayload::query_key_value_z, ec), ec), qkv,
+        active(output_gate_flat, ec), text_policy(fused[0]->query_key_value_z), workspace, ec);
 }
 
 void Variant::gdn_input_projection_snapshot(
-    const std::array<Tensor, 2>& hidden, const std::array<const GdnProjectionWeights*, 2>& w,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_slot,
-    const std::array<Tensor, 2>& snapshot_base_slot, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
-    const std::array<const GdnInputProjectionPayload*, 2> input = {&w[0]->input_projection,
-                                                                   &w[1]->input_projection};
+    std::span<const Tensor> hidden, std::span<const GdnProjectionWeights* const> w,
+    std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,
+    std::span<const Tensor> valid_columns, std::span<const Tensor> initial_slot,
+    std::span<const Tensor> snapshot_base_slot, std::span<const Tensor> query,
+    std::span<const Tensor> key, std::span<const Tensor> value,
+    std::span<const Tensor> output_gate, qwen3_6::TextPhase,
+    std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
+    const auto input = payload_shards(w, &GdnProjectionWeights::input_projection);
     if (std::holds_alternative<SplitGdnInputProjectionPayload>(*input[0])) {
-        const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(
-            input, "GDN snapshot projection");
+        const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(active(input, ec), "GDN snapshot projection");
         ops::gdn_input_proj_conv_snapshot_column_parallel(
-            hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->value_z, split[1]->value_z), conv_weight, conv_states, valid_columns,
+            hidden, active(weight_shards(split, &SplitGdnInputProjectionPayload::query_key, ec), ec),
+            active(weight_shards(split, &SplitGdnInputProjectionPayload::value_z, ec), ec), conv_weight, conv_states, valid_columns,
             initial_slot, snapshot_base_slot, query, key, value, output_gate, workspace, ec);
         return;
     }
     const auto fused =
-        require_same_alternative<FusedGdnInputProjectionPayload>(input, "GDN snapshot projection");
+        require_same_alternative<FusedGdnInputProjectionPayload>(active(input, ec), "GDN snapshot projection");
     ops::gdn_input_proj_conv_snapshot_column_parallel(
-        hidden, pair_of(fused[0]->query_key_value_z, fused[1]->query_key_value_z), conv_weight,
+        hidden, active(weight_shards(fused, &FusedGdnInputProjectionPayload::query_key_value_z, ec), ec), conv_weight,
         conv_states, valid_columns, initial_slot, snapshot_base_slot, query, key, value,
         output_gate, text_policy(fused[0]->query_key_value_z), workspace, ec);
 }
 
-void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
-                                    const std::array<Weight, 2>& weight,
-                                    const std::array<Tensor, 2>& residual,
-                                    const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
-                                    const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::gdn_output_projection(std::span<const Tensor> hidden,
+                                    std::span<const Weight> weight,
+                                    std::span<const Tensor> residual,
+                                    std::span<const Tensor> staging, qwen3_6::TextPhase,
+                                    std::span<WorkspaceArena* const> workspace,
                                     const ExecutionContext& ec, const ops::PeerEvents& ev) {
     if (weight[0].qtype == QType::GGML_K) {
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
@@ -720,110 +848,114 @@ void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
                                  workspace, ec, ev);
 }
 
-void Variant::gdn_control_projection(const std::array<Tensor, 2>& hidden,
-                                     const std::array<const GdnProjectionWeights*, 2>& w,
-                                     const std::array<Tensor, 2>& g,
-                                     const std::array<Tensor, 2>& beta,
-                                     const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::gdn_control_projection(std::span<const Tensor> hidden,
+                                     std::span<const GdnProjectionWeights* const> w,
+                                     std::span<const Tensor> g,
+                                     std::span<const Tensor> beta,
+                                     std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec) {
     // The tp1 leaf fuses the input RMSNorm into the gating GEMM. There is no split form of the
     // fused kernel and no reason for one: the norm is replicated elementwise work over the
     // full-width residual, so the caller runs it per rank and this leaf takes the normalized
     // hidden directly.
-    const std::array<const GdnControlProjectionPayload*, 2> control = {&w[0]->control_projection,
-                                                                       &w[1]->control_projection};
-    const std::array<Tensor, 2> a_log    = {w[0]->a_log, w[1]->a_log};
-    const std::array<Tensor, 2> dt_bias  = {w[0]->dt_bias, w[1]->dt_bias};
+    const auto control = payload_shards(w, &GdnProjectionWeights::control_projection);
+    std::array<Tensor, kMaximumExecutionDevices> a_log{}, dt_bias{};
+    for (int rank = 0; rank < ec.tp; ++rank) {
+        a_log[rank] = w[rank]->a_log;
+        dt_bias[rank] = w[rank]->dt_bias;
+    }
     if (std::holds_alternative<SplitGdnControlProjectionPayload>(*control[0])) {
-        const auto split = require_same_alternative<SplitGdnControlProjectionPayload>(
-            control, "GDN control projection");
+        const auto split = require_same_alternative<SplitGdnControlProjectionPayload>(active(control, ec), "GDN control projection");
         ops::gdn_gating_proj_column_parallel(
-            hidden, pair_of(split[0]->a_projection, split[1]->a_projection),
-            pair_of(split[0]->b_projection, split[1]->b_projection), a_log, dt_bias, workspace, g,
+            hidden, active(weight_shards(split, &SplitGdnControlProjectionPayload::a_projection, ec), ec),
+            active(weight_shards(split, &SplitGdnControlProjectionPayload::b_projection, ec), ec), active(a_log, ec), active(dt_bias, ec), workspace, g,
             beta, ec);
         return;
     }
-    const auto fused = require_same_alternative<FusedGdnControlProjectionPayload>(
-        control, "GDN control projection");
+    const auto fused = require_same_alternative<FusedGdnControlProjectionPayload>(active(control, ec), "GDN control projection");
     ops::gdn_gating_proj_column_parallel(
-        hidden, pair_of(fused[0]->a_b_projection, fused[1]->a_b_projection), a_log, dt_bias,
+        hidden, active(weight_shards(fused, &FusedGdnControlProjectionPayload::a_b_projection, ec), ec), active(a_log, ec), active(dt_bias, ec),
         workspace, g, beta, ec);
 }
 
-void Variant::post_mixer(const std::array<Tensor, 2>& hidden,
-                         const std::array<const PostMixerWeights*, 2>& w,
-                         const std::array<Tensor, 2>& residual,
-                         const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
-                         const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::post_mixer(std::span<const Tensor> hidden,
+                         std::span<const PostMixerWeights* const> w,
+                         std::span<const Tensor> residual,
+                         std::span<const Tensor> staging, qwen3_6::TextPhase,
+                         std::span<WorkspaceArena* const> workspace,
                          const ExecutionContext& ec, const ops::PeerEvents& ev) {
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
-    if (w[1]->gate_up.n != w[0]->gate_up.n) {
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (w[rank]->gate_up.n != w[0]->gate_up.n) {
         throw std::logic_error("post_mixer: tp2 gate/up shards disagree on width");
+        }
     }
-    std::array<Tensor, 2> activation{};
-    std::array<WorkspaceArena::Scope, 2> scopes = {workspace[0]->scope(), workspace[1]->scope()};
-    for (std::size_t rank = 0; rank < 2; ++rank) {
+    std::array<Tensor, kMaximumExecutionDevices> activation{};
+    auto scopes = workspace_scopes(workspace);
+    for (std::size_t rank = 0; rank < ec.tp; ++rank) {
         activation[rank] =
             workspace[rank]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
     }
-    ops::linear_swiglu_column_parallel(hidden, pair_of(w[0]->gate_up, w[1]->gate_up), activation,
+    ops::linear_swiglu_column_parallel(hidden, active(weight_shards(w, &PostMixerWeights::gate_up, ec), ec), active(activation, ec),
                                        text_policy(w[0]->gate_up), workspace, ec);
-    ops::linear_add_row_parallel(activation, pair_of(w[0]->down, w[1]->down), residual, staging,
+    ops::linear_add_row_parallel(active(activation, ec), active(weight_shards(w, &PostMixerWeights::down, ec), ec), residual, staging,
                                  text_policy(w[0]->down), workspace, ec, ev);
 }
 
 void Variant::gdn_input_projection_record(
-    const std::array<Tensor, 2>& hidden, const std::array<const GdnProjectionWeights*, 2>& w,
-    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
-    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_slots,
-    const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<Tensor, 2>& output_gate, qwen3_6::TextPhase,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+    std::span<const Tensor> hidden, std::span<const GdnProjectionWeights* const> w,
+    std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,
+    std::span<const Tensor> valid_columns, std::span<const Tensor> initial_slots,
+    std::span<const Tensor> conv_record, std::span<const Tensor> query,
+    std::span<const Tensor> key, std::span<const Tensor> value,
+    std::span<const Tensor> output_gate, qwen3_6::TextPhase,
+    std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
     // The record twin of `gdn_input_projection_snapshot` above, reached only from the speculative
     // verify round: instead of snapshotting the post-round conv state it writes a per-column
     // `conv_record` that the peer's `ops::gdn_replay_fold` later folds at
     // FoldGeometry<48, 8, 24, 5120>. Everything else -- the shard extents, the weight storage
     // form, the per-rank issue -- is the snapshot leaf's.
-    const std::array<const GdnInputProjectionPayload*, 2> input = {&w[0]->input_projection,
-                                                                   &w[1]->input_projection};
+    const auto input = payload_shards(w, &GdnProjectionWeights::input_projection);
     if (std::holds_alternative<SplitGdnInputProjectionPayload>(*input[0])) {
-        const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(
-            input, "GDN record projection");
+        const auto split = require_same_alternative<SplitGdnInputProjectionPayload>(active(input, ec), "GDN record projection");
         ops::gdn_input_proj_conv_record_column_parallel(
-            hidden, pair_of(split[0]->query_key, split[1]->query_key),
-            pair_of(split[0]->value_z, split[1]->value_z), conv_weight, conv_states, valid_columns,
+            hidden, active(weight_shards(split, &SplitGdnInputProjectionPayload::query_key, ec), ec),
+            active(weight_shards(split, &SplitGdnInputProjectionPayload::value_z, ec), ec), conv_weight, conv_states, valid_columns,
             initial_slots, conv_record, query, key, value, output_gate, workspace, ec);
         return;
     }
     const auto fused =
-        require_same_alternative<FusedGdnInputProjectionPayload>(input, "GDN record projection");
+        require_same_alternative<FusedGdnInputProjectionPayload>(active(input, ec), "GDN record projection");
     ops::gdn_input_proj_conv_record_column_parallel(
-        hidden, pair_of(fused[0]->query_key_value_z, fused[1]->query_key_value_z), conv_weight,
+        hidden, active(weight_shards(fused, &FusedGdnInputProjectionPayload::query_key_value_z, ec), ec), conv_weight,
         conv_states, valid_columns, initial_slots, conv_record, query, key, value, output_gate,
         text_policy(fused[0]->query_key_value_z), workspace, ec);
 }
 
 void Variant::mtp_attention_projection(
-    const std::array<Tensor, 2>& hidden,
-    const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-    const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& gate,
-    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
-    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
-    require_mtp_shard(w[0]->packed, w[1]->packed, "MTP attention projection");
+    std::span<const Tensor> hidden,
+    std::span<const MtpAttentionProjectionWeights* const> w,
+    std::span<const Tensor> query, std::span<const Tensor> gate,
+    std::span<const Tensor> key, std::span<const Tensor> value,
+    std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->packed, w[rank]->packed, "MTP attention projection");
+    }
     const std::int32_t columns   = hidden[0].ne[1];
     const std::int32_t attn_rows = w[0]->packed.n;
-    if (hidden[1].ne[1] != columns) {
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        if (hidden[rank].ne[1] != columns) {
         throw std::logic_error("MTP attention projection: tp2 ranks disagree on token count");
+        }
     }
-    std::array<Tensor, 2> packed{};
-    std::array<WorkspaceArena::Scope, 2> scopes = {workspace[0]->scope(), workspace[1]->scope()};
-    for (std::size_t rank = 0; rank < 2; ++rank) {
+    std::array<Tensor, kMaximumExecutionDevices> packed{};
+    auto scopes = workspace_scopes(workspace);
+    for (std::size_t rank = 0; rank < ec.tp; ++rank) {
         packed[rank] = workspace[rank]->alloc(DType::BF16, {attn_rows, columns});
     }
-    ops::linear_column_parallel(hidden, pair_of(w[0]->packed, w[1]->packed), packed, ec);
+    ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::packed, ec), ec), active(packed, ec), ops::LinearPolicy::A16Only, workspace, ec);
     // `mtp_split_attn_in` selects its section boundaries from the packed row count alone, so the
     // shard geometry (rows [0,3072) Q | [3072,3584) K | [3584,6656) Gate | [6656,7168) V) needs
     // no rank argument. The resulting head indices are DEVICE-LOCAL, which is exactly what the
@@ -841,36 +973,44 @@ void Variant::mtp_attention_projection(
     });
 }
 
-void Variant::mtp_kv_projection(const std::array<Tensor, 2>& hidden,
-                                const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                const std::array<Tensor, 2>& key,
-                                const std::array<Tensor, 2>& value,
-                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext& ec) {
+void Variant::mtp_kv_projection(std::span<const Tensor> hidden,
+                                std::span<const MtpAttentionProjectionWeights* const> w,
+                                std::span<const Tensor> key,
+                                std::span<const Tensor> value,
+                                std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
     // The tp1 leaf fuses these two into one `linear_pair`; the shard's key and value row views
     // are separate blocks of the same packed shard, so at tp2 they are two column-parallel calls.
-    require_mtp_shard(w[0]->key, w[1]->key, "MTP key projection");
-    require_mtp_shard(w[0]->value, w[1]->value, "MTP value projection");
-    ops::linear_column_parallel(hidden, pair_of(w[0]->key, w[1]->key), key, ec);
-    ops::linear_column_parallel(hidden, pair_of(w[0]->value, w[1]->value), value, ec);
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->key, w[rank]->key, "MTP key projection");
+    }
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->value, w[rank]->value, "MTP value projection");
+    }
+    ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::key, ec), ec), key, ops::LinearPolicy::A16Only, workspace, ec);
+    ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::value, ec), ec), value, ops::LinearPolicy::A16Only, workspace, ec);
 }
 
-void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
-                                    const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                    const std::array<Tensor, 2>& query,
-                                    const std::array<Tensor, 2>& gate,
-                                    const std::array<WorkspaceArena*, 2>&,
+void Variant::mtp_q_gate_projection(std::span<const Tensor> hidden,
+                                    std::span<const MtpAttentionProjectionWeights* const> w,
+                                    std::span<const Tensor> query,
+                                    std::span<const Tensor> gate,
+                                    std::span<WorkspaceArena* const>,
                                     const ExecutionContext& ec) {
-    require_mtp_shard(w[0]->query, w[1]->query, "MTP query projection");
-    require_mtp_shard(w[0]->output_gate, w[1]->output_gate, "MTP gate projection");
-    ops::linear_column_parallel(hidden, pair_of(w[0]->query, w[1]->query), query, ec);
-    ops::linear_column_parallel(hidden, pair_of(w[0]->output_gate, w[1]->output_gate), gate, ec);
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->query, w[rank]->query, "MTP query projection");
+    }
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->output_gate, w[rank]->output_gate, "MTP gate projection");
+    }
+    ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::query, ec), ec), query, ec);
+    ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::output_gate, ec), ec), gate, ec);
 }
 
-void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
-                             const std::array<const MtpPostMixerWeights*, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging,
-                             const std::array<WorkspaceArena*, 2>& workspace,
+void Variant::mtp_post_mixer(std::span<const Tensor> hidden,
+                             std::span<const MtpPostMixerWeights* const> w,
+                             std::span<const Tensor> residual,
+                             std::span<const Tensor> staging,
+                             std::span<WorkspaceArena* const> workspace,
                              const ExecutionContext& ec, const ops::PeerEvents& ev) {
     // The MTP post-mixer is composed exactly the way the tp1 leaf above composes it -- separate
     // `linear` / `silu_mul` / `linear` / `residual_add`, NOT the fused linear_swiglu + linear_add
@@ -880,20 +1020,24 @@ void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
     // the same reason. `tests/ops/test_mtp_split.cpp`'s Leg A proves this exact composition at
     // tp2 -- column-parallel gate_up, a shard-local silu_mul over the shard's own gate/up halves,
     // then row-parallel down plus the all-reduce.
-    require_mtp_shard(w[0]->gate_up, w[1]->gate_up, "MTP post mixer gate/up");
-    require_mtp_shard(w[0]->down, w[1]->down, "MTP post mixer down");
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->gate_up, w[rank]->gate_up, "MTP post mixer gate/up");
+    }
+    for (int rank = 1; rank < ec.tp; ++rank) {
+        require_mtp_shard(w[0]->down, w[rank]->down, "MTP post mixer down");
+    }
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
     const std::int32_t columns            = hidden[0].ne[1];
-    std::array<Tensor, 2> gate_up{};
-    std::array<Tensor, 2> activation{};
-    std::array<Tensor, 2> delta{};
-    std::array<WorkspaceArena::Scope, 2> scopes = {workspace[0]->scope(), workspace[1]->scope()};
-    for (std::size_t rank = 0; rank < 2; ++rank) {
+    std::array<Tensor, kMaximumExecutionDevices> gate_up{};
+    std::array<Tensor, kMaximumExecutionDevices> activation{};
+    std::array<Tensor, kMaximumExecutionDevices> delta{};
+    auto scopes = workspace_scopes(workspace);
+    for (std::size_t rank = 0; rank < ec.tp; ++rank) {
         gate_up[rank]    = workspace[rank]->alloc(DType::BF16, {w[rank]->gate_up.n, columns});
         activation[rank] = workspace[rank]->alloc(DType::BF16, {shard_intermediate, columns});
         delta[rank]      = workspace[rank]->alloc(DType::BF16, {TextConfig::hidden, columns});
     }
-    ops::linear_column_parallel(hidden, pair_of(w[0]->gate_up, w[1]->gate_up), gate_up, ec);
+    ops::linear_column_parallel(hidden, active(weight_shards(w, &PostMixerWeights::gate_up, ec), ec), active(gate_up, ec), ops::LinearPolicy::A16Only, workspace, ec);
     // Each rank's gate and up halves are its OWN shard's halves -- the ShardPlan splits gate_up
     // as two independent column blocks, so rank r holds gate rows [r*I/2 ...] and up rows in the
     // matching block, and the SiLU pairing is rank-local with nothing to communicate.
@@ -903,7 +1047,7 @@ void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
                       gate_up[r].slice(0, shard_intermediate, shard_intermediate), activation[r],
                       ec.dev[rank]->stream);
     });
-    ops::linear_row_parallel(activation, pair_of(w[0]->down, w[1]->down), delta, staging, ec, ev);
+    ops::linear_row_parallel(active(activation, ec), active(weight_shards(w, &PostMixerWeights::down, ec), ec), active(delta, ec), staging, ops::LinearPolicy::A16Only, workspace, ec, ev);
     // `delta` is identical on both ranks after the collective, so the residual fold is replicated
     // elementwise work and keeps the residual bit-identical across devices.
     for_each_rank(ec, [&](int rank) {
@@ -912,13 +1056,23 @@ void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
     });
 }
 
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                              std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
+    if (profile == WeightsProfile::Qwen38Fp8) {
+        const auto bytes = std::max(
+            ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+                TextConfig::mtp_mlp_gate_up_rows / tp, TextConfig::hidden,
+                ops::LinearPolicy::A16Only, first, last),
+            ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+                TextConfig::hidden, TextConfig::intermediate / tp,
+                ops::LinearPolicy::A16Only, first, last));
+        if (bytes) { (void)layout.alloc_bytes(bytes); }
+    }
     return layout.peak_bytes(1);
 }
 

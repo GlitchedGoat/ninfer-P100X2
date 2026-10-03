@@ -123,7 +123,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                         const std::vector<std::int32_t>& drafts, std::int32_t initial_length,
                         int token_domain, ops::SamplingConfig config,
                         const std::vector<std::int32_t>& initial_token_counts,
-                        const AcceptExpected& expected) {
+                        const AcceptExpected& expected, bool greedy_only = false,
+                        int current_extent = -1) {
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
     DeviceBuffer d_logits    = to_device(logits_bits);
@@ -138,7 +139,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     GuardedDeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     GuardedDeviceBuffer d_num(sizeof(std::int32_t));
     GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
-    DeviceBuffer d_extent = to_device<std::int32_t>({k});
+    const std::vector<std::int32_t> extents{current_extent < 0 ? k : current_extent};
+    DeviceBuffer d_extent = to_device(extents);
     initialize(d_length, std::vector<std::int32_t>{initial_length});
     initialize(d_token, std::vector<std::int32_t>{-1234567});
     d_sampled.fill(0x9d);
@@ -157,13 +159,55 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::speculative_accept_greedy_drafts(
-        targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+    int failures = 0;
+    if (greedy_only) {
+        const auto invoke = [&](cudaStream_t stream) {
+            ops::speculative_accept_greedy_tokens(
+                targets, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
+                token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), stream);
+        };
+        invoke(nullptr);
+        cuda_synchronize();
+        const auto check = [&] {
+            int errors = verify_exact((label + " licensed").c_str(),
+                                       read<std::int32_t>(d_sampled, k + 1), expected.sampled);
+            errors += verify_exact((label + " count").c_str(), read<std::int32_t>(d_num, 1),
+                                    {expected.num_sampled});
+            errors += verify_exact((label + " accepted").c_str(), read<std::int32_t>(d_accepted, 1),
+                                    {expected.accepted});
+            errors += verify_exact((label + " frontier").c_str(), read<std::int32_t>(d_length, 1),
+                                    {expected.length});
+            errors += verify_exact((label + " anchor").c_str(), read<std::int32_t>(d_token, 1),
+                                    {expected.token});
+            return errors;
+        };
+        failures += check();
+        cudaStream_t stream;
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        cuda_check(cudaStreamCreate(&stream), "greedy accept stream");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "greedy accept capture");
+        invoke(stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "greedy accept capture end");
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "greedy accept graph");
+        for (int replay = 0; replay < 2; ++replay) {
+            initialize(d_length, std::vector<std::int32_t>{initial_length});
+            cuda_check(cudaGraphLaunch(executable, stream), "greedy accept replay");
+            cuda_synchronize(stream);
+            failures += check();
+        }
+        cuda_check(cudaGraphExecDestroy(executable), "greedy accept graph destroy");
+        cuda_check(cudaGraphDestroy(graph), "greedy accept definition destroy");
+        cuda_check(cudaStreamDestroy(stream), "greedy accept stream destroy");
+    } else {
+        ops::speculative_accept_greedy_drafts(
+            targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
+            token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+    }
     cuda_synchronize();
 
-    int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
-                                expected.sampled);
+    failures += verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
+                              expected.sampled);
     failures += verify_exact((label + " num sampled").c_str(), read<std::int32_t>(d_num, 1),
                              {expected.num_sampled});
     failures += verify_exact((label + " accepted").c_str(), read<std::int32_t>(d_accepted, 1),
@@ -180,6 +224,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                              from_device<std::uint16_t>(d_logits, logits_bits.size()), logits_bits);
     failures += verify_exact((label + " drafts unchanged").c_str(),
                              from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
+    failures += verify_exact((label + " extent unchanged").c_str(),
+                             from_device<std::int32_t>(d_extent, 1), extents);
     failures += verify_exact((label + " config unchanged").c_str(),
                              from_device<std::uint8_t>(d_config, sizeof(ops::SamplingConfig)),
                              config_before);
@@ -200,14 +246,14 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     failures += d_sampled.verify_guards((label + " sampled guards").c_str());
     failures += d_num.verify_guards((label + " num guards").c_str());
     failures += d_accepted.verify_guards((label + " accepted guards").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() != (greedy_only ? 0 : workspace_bytes)) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
     return failures;
 }
 
-int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
+int greedy_accept_case(int k, int accepted_count, int token_domain = 64, int extent = -1) {
     std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k));
     for (int i = 0; i <= k; ++i) {
@@ -227,10 +273,16 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
     }
     std::vector<std::int32_t> token_counts(token_domain);
     for (int i = 0; i < token_domain; ++i) token_counts[static_cast<std::size_t>(i)] = i % 5;
-    return execute_accept_case("speculative greedy K=" + std::to_string(k) +
-                                   " A=" + std::to_string(accepted_count),
-                               targets, logits, token_domain, drafts, initial_length, token_domain,
-                               ops::SamplingConfig{}, token_counts, expected);
+    const std::string label = "speculative greedy K=" + std::to_string(k) +
+                              " A=" + std::to_string(accepted_count);
+    ops::SamplingConfig config{};
+    config.presence_penalty = 0.5F;
+    config.frequency_penalty = 0.3F;
+    return execute_accept_case(label, targets, logits, token_domain, drafts, initial_length,
+                               token_domain, config, token_counts, expected, false, extent) +
+           execute_accept_case(label + " tokens-only", targets, logits, token_domain, drafts,
+                               initial_length, token_domain, config, token_counts, expected, true,
+                               extent);
 }
 
 int deterministic_sampling_case() {
@@ -339,6 +391,28 @@ int batched_sampling_workspace_stride_case() {
                              from_device<std::int32_t>(d_lengths, batch), {102, 204});
     failures += verify_exact("speculative sampling B=2 anchors",
                              from_device<std::int32_t>(d_anchors, batch), {20, 33});
+    // Reuse the batch layout with a zero-draft budget in one lane and a shortened window in
+    // the other. Greedy acceptance must not use physical drafts outside either lane's extent.
+    auto greedy_configs = to_device(std::vector<ops::SamplingConfig>(batch));
+    auto greedy_lengths = to_device<std::int32_t>({100, 200});
+    auto greedy_extents = to_device<std::int32_t>({0, 2});
+    Tensor shortened(greedy_extents.p, DType::I32, {batch});
+    Tensor frontiers(greedy_lengths.p, DType::I32, {batch});
+    ops::speculative_accept_greedy_tokens(
+        targets, draft_tensor, shortened, frontiers, anchors, licensed, counts, accepted,
+        token_domain, static_cast<const ops::SamplingConfig*>(greedy_configs.p), nullptr);
+    cuda_synchronize();
+    failures += verify_exact("speculative greedy B=2 licensed",
+                             from_device<std::int32_t>(d_licensed, columns * batch),
+                             {10, 0, 0, 0, 30, 31, 32, 0});
+    failures += verify_exact("speculative greedy B=2 counts",
+                             from_device<std::int32_t>(d_counts, batch), {1, 3});
+    failures += verify_exact("speculative greedy B=2 accepted",
+                             from_device<std::int32_t>(d_accepted, batch), {0, 2});
+    failures += verify_exact("speculative greedy B=2 frontiers",
+                             from_device<std::int32_t>(greedy_lengths, batch), {101, 203});
+    failures += verify_exact("speculative greedy B=2 anchors",
+                             from_device<std::int32_t>(d_anchors, batch), {10, 32});
     return failures;
 }
 
@@ -436,6 +510,9 @@ int main() {
     } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
+    failures += greedy_accept_case(3, 0, 64, 0);
+    failures += greedy_accept_case(3, 2, 64, 2);
+    failures += greedy_accept_case(3, 3);
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);

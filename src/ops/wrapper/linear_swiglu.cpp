@@ -1,4 +1,5 @@
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/linear/fp8/fp8_block.h"
 
 #include "core/layout.h"
 #include "ninfer/ops/silu_mul.h"
@@ -40,6 +41,19 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
+    }
+#ifdef NINFER_VOLTA_BUILD
+    if (gate_up_rows == 8704 && input_rows == 5120 &&
+        (qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16S)) {
+        return linear_swiglu_column_parallel_workspace_capacity_bytes(
+            qtype, policy, min_tokens, max_tokens, 4);
+    }
+#endif
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 SwiGLU requires A16");
+        }
+        return detail::fp8_block_swiglu_workspace_bytes(gate_up_rows, input_rows, min_tokens, max_tokens);
     }
     if (qtype == QType::GGML_K) {
         (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows, policy,
@@ -97,8 +111,14 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool w8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
+    bool quarter_shape = false;
+#ifdef NINFER_VOLTA_BUILD
+    quarter_shape = x.ne[0] == 5120 && out.ne[0] == 4352 && gate_up_weight.n == 8704 &&
+                    gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 8704 &&
+                    gate_up_weight.padded_shape[1] == 5120;
+#endif
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !w8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !w8_shape && !quarter_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -106,6 +126,26 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
     if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
+    }
+    if (gate_up_weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 SwiGLU requires A16");
+        }
+        detail::fp8_block_swiglu_launch(x, gate_up_weight, out, ws, stream);
+        return;
+    }
+    if (quarter_shape) {
+        if (gate_up_weight.qtype == QType::NVFP4) {
+            (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 TP4 linear_swiglu");
+            detail::nvfp4_linear_swiglu_dispatch_shard(x, gate_up_weight, out, policy, &ws, stream);
+            return;
+        }
+        if (gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            (void)detail::validate_fp8_weight(gate_up_weight, "fp8 TP4 linear_swiglu");
+            detail::fp8_linear_swiglu_dispatch_shard(x, gate_up_weight, out, policy, &ws, stream);
+            return;
+        }
+        throw std::invalid_argument("TP4 linear_swiglu: unsupported weight format");
     }
 
     if (gate_up_weight.qtype == QType::GGML_K) {
@@ -178,16 +218,17 @@ constexpr std::int32_t kShardInputRows    = 5120;
 constexpr std::int32_t kShardIntermediate = kShardGateUpRows / 2; // 8704
 
 void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, const Tensor& out,
-                                           LinearPolicy policy) {
+                                           LinearPolicy policy, int tp) {
     validate_policy(policy);
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu column-parallel: x/out must be BF16");
     }
     const std::int32_t t = x.ne[1];
+    const std::int32_t shard_rows = 34816 / tp;
     const bool shard_shape =
-        x.ne[0] == kShardInputRows && out.ne[0] == kShardIntermediate &&
-        w.n == kShardGateUpRows && w.k == kShardInputRows &&
-        w.padded_shape[0] == kShardGateUpRows && w.padded_shape[1] == kShardInputRows;
+        x.ne[0] == kShardInputRows && out.ne[0] == shard_rows / 2 &&
+        w.n == shard_rows && w.k == kShardInputRows &&
+        w.padded_shape[0] == shard_rows && w.padded_shape[1] == kShardInputRows;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || !shard_shape) {
         throw std::invalid_argument("linear_swiglu column-parallel: invalid tensor shape");
@@ -199,7 +240,17 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
         throw std::invalid_argument(
             "linear_swiglu column-parallel: x/out must be non-null and 16-byte aligned");
     }
+    if (tp == 4) {
+        (void)linear_swiglu_column_parallel_workspace_capacity_bytes(w.qtype, policy, t, t, tp);
+    }
 
+    if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 SwiGLU requires A16");
+        }
+        detail::validate_fp8_block_weight(w);
+        return;
+    }
     if (w.qtype == QType::GGML_K) {
         (void)linear_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, t, t);
         return;
@@ -239,21 +290,26 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
 // Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
 // validate_swiglu_column_rank_semantics. Mirrors linear.h's own validate_split_pair
 // (src/ops/linear/linear.cpp) for the column-parallel case.
-void validate_swiglu_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+void validate_swiglu_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                                 const ExecutionContext& ec) {
     detail::require_split_context(
-        ec, "linear_swiglu column-parallel: requires an ExecutionContext with two distinct devices");
-    if (x[0].ne[1] != x[1].ne[1]) {
+        ec, "linear_swiglu column-parallel: requires two or four distinct devices", ec.tp);
+    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        throw std::invalid_argument("linear_swiglu: input/weight width must equal TP width");
+    }
+    for (int rank = 1; rank < ec.tp; ++rank) {
+    if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "linear_swiglu column-parallel: both ranks must carry the same token count");
     }
-    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
+    if (w[0].qtype != w[rank].qtype || w[0].layout != w[rank].layout) {
         throw std::invalid_argument(
             "linear_swiglu column-parallel: both ranks must carry the same weight format");
     }
-    if (w[0].k != w[1].k) {
+    if (w[0].k != w[rank].k) {
         throw std::invalid_argument(
             "linear_swiglu column-parallel: both ranks must consume the same input extent K");
+    }
     }
 }
 
@@ -291,12 +347,18 @@ std::size_t q4_column_parallel_workspace_bytes(QType qtype, std::int32_t max_tok
     return layout.peak_bytes(1);
 }
 
-void issue_swiglu_column_rank(int rank, const std::array<Tensor, 2>& x,
-                              const std::array<Weight, 2>& w, std::array<Tensor, 2>& out,
-                              LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+void issue_swiglu_column_rank(int rank, std::span<const Tensor> x,
+                              std::span<const Weight> w, std::span<Tensor> out,
+                              LinearPolicy policy, std::span<WorkspaceArena* const> workspace,
                               const ExecutionContext& ec) {
     const auto slot = static_cast<std::size_t>(rank);
-    if (w[slot].qtype == QType::NVFP4) {
+    if (w[slot].qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (!workspace[slot]) {
+            throw std::invalid_argument("FP8 block128 SwiGLU needs workspace");
+        }
+        detail::fp8_block_swiglu_launch(x[slot], w[slot], out[slot], *workspace[slot],
+                                       ec.dev[slot]->stream);
+    } else if (w[slot].qtype == QType::NVFP4) {
         detail::nvfp4_linear_swiglu_dispatch_shard(x[slot], w[slot], out[slot], policy,
                                                    workspace[slot], ec.dev[slot]->stream);
     } else if (w[slot].qtype == QType::FP8_E4M3FN_ROW_BF16S) {
@@ -311,21 +373,31 @@ void issue_swiglu_column_rank(int rank, const std::array<Tensor, 2>& x,
 
 std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                     std::int32_t min_tokens,
-                                                                    std::int32_t max_tokens) {
+                                                                    std::int32_t max_tokens, int tp) {
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument(
             "linear_swiglu column-parallel workspace: invalid token interval");
     }
+    if (tp != 2 && tp != 4) {
+        throw std::invalid_argument("linear_swiglu workspace: TP width must be two or four");
+    }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("FP8 block128 SwiGLU requires A16");
+        }
+        return detail::fp8_block_swiglu_workspace_bytes(34816 / tp, 5120, min_tokens, max_tokens);
+    }
     if (qtype == QType::NVFP4) {
         return detail::nvfp4_linear_swiglu_shard_workspace_capacity_bytes(policy, min_tokens,
-                                                                          max_tokens);
+                                                                          max_tokens, tp);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return detail::fp8_linear_swiglu_shard_workspace_capacity_bytes(policy, min_tokens,
-                                                                         max_tokens);
+                                                                         max_tokens, tp);
     }
     if (qtype == QType::Q4G64_F16S || qtype == QType::GGML_K) {
+        if (tp != 2) { throw std::invalid_argument("Q4/GGML_K SwiGLU admits only TP2"); }
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument(
                 "linear_swiglu column-parallel workspace: Q4 admits only A16");
@@ -335,17 +407,21 @@ std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, 
     throw std::invalid_argument("linear_swiglu column-parallel workspace: unsupported weight format");
 }
 
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, LinearPolicy policy,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void linear_swiglu_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                                   std::span<const Tensor> out, LinearPolicy policy,
+                                   std::span<WorkspaceArena* const> workspace,
                                    const ExecutionContext& ec) {
     validate_swiglu_split_pair(x, w, ec);
-    // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
-    std::array<Tensor, 2> destination{out[0], out[1]};
-    for (std::size_t slot = 0; slot < 2; ++slot) {
-        validate_swiglu_column_rank_semantics(x[slot], w[slot], destination[slot], policy);
+    if (out.size() != x.size() || workspace.size() != x.size()) {
+        throw std::invalid_argument("linear_swiglu: output/workspace width must equal TP width");
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    // Validate every rank before enqueueing any work. The fixed host views allocate nothing.
+    std::array<Tensor, 4> destination{};
+    for (std::size_t slot = 0; slot < x.size(); ++slot) {
+        destination[slot] = out[slot];
+        validate_swiglu_column_rank_semantics(x[slot], w[slot], destination[slot], policy, ec.tp);
+    }
+    for (int rank = 0; rank < ec.tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, out[slot].data,
@@ -357,9 +433,11 @@ void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::ar
     });
 }
 
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, const ExecutionContext& ec) {
-    linear_swiglu_column_parallel(x, w, out, LinearPolicy::A16Only, {nullptr, nullptr}, ec);
+void linear_swiglu_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                                   std::span<const Tensor> out, const ExecutionContext& ec) {
+    const std::array<WorkspaceArena*, 4> workspace{};
+    linear_swiglu_column_parallel(x, w, out, LinearPolicy::A16Only,
+                                  std::span(workspace).first(ec.tp), ec);
 }
 
 } // namespace ninfer::ops

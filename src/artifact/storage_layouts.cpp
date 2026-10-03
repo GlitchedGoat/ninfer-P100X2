@@ -131,6 +131,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return "FP8_E4M3FN_BLOCK128_BF16S";
     case NumericFormat::GGML_K:
         return "GGML_K";
     }
@@ -139,6 +141,8 @@ std::string_view format_name(NumericFormat format) noexcept {
 
 std::string_view layout_name(StorageLayout layout) noexcept {
     switch (layout) {
+    case StorageLayout::BlockScaleM128K128V1:
+        return "blockscale-m128-k128-v1";
     case StorageLayout::ContiguousLeV1:
         return "contiguous-le-v1";
     case StorageLayout::RowSplitK128V1:
@@ -206,6 +210,9 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        return fp8_block_geometry(format, shape).encoded_bytes;
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -492,6 +499,20 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
         append_row_plane_copies(out, planes, rows, 1);
         return out;
     }
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        const auto count = validate_row_ranges(rows, shape[0], 128);
+        const auto parent = fp8_block_geometry(format, shape);
+        const std::array<std::uint64_t, 2> shard_shape{count, shape[1]};
+        const auto shard = fp8_block_geometry(format, shard_shape);
+        out.encoded_bytes = shard.encoded_bytes;
+        const std::array<SlicePlane, 1> code{SlicePlane{0, 0, shape[1]}};
+        append_row_plane_copies(out, code, rows, 1);
+        const std::array<SlicePlane, 1> scale{
+            SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset,
+                       parent.column_blocks * 2}};
+        append_row_plane_copies(out, scale, rows, 128);
+        return out;
+    }
     throw ArtifactError("unknown tensor layout");
 }
 
@@ -615,7 +636,36 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
                                        shard.scale_plane_bytes});
         return out;
     }
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        require_slice(columns.begin % 128 == 0 && columns.count % 128 == 0,
+                      "blockscale-m128-k128-v1 column slices require whole 128-column blocks");
+        const auto parent = fp8_block_geometry(format, shape);
+        const std::array<std::uint64_t, 2> shard_shape{rows, columns.count};
+        const auto shard = fp8_block_geometry(format, shard_shape);
+        out.encoded_bytes = shard.encoded_bytes;
+        const std::array<SlicePlane, 1> code{SlicePlane{0, 0, 1}};
+        append_column_plane_copies(out, code, rows, columns.begin, parent.columns,
+                                   columns.count, columns.count);
+        const std::array<SlicePlane, 1> scale{
+            SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset, 2}};
+        append_column_plane_copies(out, scale, parent.row_blocks, columns.begin / 128,
+                                   parent.column_blocks, shard.column_blocks, shard.column_blocks);
+        return out;
+    }
     throw ArtifactError("unknown tensor layout");
+}
+
+Fp8BlockGeometry fp8_block_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_BLOCK128_BF16S || shape.size() != 2 ||
+        shape[0] == 0 || shape[1] == 0 || shape[0] % 128 != 0 || shape[1] % 128 != 0) {
+        throw ArtifactError("blockscale-m128-k128-v1 requires block-128 FP8 and positive N,K multiples of 128");
+    }
+    const auto codes = checked_mul(shape[0], shape[1], "FP8 block code bytes");
+    const auto scales = checked_mul(checked_mul(shape[0] / 128, shape[1] / 128,
+                                              "FP8 scale blocks"), 2, "FP8 scale bytes");
+    const auto offset = align_up(codes, kTensorAlignment, "FP8 scale offset");
+    return {shape[0], shape[1], shape[0] / 128, shape[1] / 128, offset, scales,
+            checked_add(offset, scales, "FP8 payload bytes")};
 }
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {

@@ -87,8 +87,9 @@ void merge_argmax_shards(const Tensor& values, const Tensor& indices, Tensor& ou
                          std::int32_t first_shard_rows, cudaStream_t stream) {
     constexpr const char* op = "merge_argmax_shards";
     if (values.dtype != DType::FP32 || indices.dtype != DType::I32 || out.dtype != DType::I32 ||
-        values.ne[0] != 2 || values.ne[1] <= 0 || values.ne[2] != 1 || values.ne[3] != 1 ||
-        indices.ne[0] != 2 || indices.ne[1] != values.ne[1] || indices.ne[2] != 1 ||
+        (values.ne[0] != 2 && values.ne[0] != 4) || values.ne[1] <= 0 ||
+        values.ne[2] != 1 || values.ne[3] != 1 ||
+        indices.ne[0] != values.ne[0] || indices.ne[1] != values.ne[1] || indices.ne[2] != 1 ||
         indices.ne[3] != 1 || out.ne[0] != values.ne[1] || out.ne[1] != 1 || out.ne[2] != 1 ||
         out.ne[3] != 1 || !values.is_contiguous() || !indices.is_contiguous() ||
         !out.is_contiguous() || values.data == nullptr || indices.data == nullptr ||

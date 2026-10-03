@@ -73,7 +73,8 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     // full-formula oracle practical at large registered T boundaries without adopting any
     // production staging or reduction behavior.
     const bool native_float_weight =
-        profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16S;
+        profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+        profile.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S;
     const float dense_scale =
         profile.qtype == QType::Q4G64_F16S ? 1.25e-4F : (native_float_weight ? 1.0e-3F : 1.0e-5F);
     for (std::int32_t column = 0; column < profile.input_rows; ++column) {
@@ -221,11 +222,14 @@ void validate_profile(const Profile& profile) {
                     profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool w8 = profile.qtype == QType::W8G32_F16S && profile.gate_up_rows == 12288 &&
                     profile.input_rows == 2048 && profile.output_rows == 6144;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
-                       profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
-                     profile.gate_up_rows == 34816 && profile.input_rows == 5120 &&
-                     profile.output_rows == 17408;
+    bool native_shape = profile.gate_up_rows == 34816 && profile.output_rows == 17408;
+#ifdef NINFER_VOLTA_BUILD
+    native_shape = native_shape || (profile.gate_up_rows == 8704 && profile.output_rows == 4352);
+#endif
+    const bool nvfp4 = profile.qtype == QType::NVFP4 && native_shape && profile.input_rows == 5120;
+    const bool fp8 = (profile.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+                      profile.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) &&
+                     native_shape && profile.input_rows == 5120;
     if ((!q4 && !w8 && !nvfp4 && !fp8) || profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
@@ -330,15 +334,18 @@ int run_profile(std::string_view label, const Profile& profile,
 int run_column_parallel_profile(std::string_view label, const Profile& shard_profile,
                                 std::span<const std::int32_t> token_cases) {
     Profile parent_profile = shard_profile;
-    parent_profile.gate_up_rows *= 2;
-    parent_profile.output_rows *= 2;
+    const int tp = 34816 / shard_profile.gate_up_rows;
+    if (tp != 2 && tp != 4) { throw std::invalid_argument("LinearSwiGLU split: invalid width"); }
+    parent_profile.gate_up_rows *= tp;
+    parent_profile.output_rows *= tp;
     validate_profile(parent_profile);
     if (token_cases.empty()) { throw std::invalid_argument("LinearSwiGLU split: no token cases"); }
     if (!cuda_available()) { return 77; }
     int devices = 0;
     cuda_check(cudaGetDeviceCount(&devices), "count devices");
-    if (devices < 2) { return 77; }
-    const ExecutionContext ec({0, 1});
+    if (devices < tp) { return 77; }
+    const std::array ids{0, 1, 2, 3};
+    const ExecutionContext ec{std::vector<int>(ids.begin(), ids.begin() + tp)};
     const std::int32_t maximum_tokens = token_cases.back();
     const auto policy = ops::LinearPolicy::A16Only;
     if (shard_profile.activation_compute != ActivationCompute::A16) {
@@ -353,10 +360,10 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
         std::unique_ptr<test::GuardedDeviceBuffer> output;
         std::unique_ptr<WorkspaceArena> workspace;
     };
-    std::array<Rank, 2> ranks;
+    std::array<Rank, 4> ranks;
     const std::size_t capacity = ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
-        shard_profile.qtype, policy, 1, maximum_tokens);
-    for (int rank = 0; rank < 2; ++rank) {
+        shard_profile.qtype, policy, 1, maximum_tokens, tp);
+    for (int rank = 0; rank < tp; ++rank) {
         cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
         auto& data = ranks[rank];
         Profile profile = shard_profile;
@@ -380,11 +387,11 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
     }
     int failures = 0;
     for (const auto tokens : token_cases) {
-        std::array<Tensor, 2> x, output;
-        std::array<Weight, 2> weights;
-        std::array<WorkspaceArena*, 2> workspace;
+        std::array<Tensor, 4> x, output;
+        std::array<Weight, 4> weights;
+        std::array<WorkspaceArena*, 4> workspace;
         const std::size_t elements = checked_elements(shard_profile.output_rows, tokens, "split");
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < tp; ++rank) {
             cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
             auto& data = ranks[rank];
             data.output = std::make_unique<test::GuardedDeviceBuffer>(elements * 2);
@@ -398,10 +405,12 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
             workspace[rank] = data.workspace.get();
             cuda_check(cudaDeviceSynchronize(), "retire split staging");
         }
-        ops::linear_swiglu_column_parallel(x, weights, output, policy, workspace, ec);
+        ops::linear_swiglu_column_parallel(std::span(x).first(tp), std::span(weights).first(tp),
+                                          std::span(output).first(tp), policy,
+                                          std::span(workspace).first(tp), ec);
         const std::size_t exact = ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
-            shard_profile.qtype, policy, tokens, tokens);
-        for (int rank = 0; rank < 2; ++rank) {
+            shard_profile.qtype, policy, tokens, tokens, tp);
+        for (int rank = 0; rank < tp; ++rank) {
             cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
             cuda_check(cudaStreamSynchronize(ec.dev[rank]->stream), "complete split SwiGLU");
             auto& data = ranks[rank];
@@ -416,7 +425,7 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
             }
         }
     }
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < tp; ++rank) {
         cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
         auto& data = ranks[rank];
         failures += verify_unchanged(label, *data.weight, data.packed.payload.data(),

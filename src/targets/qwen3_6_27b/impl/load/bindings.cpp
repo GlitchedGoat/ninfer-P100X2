@@ -44,9 +44,12 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    case WeightsProfile::Qwen38Fp8:
+        return NumericFormat::BF16;
     case WeightsProfile::Qwen38GgmlK:
         return NumericFormat::GGML_K;
     }
@@ -145,6 +148,17 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
+    if (block.layout == QuantLayout::BlockScale128 && row_begin >= 0 && row_count > 0 &&
+        row_begin + row_count <= block.n && row_begin % 128 == 0 && row_count % 128 == 0) {
+        Weight out = block;
+        out.qdata = static_cast<const std::byte*>(block.qdata) +
+                    static_cast<std::size_t>(row_begin) * block.k;
+        out.scales = static_cast<const std::byte*>(block.scales) +
+                     static_cast<std::size_t>(row_begin / 128) * (block.k / 128) * 2;
+        out.n = out.shape[0] = out.padded_shape[0] = row_count;
+        out.scale_ne[1] = row_count / 128;
+        return out;
+    }
     if (block.layout == QuantLayout::Contiguous && block.qtype == QType::BF16_CTRL &&
         row_begin >= 0 && row_count > 0 && row_begin + row_count <= block.n) {
         Weight out = block;
@@ -219,10 +233,16 @@ load_attention_projection(const FullAttentionPlan& plan,
         };
     }
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
-    return FusedAttentionProjectionPayload{
+    FusedAttentionProjectionPayload out{
         .query_key_gate_value =
             materialized_weight(materialized, fused.query_key_gate_value, 14336 / tp, 5120, device),
     };
+#ifdef NINFER_VOLTA_BUILD
+    if (out.query_key_gate_value.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.query_key_gate_value);
+    }
+#endif
+    return out;
 }
 
 GdnInputProjectionPayload
@@ -237,10 +257,16 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
         };
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
-    return FusedGdnInputProjectionPayload{
+    FusedGdnInputProjectionPayload out{
         .query_key_value_z =
             materialized_weight(materialized, fused.query_key_value_z, 16384 / tp, 5120, device),
     };
+#ifdef NINFER_VOLTA_BUILD
+    if (out.query_key_value_z.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.query_key_value_z);
+    }
+#endif
+    return out;
 }
 
 GdnControlProjectionPayload
@@ -385,8 +411,17 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
-void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k) {
-    const NumericFormat matrix_format = ggml_k ? NumericFormat::GGML_K : NumericFormat::FP8_E4M3FN_ROW_BF16S;
+void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out,
+                                  NumericFormat matrix_format) {
+    const bool ggml_k = matrix_format == NumericFormat::GGML_K;
+    const bool full_nvfp4 = matrix_format == NumericFormat::NVFP4;
+    const auto bind_projection = [&](const std::string& name, std::int32_t rows,
+                                      std::int32_t columns, const std::string& divisor) {
+        return full_nvfp4 ? bind_nvfp4_weight(binder, name, rows, columns, divisor)
+                          : bind_weight(binder, name, matrix_format,
+                              {static_cast<std::uint64_t>(rows),
+                               static_cast<std::uint64_t>(columns)});
+    };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -395,15 +430,17 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
-                .query_key_gate_value = bind_weight(
-                    binder, prefix + "attention/query_key_gate_value", matrix_format, {14336, 5120}),
+                .query_key_gate_value = bind_projection(
+                    prefix + "attention/query_key_gate_value", 14336, 5120,
+                    prefix + "attention/input_projection/input_scale_divisor"),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output =
-                bind_weight(binder, prefix + "attention/output", matrix_format, {5120, 6144});
+                bind_projection(prefix + "attention/output", 5120, 6144,
+                    prefix + "attention/output_projection/input_scale_divisor");
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -417,15 +454,17 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", matrix_format, {16384, 5120}),
+                    bind_projection(prefix + "gdn/query_key_value_z", 16384, 5120,
+                        prefix + "gdn/input_projection/input_scale_divisor"),
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", matrix_format, {5120, 6144});
+            target.gdn.output = bind_projection(prefix + "gdn/output", 5120, 6144,
+                prefix + "gdn/output_projection/input_scale_divisor");
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (!ggml_k && layer < 56) {
+        if (full_nvfp4 || (matrix_format == NumericFormat::FP8_E4M3FN_ROW_BF16S && layer < 56)) {
             target.mlp.gate_up =
                 bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
                                   prefix + "mlp/gate_up_projection/input_scale_divisor");
@@ -885,8 +924,27 @@ ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config,
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features, int tp) {
-    if (tp < 1 || tp > static_cast<int>(artifact::kMaximumDevices)) {
-        throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2");
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2 or 4");
+    }
+    if (tp == 4 && weights_profile != WeightsProfile::Qwen38Nvfp4 &&
+        weights_profile != WeightsProfile::Qwen38Fp8) {
+        throw std::invalid_argument("TP4 requires Qwen3.8-27B NVFP4 or native FP8");
+    }
+    const bool native_fp8 = weights_profile == WeightsProfile::Qwen38Fp8;
+    const bool quasar = weights_profile == WeightsProfile::Qwen38QuasarNvfp4;
+    if (quasar && (tp != 2 || features.vision)) {
+        throw std::invalid_argument("qwen3.8-27b/quasar-nvfp4 supports TP2 Text/None/MTP/DFlash only");
+    }
+    if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
+        throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");
+    }
+#ifndef NINFER_VOLTA_BUILD
+    if (quasar) { throw std::invalid_argument("QUASAR currently requires SM70"); }
+    if (tp == 4 || native_fp8) { throw std::invalid_argument("27B TP4 currently requires SM70"); }
+#endif
+    if (tp == 4 && features.dflash()) {
+        throw std::invalid_argument("qwen3_6_27b: TP4 does not support DFlash");
     }
     // The binder's arena count and the shard map's device count are two halves of one decision.
     // If they disagree, nothing downstream notices: a tp2 map on a one-device binder would place
@@ -919,6 +977,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (ggml_k) {
         out.draft_format = NumericFormat::GGML_K;
         out.mtp_format = NumericFormat::GGML_K;
+        out.mtp_stem_format = NumericFormat::GGML_K;
+    }
+    if (native_fp8) {
+        out.draft_format = NumericFormat::BF16;
+        out.mtp_format = NumericFormat::FP8_E4M3FN_BLOCK128_BF16S;
+        out.mtp_stem_format = NumericFormat::BF16;
     }
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
@@ -933,10 +997,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_nvfp4_text_layers(binder, out);
         break;
     case WeightsProfile::Qwen38Nvfp4:
-        bind_qwen38_fused_text_layers(binder, out, false);
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::FP8_E4M3FN_ROW_BF16S);
+        break;
+    case WeightsProfile::Qwen38QuasarNvfp4:
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::NVFP4);
+        break;
+    case WeightsProfile::Qwen38Fp8:
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::FP8_E4M3FN_BLOCK128_BF16S);
         break;
     case WeightsProfile::Qwen38GgmlK:
-        bind_qwen38_fused_text_layers(binder, out, true);
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::GGML_K);
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
@@ -961,7 +1031,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
     out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", out.mtp_format, {5120, 10240});
+        bind_mtp("mtp/input_projection", out.mtp_stem_format, {5120, 10240});
     out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
     out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
     out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
@@ -989,7 +1059,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         throw std::invalid_argument("qwen3.8-27b: --spec dflash requires the DFlash2 package in the artifact");
     }
     if (has_dflash2) {
-        out.dflash.projection_format = weights_profile == WeightsProfile::Qwen38Nvfp4
+        out.dflash.projection_format = (weights_profile == WeightsProfile::Qwen38Nvfp4 || quasar)
                                             ? NumericFormat::W8G32_F16S : NumericFormat::BF16;
         const artifact::TensorPlacement dflash_placement =
             features.dflash() ? artifact::TensorPlacement::Device
@@ -1039,7 +1109,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                         : artifact::TensorPlacement::ValidateOnly;
     if (ggml_k) {
         binder.validate_unconsumed_matching("vision/gguf/");
-    } else {
+    } else if (!native_fp8) {
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
@@ -1060,14 +1130,18 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  int tensor_parallel)
     : backing(std::move(materialized)), tp(tensor_parallel) {
-    if (tp != 1 && tp != 2) { throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2"); }
+    if (tp != 1 && tp != 2 && tp != 4) {
+        throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2 or 4");
+    }
     if (tp > backing.device_count()) {
         throw std::invalid_argument("qwen3_6_27b: tp exceeds the materialized device count");
     }
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     build_device_view(plan, 0, runtime);
-    if (tp == 2) { build_device_view(plan, 1, runtime_peer.emplace()); }
+    for (int rank = 1; rank < tp; ++rank) {
+        build_device_view(plan, rank, runtime_peers[rank - 1].emplace());
+    }
 }
 
 // Builds `device`'s own model view. At tp == 1 this is the whole model on device 0; at tp == 2
@@ -1109,6 +1183,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                               NumericFormat::BF16, {256}, device);
             target.output = materialized_weight(backing, source.attention.output, 5120, 6144 / tp,
                                                 device);
+#ifdef NINFER_VOLTA_BUILD
+            if (target.output.qtype == QType::NVFP4) {
+                ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(target.output);
+            }
+#endif
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.post_mixer = load_mlp(source.mlp, backing, tp, device);
@@ -1132,6 +1211,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                         NumericFormat::BF16, {128}, device);
             target.output =
                 materialized_weight(backing, source.gdn.output, 5120, 6144 / tp, device);
+#ifdef NINFER_VOLTA_BUILD
+            if (target.output.qtype == QType::NVFP4) {
+                ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(target.output);
+            }
+#endif
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.post_mixer = load_mlp(source.mlp, backing, tp, device);
@@ -1176,7 +1260,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         //   * every norm is replicated: full copy per device, only the `device` argument moves.
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, plan.mtp_format, 5120, 10240 / tp,
+            backing, plan.mtp.input_projection, plan.mtp_stem_format, 5120, 10240 / tp,
             device);
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
                                                              NumericFormat::BF16, {5120}, device);

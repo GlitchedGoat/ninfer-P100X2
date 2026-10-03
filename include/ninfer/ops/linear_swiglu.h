@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 
@@ -163,7 +164,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
  * function reports their nonzero capacity. Invalid formats, policies, or intervals throw.
  */
 [[nodiscard]] std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(
-    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens, int tp);
 
 /**
  * @brief Column-parallel (output-split) linear_swiglu across two devices.
@@ -181,9 +182,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
  * that need none; Q4G64_F16S and GGML_K require an arena for their projected plane.
  * @param[in] ec Execution context holding exactly two distinct devices.
  */
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, LinearPolicy policy,
-                                   const std::array<WorkspaceArena*, 2>& workspace,
+void linear_swiglu_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                                   std::span<const Tensor> out, LinearPolicy policy,
+                                   std::span<WorkspaceArena* const> workspace,
                                    const ExecutionContext& ec);
 
 /**
@@ -191,7 +192,7 @@ void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::ar
  * profiles whose capacity query returns zero. Use the policy-bearing overload with an allocated
  * arena for every route requiring scratch, including Volta NVFP4 and wide row-scaled FP8.
  */
-void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                                   const std::array<Tensor, 2>& out, const ExecutionContext& ec);
+void linear_swiglu_column_parallel(std::span<const Tensor> x, std::span<const Weight> w,
+                                   std::span<const Tensor> out, const ExecutionContext& ec);
 
 } // namespace ninfer::ops

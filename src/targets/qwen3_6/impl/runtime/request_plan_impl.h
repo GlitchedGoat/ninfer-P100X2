@@ -118,6 +118,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache() != nullptr) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
+    if (ram_kv.gpu_tokens != 0) {
+        base->text_kv_page_entitlement = decoder->text_kv.pool().page_group_count();
+        base->backend_kv_page_entitlement = decoder->mtp_cache() != nullptr
+            ? std::min(decoder->mtp_cache()->pool().page_group_count(), pages_for_tokens(capacity)) : 0U;
+    }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,
         .main_kv_pages    = base->text_kv_page_entitlement,

@@ -34,6 +34,14 @@ bool is_17408_family(std::int32_t input_rows) { return input_rows == 17408 || in
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
+#ifdef NINFER_VOLTA_BUILD
+    if (tokens > 0 && output_rows == 5120 && (input_rows == 1536 || input_rows == 4352)) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("nvfp4 TP4 linear_add admits only SM70 A16");
+        }
+        return Nvfp4LinearAddRoute::LinearThenAdd;
+    }
+#endif
     if (tokens <= 0 || output_rows != 5120 ||
         !(is_6144_family(input_rows) || is_17408_family(input_rows))) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");

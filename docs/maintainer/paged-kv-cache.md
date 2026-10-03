@@ -27,7 +27,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ### 1.1 Non-goals
 
-- request preemption、swap、KV offload 或跨 GPU storage；
+- request preemption、swap 或跨 GPU storage；默认完整注意力路径不 offload，显式 RAM-KV 实验见 §15；
 - active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
 - arbitrary longest-common-prefix reuse；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
@@ -107,7 +107,7 @@ selected speculative backend off、MTP 或 DFlash
 用户配置，而由 resolved Main capacity、selected backend、`max_concurrency` 和 exact target frontier
 contract 唯一导出。
 
-Planner 将 Main contract 归一化为 physical page capacity：
+默认完整注意力 Planner 将 Main contract 归一化为 physical page capacity（RAM-KV 例外见 §15）：
 
 ```text
 L     = ceil(S / P_main)
@@ -1445,4 +1445,41 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 - route-private staging、workspace representation 和 reduction decomposition。
 
 改变 `P`、pool grouping、page ID model 或 closed pool orders 都是 architecture contract 变更，不属于
-kernel tuning。任何实现都不能在 kernel 内暗中建立第三套 storage contract。
+ kernel tuning。任何实现都不能在 kernel 内暗中建立第三套 storage contract。
+
+## 15. Optional native RAM-KV experiment
+
+`EngineOptions.ram_kv.gpu_tokens>0` 显式启用近似模式，默认关闭。首版是 training-free **lexical
+retrieval**，不是外部 KVMem 的 Q/K mean-vector 检索移植。仅支持 SM70 的 27B、TP1/TP2、单请求
+Text/None/MTP；Vision、DFlash、TP4、35B-A3B 不支持此模式，其默认路径不变。
+
+逻辑容量仍为 `max_context`。`kv_capacity` 必须显式等于 GPU window；此时 Main 的最小/最大 physical
+page count 均为 `window/64`，不再要求 `kv_capacity>=max_context`。window 必须为 64 的倍数、至少
+`prefill_chunk+8192`，且不超过逻辑容量。MTP 按原有 draft lead 增加 physical headroom，request
+entitlement 不超过其 logical page capacity。GPU workspace 同样按 resident attention ceiling 规划。
+
+每个 allocation 独占一个匿名 RAM archive，按 actual K/V/code/scale planes 规划，不为 GDN 层分配
+虚构 KV。保存/恢复是原始 packed bytes 的逐页复制；不反量化、不重新量化。预算
+`ram_kv.budget_bytes` 检查全部 ranks 的最大 archive bytes，默认十进制 32 GB，**不是进程 RSS
+限制**；整个服务器的硬预算需另用 cgroup，评测工具设置 MemoryMax=32000000000、swap=0。
+
+Family 用最后 user query 的 bounded token overlap、document-frequency 权重对 256-token 块排序。
+Core 仅消费 page ranking，优先保留全部当前 append pages、最近 4096 tokens、512-token sink，随后
+按排序填充窗口。每个 execution unit 前更新；相同页集合不搬移 resident payload，不在 decode
+graph 中保存 host archive pointers。新 query 可以从 RAM 重新调入冷页。Prefill 超过窗口时也会淘汰，
+因此它不是只改变 decode 的完整语义缓存。
+
+写表继续用 original logical page -> physical page；`read_indices` 将 original logical page 映射到
+chronological resident index，`read_tables` 将其映射到 physical page。GQA 的私有 I32 position remap
+只用于 KV 寻址/因果遮罩；已计算的 Q/K 和 RoPE 保持 original positions。排序保证 compact key<=query
+等价于选中集合内 original key<=query，未选中的 key 不参与 softmax。所有 query/write pages 必须
+驻留，metadata 在执行期间冻结。A2 原始写入和 A1 compact 写入指向同一 physical bytes。
+
+Main/MTP/peer archives 各自拥有，页操作同序执行。MTP provisional tail 受原始 token frontier 遮罩，
+回滚按 logical extent 截断，不把 resident page count 当作 logical frontier。Prefix reuse 仍要求完整
+GDN continuation checkpoint；近似模式复用已有近似状态，不保证与新 query ranking 的 cold rerun
+一致。不能用 KV 字节无损、identity-window parity 或九项 QA 正确声称普遍不降智。
+
+资格检查包括 exact code/scale eviction/reload、FP64 selected-key attention oracle、原始因果位置与
+future-column masking、真实 Engine Text/MTP/prefix。长测结果按实际占用、窗口、committed decode、
+prefill、缓存命中、质量和整进程内存分别报告；外部 llama.cpp 结果不是原生实现的速度证据。

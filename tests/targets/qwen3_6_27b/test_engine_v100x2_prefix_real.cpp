@@ -2,7 +2,7 @@
 // Defaults to optimized MTP3; NINFER_V100X2_SPEC=dflash selects full-head DFlash7.
 // Exact token/state replay is the behavioral oracle; the independent numerical
 // Op oracles live in the GGML_K, GDN, and attention tests. Prefix vs cold prefill
-// uses exact greedy output except resident exact-frontier and normalized-response cold comparisons:
+// uses exact replay with an equivalent prefill partition. Cold comparisons can differ:
 // cold prefill changes the BF16 GEMM/GDN grouping of decoded tokens and suffix chunks.
 // Its first divergent choice is checked at the common history against fresh
 // teacher-forced target logits and the existing TP2 0.5-logit near-tie bound.
@@ -44,8 +44,8 @@ void require(bool condition, const std::string& message) {
 ninfer::EngineOptions engine_options(const char* artifact, bool graphs) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
-    options.tp = 2;
-    options.devices = {0, 1};
+    options.tp = v100x2_test::tp();
+    options.devices = v100x2_test::devices();
     options.max_context = kCapacity;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(kCapacity);
     options.prefill_chunk = 256;
@@ -300,7 +300,18 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
             "partial-terminal append resumed uncommitted speculative state");
     const auto& stopped_cold = remember(run(engine, "partial_terminal_append_cold",
         engine.prepare_tokens(stopped_append_tokens), false, Path::FullReset));
-    same_output(stopped_append, stopped_cold);
+    // The same two published tokens, but no stop inside a longer licensed round.
+    // Both routes have the same prefill partition. Exact output, logits and
+    // acceptance protect the partial-round rollback, independently of cold
+    // GEMM/GDN grouping. TP4 reproduced a cold divergence at position 28 with
+    // zero emitted-logit deficit (a BF16 tie); these state controls stayed exact.
+    const auto& budget_stopped = remember(run(engine, "budget_terminal",
+        engine.prepare(input), false, Path::FullReset, 2));
+    same_output(stopped, budget_stopped);
+    const auto& budget_append = remember(run(engine, "budget_terminal_append",
+        engine.prepare_tokens(stopped_append_tokens), true, Path::AppendAtFrontier));
+    same_replay(stopped_append, budget_append);
+    compare_cold_rounding(engine, stopped_append_tokens, stopped_append, stopped_cold);
 
     // A client may normalize or replace the previous assistant text before the next turn.
     // Its token stream then diverges after the saved response boundary, so resident append is
@@ -385,8 +396,8 @@ int main() {
         return 77;
     }
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
-        std::cout << "skip: V100X2 prefix gate requires two CUDA devices\n";
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < v100x2_test::tp()) {
+        std::cout << "skip: insufficient devices for the selected tensor-parallel width\n";
         return 77;
     }
     try {

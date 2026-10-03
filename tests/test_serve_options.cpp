@@ -27,6 +27,9 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    const auto tp4 = parse({"ninfer-serve", "model.ninfer", "--tp", "4", "--devices", "3,1,0,2"});
+    failures += check(tp4.tp == 4 && tp4.devices == std::vector<int>({3, 1, 0, 2}),
+                      "TP4 server lost the four-rank device order");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
@@ -237,6 +240,12 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    const auto ram = parse({"ninfer-serve", "model.ninfer", "--max-context", "262144",
+                            "--ram-kv-window", "98304", "--ram-kv-budget-bytes", "32000000000"});
+    failures += check(ram.ram_kv.gpu_tokens == 98304 && ram.kv_capacity.explicit_tokens == 98304 &&
+                          ram.ram_kv.budget_bytes == 32000000000ULL,
+                      "RAM KV did not separate logical and resident capacity");
+    failures += check(defaults.ram_kv.gpu_tokens == 0, "RAM KV unexpectedly enabled by default");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -495,7 +495,8 @@ inline double cache_value(const HostCache& cache, bool key, std::int32_t head, s
 }
 
 inline std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    std::span<const std::int32_t> selected_pages = {}) {
     const Geometry& geometry  = cache.geometry;
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
@@ -504,12 +505,17 @@ inline std::vector<double> ideal_attention(const std::vector<float>& q, const Ho
 
     std::vector<double> scores(static_cast<std::size_t>(positions.back()) + 1);
     std::vector<double> probabilities(scores.size());
+    const auto selected = [&](std::int32_t position) {
+        return selected_pages.empty() || std::find(selected_pages.begin(), selected_pages.end(),
+            position / kPagedKVPageSize) != selected_pages.end();
+    };
     for (std::int32_t token = 0; token < tokens; ++token) {
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
             double max_score           = -std::numeric_limits<double>::infinity();
             for (std::int32_t position = 0; position < visible; ++position) {
+                if (!selected(position)) { continue; }
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
@@ -522,6 +528,7 @@ inline std::vector<double> ideal_attention(const std::vector<float>& q, const Ho
 
             double sum = 0.0;
             for (std::int32_t position = 0; position < visible; ++position) {
+                if (!selected(position)) { probabilities[position] = 0; continue; }
                 const double probability =
                     std::exp(scores[static_cast<std::size_t>(position)] - max_score);
                 probabilities[static_cast<std::size_t>(position)] = probability;

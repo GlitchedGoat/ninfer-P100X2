@@ -21,6 +21,14 @@ namespace {
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
+
+int device_sm() {
+    int device = 0;
+    cudaDeviceProp props{};
+    cuda_check(cudaGetDevice(&device), "record device");
+    cuda_check(cudaGetDeviceProperties(&props, device), "record capability");
+    return props.major * 10 + props.minor;
+}
 constexpr ReductionCriterion kFp8GdnInputProjConvRecordA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
                                                                     2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjConvRecordA8Tolerance{0.04, 1.0 / 256.0, 0.06};
@@ -319,7 +327,8 @@ int run_nvfp4() {
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 1601U, options));
+        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 1601U, options),
+        device_sm() == 70);
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
@@ -352,10 +361,12 @@ int run_nvfp4() {
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
     failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
-    failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
-    failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
-    failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
-    failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
+    const auto policy = device_sm() >= 120 ? ops::LinearPolicy::AllowA4
+                                         : ops::LinearPolicy::A16Only;
+    failures += run(3, 1, {2}, policy, 1631U);
+    failures += run(4, 1, {}, policy, 1641U);
+    failures += run(16, 1, {13}, policy, 1651U);
+    failures += run(6, 3, {6, 4, 1}, policy, 1661U);
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }
@@ -541,12 +552,17 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    if (argc == 2 && std::string_view(argv[1]) == "--nvfp4") {
+        const int failures = run_nvfp4();
+        std::cout << (failures ? "FAIL" : "OK") << " NVFP4 gdn_input_proj_conv_record\n";
+        return failures ? 1 : 0;
+    }
     int failures                   = 0;
     const auto fp8_record_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                         std::int32_t min_width, std::int32_t max_width) {

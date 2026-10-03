@@ -131,10 +131,10 @@ struct SequenceKVBundle {
     // geometry (only the per-page byte count differs, because rank 1 holds 2 of the 4 KV heads),
     // and every pool operation below is issued on both in the same order, so the two allocations
     // hold the same page ids and publish identical block tables.
-    std::optional<PagedKVAllocation> text_peer;
+    std::array<std::optional<PagedKVAllocation>, kMaximumExecutionDevices - 1> text_peers;
     // Rank 1's allocation in ITS OWN MTP (backend) KV pool at tp == 2. Same lockstep argument as
     // `text_peer`: identical page geometry, every pool operation issued on both in the same order.
-    std::optional<PagedKVAllocation> backend_peer;
+    std::array<std::optional<PagedKVAllocation>, kMaximumExecutionDevices - 1> backend_peers;
 };
 
 struct DecodeGraphProfile {
@@ -214,11 +214,12 @@ struct RequestControl {
 // sampling and the pinned host round buffers all live once, on rank 0.
 struct PeerRuntime {
     PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
-                const SequencePlanImpl& plan);
+                const SequencePlanImpl& plan, int rank);
 
     PeerRuntime(const PeerRuntime&)            = delete;
     PeerRuntime& operator=(const PeerRuntime&) = delete;
 
+    const int rank;
     DeviceContext& device;
     const LoadedModelData& model;
     DeviceArena persistent;
@@ -239,11 +240,18 @@ struct PeerRuntime {
     // happens on rank 0 alone -- prefill's bonus token -- is copied across before the first decode
     // round), and thereafter both are advanced by the same Op over bit-identical inputs.
     Tensor token_counts;
+    std::optional<DecodeGraphPeerBridge> graph_bridge;
+    std::optional<PinnedHostBuffer> ordinary_host;
+    qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
+    std::optional<PinnedHostBuffer> mtp_host;
+    qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    std::optional<PinnedHostBuffer> dflash_host;
+    qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
 
 class ProgramImplCore {
 public:
-    ProgramImplCore(const LoadedModelData& model, const LoadedModelData* peer_model,
+    ProgramImplCore(const LoadedModelData& model, std::span<const LoadedModelData* const> peer_models,
                     const SequencePlanImpl& plan, ExecutionContext& execution);
     ~ProgramImplCore() noexcept;
 
@@ -290,6 +298,7 @@ public:
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const RamKvOptions ram_kv;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
@@ -303,7 +312,7 @@ public:
     // single cross-device graph materializes driver state on BOTH devices, and each is checked
     // against the SAME per-device allowance -- graph_allowance_bytes is a per-device budget, like
     // every other field in device_reservation_bytes.
-    std::array<std::size_t, 2> graph_observed_bytes{0, 0};
+    std::array<std::size_t, kMaximumExecutionDevices> graph_observed_bytes{0, 0};
     // Node count of ONE captured decode graph (the first profile of the captured family). At tp2
     // one graph holds both devices' nodes, so this is the direct measurement of whether the peer's
     // half of the schedule was captured rather than left out.
@@ -325,16 +334,17 @@ public:
     //
     // `rope_frequency[rank]` is the descriptor every text rope call site reads (through
     // `ExecutionCore::rope_frequency` -> `TextContext`); a null `inv_frequency` IS the native path.
-    std::array<DeviceBuffer, 2> rope_frequency_storage;
-    std::array<ops::RopeFrequencyOverride, 2> rope_frequency{};
+    std::array<DeviceBuffer, kMaximumExecutionDevices> rope_frequency_storage;
+    std::array<ops::RopeFrequencyOverride, kMaximumExecutionDevices> rope_frequency{};
     const RopeMode rope_mode;
     const std::uint32_t effective_max_context;
     const double yarn_mscale;
-    std::optional<PeerRuntime> peer;
+    std::vector<std::unique_ptr<PeerRuntime>> peers;
     std::optional<ops::PeerEvents> peer_events;
-    // Created once at tp2 when graphs are on; forks rank 1's stream into rank 0's capture.
-    std::optional<DecodeGraphPeerBridge> graph_bridge;
-    std::optional<schedule::TpPeerCore> peer_core;
+    std::array<schedule::TpPeerCore, kMaximumExecutionDevices - 1> peer_cores{};
+    [[nodiscard]] std::span<const schedule::TpPeerCore> peer_views() const noexcept {
+        return std::span(peer_cores).first(peers.size());
+    }
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
@@ -379,8 +389,7 @@ public:
     // fault. A separate pinned buffer rather than a patched copy at issue time, for the same
     // reason as `mtp_peer_host_ingress`: the upload is inside the captured decode graph, which
     // re-reads this exact host address at every replay.
-    std::optional<PinnedHostBuffer> ordinary_peer_host;
-    qwen3_6::OrdinaryDecodeIngress* ordinary_peer_host_ingress = nullptr;
+
     bool peer_egress_check_enabled     = false;
     std::uint64_t peer_egress_rounds     = 0;
     std::uint64_t peer_egress_mismatches = 0;
@@ -391,13 +400,11 @@ public:
     // `sampling[row].token_counts` names rank 1's counter lane. It has to be a separate pinned
     // buffer rather than a patched copy made at issue time, because the ingress upload is inside
     // the captured decode graph and the graph re-reads this exact host address at every replay.
-    std::optional<PinnedHostBuffer> mtp_peer_host;
-    qwen3_6::MtpDecodeIngress* mtp_peer_host_ingress = nullptr;
+
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
-    std::optional<PinnedHostBuffer> dflash_peer_host;
-    qwen3_6::DFlashDecodeIngress* dflash_peer_host_ingress = nullptr;
+
 
     std::size_t workspace_logical_peak_bytes = 0;
 
@@ -448,7 +455,7 @@ private:
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
-    void set_peer_i32(Tensor& tensor, std::int32_t value);
+    static void set_peer_i32(Tensor& tensor, std::int32_t value, DeviceContext& rank_device);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
     void copy_round_logits();
@@ -486,7 +493,8 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
-    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view_peer(const SequenceState& sequence) const;
+    [[nodiscard]] std::array<qwen3_6::PagedKVCacheView, kMaximumExecutionDevices - 1>
+    mtp_kv_views_peer(const SequenceState& sequence) const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

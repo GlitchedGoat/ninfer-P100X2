@@ -288,6 +288,7 @@ struct BindingPlan {
     qwen3_6::StartupFeatures features;
     artifact::NumericFormat draft_format = artifact::NumericFormat::Q4G64_F16S;
     artifact::NumericFormat mtp_format = artifact::NumericFormat::W8G32_F16S;
+    artifact::NumericFormat mtp_stem_format = artifact::NumericFormat::W8G32_F16S;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -391,12 +392,14 @@ public:
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
-    // The model view for one rank. `runtime` is rank 0's (the only one at tp == 1); `runtime_peer`
-    // holds rank 1's at tp == 2. Both describe the SHARD that rank's arena holds, not the whole
+    // Rank 0 owns `runtime`; each remaining active rank owns one view in `runtime_peers`.
+    // Each describes the SHARD that rank's arena holds, not the whole
     // model -- every sharded extent in the view is already divided by tp.
     [[nodiscard]] const RuntimeModelView& view(int rank) const {
         if (rank == 0) { return runtime; }
-        if (rank == 1 && runtime_peer.has_value()) { return *runtime_peer; }
+        if (rank > 0 && rank < tp && runtime_peers[rank - 1].has_value()) {
+            return *runtime_peers[rank - 1];
+        }
         throw std::out_of_range("qwen3_6_27b model view rank is out of range");
     }
 
@@ -404,7 +407,7 @@ public:
     qwen3_6::FrontendResources frontend;
     int tp = 1;
     RuntimeModelView runtime;
-    std::optional<RuntimeModelView> runtime_peer;
+    std::array<std::optional<RuntimeModelView>, 3> runtime_peers;
 
 private:
     void build_device_view(const BindingPlan& plan, int device, RuntimeModelView& runtime);

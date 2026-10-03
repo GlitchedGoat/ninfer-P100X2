@@ -1,4 +1,4 @@
-// Host-only table test for the TP2 weight-sharding map.
+// Host-only table test for the TP2/TP4 weight-sharding map.
 //
 // `plan_for(object, tp, config, profile)` is a pure host computation over TextConfig's compile-time
 // dimensions -- no artifact, no device, no kernel. Every case below is derived from the REAL
@@ -266,6 +266,46 @@ int main() {
     // the two normalized inputs. Full derivation at plan_for's own comment. ---
     expect_plan(plan_for("mtp/input_projection", 2, config, profile),
                ShardPlan{Shard{0, 0, 5120}, Shard{1, 5120, 5120}}, "mtp input_projection");
+
+    // Four-way head-local geometry: 6Q:1KV, 4 GDN key heads and 12 value heads/rank.
+    // Every packed section is split independently; one contiguous quarter of the fused
+    // parent would pair the wrong gate/value section with the rank's query/key heads.
+    const auto quarter = [](std::uint64_t begin, std::uint64_t count) -> ShardPlan {
+        return {{0, begin, count}, {1, begin + count, count},
+                {2, begin + 2 * count, count}, {3, begin + 3 * count, count}};
+    };
+    const auto tp4 = [&](std::string_view object, const ShardPlan& expected) {
+        expect_plan(plan_for(object, 4, config, profile), expected,
+                    "tp4 " + std::string(object));
+    };
+    const ShardPlan attention_quarters = concat(
+        concat(quarter(0, 1536), quarter(6144, 256)),
+        concat(quarter(7168, 1536), quarter(13312, 256)));
+    tp4("text/layers/5/attention/query_key_gate_value", attention_quarters);
+    tp4("mtp/layer/attention/query_key_gate_value", attention_quarters);
+    tp4("text/layers/5/attention/output", quarter(0, 1536));
+    tp4("mtp/layer/attention/output", quarter(0, 1536));
+    tp4("text/layers/3/gdn/query_key_value_z",
+        concat(concat(quarter(0, 512), quarter(2048, 512)),
+               concat(quarter(4096, 1536), quarter(10240, 1536))));
+    tp4("text/layers/3/gdn/convolution",
+        concat(concat(quarter(0, 512), quarter(2048, 512)), quarter(4096, 1536)));
+    tp4("text/layers/3/gdn/output", quarter(0, 1536));
+    tp4("text/layers/3/gdn/a_b_projection", concat(quarter(0, 12), quarter(48, 12)));
+    tp4("text/layers/3/gdn/a_log", quarter(0, 12));
+    tp4("text/layers/3/gdn/dt_bias", quarter(0, 12));
+    tp4("text/layers/5/mlp/gate_up", concat(quarter(0, 4352), quarter(17408, 4352)));
+    tp4("mtp/layer/mlp/gate_up", concat(quarter(0, 4352), quarter(17408, 4352)));
+    tp4("text/layers/5/mlp/down", quarter(0, 4352));
+    tp4("mtp/layer/mlp/down", quarter(0, 4352));
+    // FC rank 0/1 consume normalized embedding halves, rank 2/3 hidden halves.
+    tp4("mtp/input_projection", quarter(0, 2560));
+    tp4("text/output_head", quarter(0, 62080));
+    tp4("text/draft_head", quarter(0, 32768));
+    for (const std::string_view object : {"text/token_embedding", "text/final_norm",
+                                        "text/draft_head_token_ids", "text/layers/3/gdn/norm"}) {
+        expect_empty(plan_for(object, 4, config, profile), "tp4 replicated " + std::string(object));
+    }
 
     // --- k128 row-split-k128-v1 group boundary (row-parallel objects): standalone validator. ---
     if (!is_row_parallel_boundary_valid(0, 128)) { fail("k128 validator: (0,128) should be valid"); }

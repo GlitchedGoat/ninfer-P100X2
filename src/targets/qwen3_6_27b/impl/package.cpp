@@ -96,6 +96,12 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "quasar-nvfp4") {
+        return WeightsProfile::Qwen38QuasarNvfp4;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "fp8") {
+        return WeightsProfile::Qwen38Fp8;
+    }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "gguf-q4-k-m") {
         return WeightsProfile::Qwen38GgmlK;
     }
@@ -152,9 +158,10 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
         throw std::invalid_argument(
             "loaded model shard width does not match the execution context");
     }
-    const detail::RuntimeModelView* peer =
-        data.runtime_peer.has_value() ? &*data.runtime_peer : nullptr;
-    return qwen3_6::create_program<detail::Variant>(data.runtime, peer,
+    std::array<const detail::RuntimeModelView*, kMaximumExecutionDevices - 1> peers{};
+    for (int rank = 1; rank < data.tp; ++rank) { peers[rank - 1] = &data.view(rank); }
+    return qwen3_6::create_program<detail::Variant>(
+        data.runtime, std::span(peers).first(data.tp - 1),
                                                    model.impl_->weights_profile, std::move(plan),
                                                    execution);
 }

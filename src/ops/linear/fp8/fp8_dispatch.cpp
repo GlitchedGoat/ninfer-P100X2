@@ -31,6 +31,14 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     if (tokens <= 0 || !is_fp8_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("fp8 linear: unsupported shape");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (is_fp8_volta_tp4_problem(output_rows, input_rows)) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("fp8 TP4 SM70 linear admits only A16");
+        }
+        return Fp8LinearRoute::A16;
+    }
+#endif
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     if (policy == LinearPolicy::A16Only) { return Fp8LinearRoute::A16; }
     // A permissive policy does not require a lower-precision route. Vocabulary logits retain
@@ -78,6 +86,23 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (is_fp8_volta_tp4_problem(weight.n, weight.k)) {
+        if (workspace != nullptr && x.ne[1] >= 128 && weight.n != 62080) {
+            fp8_cutlass_sm70_launch(x, weight, out, *workspace, stream);
+            return;
+        }
+        // All quarter-shard K extents cover whole 128-element QPN groups. The one-token
+        // native and prepacked cases both use QPN, avoiding an unrelated SIMT registry.
+        for (int begin = 0; begin < x.ne[1]; begin += kFp8VoltaQpnMaxTokens) {
+            const int active = std::min(kFp8VoltaQpnMaxTokens, x.ne[1] - begin);
+            Tensor input = x.slice(1, begin, active);
+            Tensor output = out.slice(1, begin, active);
+            launch_fp8_volta_qpn(input, weight, output, stream);
+        }
+        return;
+    }
+#endif
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
 #ifdef NINFER_VOLTA_BUILD
     if (workspace != nullptr && x.ne[1] >= 128 && !is_fp8_vocabulary_problem(problem)) {
@@ -160,6 +185,15 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (is_fp8_volta_tp4_problem(output_rows, input_rows)) {
+        (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+        (void)resolve_route(output_rows, input_rows, policy, max_tokens);
+        return max_tokens >= 128 && output_rows != 62080
+                   ? fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens)
+                   : 0;
+    }
+#endif
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     (void)resolve_route(output_rows, input_rows, policy, max_tokens);

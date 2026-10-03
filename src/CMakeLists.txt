@@ -42,7 +42,7 @@ add_library(ninfer_artifact STATIC
   artifact/materializer.cpp
   artifact/typed_binding.cpp)
 ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_core CUDA::cuda_driver)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
@@ -65,6 +65,7 @@ endif()
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
   ops/common/allreduce.cu
+  ops/launcher/allreduce.cu
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
@@ -156,6 +157,7 @@ add_library(ninfer_ops STATIC
   ops/linear/bf16/bf16_dispatch.cpp
   ops/linear/fp8/fp8_format.cpp
   ops/linear/fp8/fp8_gemv.cu
+  ops/linear/fp8/fp8_block.cu
   ops/linear/fp8/fp8_small_t.cu
   ops/linear/fp8/fp8_a16_mma.cu
   ops/linear/fp8/fp8_a8.cu
@@ -272,12 +274,16 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_sources(ninfer_ops PRIVATE
     ops/linear/ggml_k/ggml_k_cutlass_sm70.cu
     ops/linear/bf16/bf16_cutlass_sm70.cu
+    ops/linear/bf16/bf16_volta_qpn.cu
     ops/attn_input_proj/bf16/bf16_attn_input_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu
     ops/attn_input_proj/fp8/fp8_attn_input_volta_qpn.cu
+    ops/attn_input_proj/nvfp4/nvfp4_attn_input_sm70.cu
+    ops/attn_input_proj/volta_tp4.cu
     ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
     ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
+    ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_sm70.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
@@ -330,6 +336,7 @@ endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+target_link_libraries(ninfer_ops PRIVATE ${CMAKE_DL_LIBS})
 if(TARGET ninfer_nvfp4_tma)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_tma)
 endif()

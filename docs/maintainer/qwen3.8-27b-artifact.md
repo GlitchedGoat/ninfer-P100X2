@@ -1,10 +1,73 @@
 # Qwen3.8-27B artifact reference
 
 This reference defines the registered Qwen3.8-27B `.ninfer` storage contracts: the
-`qwen3.8-27b/nvfp4` and preserved `qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
+`qwen3.8-27b/nvfp4`, experimental `qwen3.8-27b/quasar-nvfp4`, native `qwen3.8-27b/fp8`
+and preserved `qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
 shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
 source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
 defined in Section 13.
+
+## Native block-128 FP8 Text/MTP package
+
+Identity `qwen3.8-27b/fp8`, filename `qwen3_8_27b_fp8.ninfer`, uses v2 framing and the same
+six frontend resources. It is a separate checkpoint identity, not a runtime reinterpretation of
+the NVFP4 package's row-scaled FP8. Its selected execution domain is four SM70 devices,
+Text and MTP only. TP1/TP2, Vision and DFlash are rejected at binding before GPU materialization.
+The integration remains unqualified until four-card model/state and performance checks pass;
+operator and host binding checks do not establish end-to-end qualification.
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_fp8 \
+  --model /explicit/path/to/Qwen3.8-27B-FP8 \
+  --out /explicit/path/to/qwen3_8_27b_fp8.ninfer
+```
+
+The converter uses Python 3.11 and CPU streaming only. It validates the indexed source shapes,
+E4M3/128×128 quantization configuration and fixed model dimensions. Matrix codes and BF16
+`weight_scale_inv` words are copied exactly into `FP8_E4M3FN_BLOCK128_BF16S` /
+`blockscale-m128-k128-v1`. Source `weight_scale_inv` is a multiplier. No reciprocal, scale
+recomputation, calibration or new quantization is performed.
+
+The object names and fused row orders are the shared Text/MTP names below: attention
+`[Q,K,G,V]`, GDN `[Q,K,V,Z]`, control `[A,B]`, MLP `[gate,up]`. HF per-head `[Q256,G256]`
+rows are separated in complete 128-row blocks, moving their scale rows identically.
+
+| Role | Persistent format | Source-to-object transform |
+|---|---|---|
+| Text attention, GDN input/output, MLP; MTP attention/MLP | block-128 FP8 | exact codes/scales and row fusion |
+| token embedding / full output head | BF16 | exact source words |
+| optional optimized draft head | BF16 `[131072,5120]` | exact first 131072 output-head rows |
+| draft ID map | I32 `[131072]` | `0..131071` |
+| MTP stem `[5120,10240]` | BF16 | exact `mtp.fc.weight` |
+| norms / GDN A/B projections | BF16 | exact words and A/B row concatenation |
+| GDN `A_log`, `dt_bias` | FP32 | exact BF16 expansion |
+| convolution `[4,10240]` | BF16 | exact transpose from `[10240,1,4]` |
+
+`--lm-head-draft` selects the optional shortlist; omitting it uses the full proposal head.
+Both modes verify proposals against the full target vocabulary. The shortlist is not the
+NVFP4 optimized-head recipe and is not claimed to have the same acceptance rate.
+
+On SM70, narrow projections dequantize per K128 block into FP16 MMA operands and accumulate
+in FP32; wide calls use caller-owned FP16 dequantization/CUTLASS scratch. SwiGLU and fused
+residual routes retain FP32 projection intermediates until their final BF16 output. These are
+private qualified arithmetic profiles, not alterations of the persistent mathematical format.
+There is no native V100 FP8 tensor-core instruction and no permanent dequantized weight copy.
+
+The native FP8 vocabulary's BF16 quarter shards `[62080,5120]` and `[32768,5120]`
+have a narrow T=1..8 Volta MMA route. Its FP16 operands are converted directly from
+the represented BF16 weights/activations, with FP32 accumulation and final BF16 output;
+the stored words are unchanged and no device workspace is allocated. Complete-dot FP64
+checks include the head geometries and BF16 exponent/significand variation. As with the
+block-FP8 profile, this is a numerical implementation profile, not bit-identical reduction.
+
+The real-artifact FP8 gate compares graph/eager outputs and speculative state exactly. Its
+teacher-forced cold re-prefill control is numerical rather than byte-exact: for each prompt,
+the speculative emitted-token worst logit deficit must not exceed ordinary decode's measured
+deficit, and both must remain within the existing 0.5-logit BF16 grouping bound. This does not
+assert identical greedy trajectories or a scored quality result. The Q4_K_M/NVFP4 real-artifact
+gate retains its stricter zero-disagreement criterion. Independent FP64 operator oracles and
+exact source-code/scale conversion checks are separate requirements, not replaced by this
+behavioral comparison.
 
 The NVFP4 profile is a registered Engine identity implemented by the target converter, exact
 binder, and Qwen3.8 execution leaves. The generic artifact registry resolves its version-2
@@ -65,6 +128,46 @@ verification uses the same TP2 Engine route as MTP. DFlash and MTP are mutually 
 are DFlash and Vision. Ordinary/MTP startup does not materialize the DFlash weights. The exact
 payload/startup test independently compares every projected object against its complete source
 file range; W8 and BF16 Ops retain their independent mathematical oracle qualification.
+
+### 1.3 QUASAR trial artifact
+
+The experimental identity `qwen3.8-27b/quasar-nvfp4` registers the single-file v3 release
+from [MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer),
+revision `d03d4f4f7bdc4efa6df63a2fa3d9becceeb9ae2c` (tag `v3`). Its container ID is
+`39be2299c2b94512abd51ffe079830f2`. The v3 directory lacks a weights-profile field, so the
+reader selects this registered identity by container ID, not filename, object count, or a
+representative tensor's format. The target binder then validates the complete storage profile.
+Other v3 artifacts retain the existing official mixed-profile contract.
+
+The file is 19,782,432,752 bytes, with 1,328 tensors and the same six frontend resources. All
+64 Text layers use NVFP4 attention/GDN input/output and MLP projections: 256 fused parents
+with 256 paired FP32 activation divisors. Codes, block scales, global weight divisors, activation
+divisors and physical row order are retained from this artifact. V100 executes A16 projections,
+not the source's optional A4 activation path; no runtime requantization is added. Vocabulary
+endpoints and MTP matrices retain W8, the optimized proposal head Q4, and GDN fused A/B controls
+BF16. The conversion decoded QUASAR's 96 narrow A/B matrices to BF16; this is a real rounding
+boundary, not a substitution from the pre-QAT official model. W8 MTP is encoded from QUASAR's
+BF16 MTP source, while vocabulary endpoints/proposal/Vision use the converter's official sources.
+
+On SM70, all resident NVFP4 Text parents are permuted once during loading into the existing
+Volta QPN fragment layout, without changing code/scale values or retaining another weight copy.
+Attention and GDN input projections use direct-output QPN for narrow token extents; wide calls
+decode once into transient FP16 weights for CUTLASS and distribute the BF16 parent result.
+The `.ninfer` file remains unchanged. These implementation profiles require operator-oracle
+and whole-model evidence; exact packing preservation alone is not a quality claim.
+
+The trial admits SM70 TP2 Text/None/MTP/DFlash. TP1/TP4 and Vision are rejected. The 66 stored
+DFlash2 objects retain W8 projections and BF16 auxiliaries, use the same text-only TP2 runtime
+as the official v3 package, and become resident only when DFlash is selected. MTP and DFlash
+are mutually exclusive; the DFlash window is at most seven.
+The host-only `ninfer_quasar_load_plan_test` checks every NVFP4 parent's original file range,
+all 256 exact FP32 scale pairs, None/MTP/DFlash residency and zero Vision objects uploaded to
+either GPU. Vision remains validation-only in the original file; removing its disk payload
+would not reduce this text-only profile's GPU memory. The public-Engine state gate and trial
+measurements are separate evidence; neither proves BF16-equivalent model quality.
+
+The fixed target facts below also apply to this checkpoint; Section 3's mixed FP8/NVFP4
+assignment describes the official `nvfp4` identity, not QUASAR.
 
 ## 2. Fixed target facts
 
