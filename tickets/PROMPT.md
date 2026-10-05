@@ -14,6 +14,18 @@ Primary workload: **`qwen3.8-27b/nvfp4`** (`.ninfer`, owner direction 2026-10-05
 INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first scope
 (see conversation queue C-1).
 
+## Gotchas (read before building)
+
+- **A full build with tests needs ~27 GB of disk** — 26 GB of it is the 133 test executables, each
+  ~280 MB because every one statically links the whole device image. The cloud container's
+  allowance is ~39 GB, so a second build tree (e.g. an sm_70 regression build) will not fit
+  alongside it, and the failure shows up as `ld: No space left on device` at link time. Build
+  only the targets you need (`--target ninfer` or the T-008 test list), or delete linked test
+  binaries first (see `ENV-SETUP.md` §4). W-12/W-13 in `QUEUES.md` track reducing this.
+- **A full sm_60 build takes well over an hour** on 4 cores at `-j3`; some CUDA TUs take 5–10 min.
+- **No source/CMake edits while a build runs**; only an edit-free pass is a build of record.
+- **Stopping a build leaves orphaned `nvcc`/`cicc`/`ptxas` processes**; kill them too.
+
 ## Ground rules
 
 - `AGENTS.md` at the repo root governs all work (scope, numerics, tests, commits). Its "current
