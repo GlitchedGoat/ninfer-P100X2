@@ -80,3 +80,4 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | T-012 | NVFP4 `.ninfer` identity on Pascal | in progress |
 | T-013 | Handoff prompt for the P100 host agent | ready |
 | T-014 | Opt-in shared libraries for test builds | todo (later) |
+| T-015 | Remove Volta (V100) support; Volta upkeep inventory | backlog |

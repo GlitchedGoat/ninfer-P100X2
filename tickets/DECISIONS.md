@@ -94,3 +94,9 @@ change it.
   only an edit-free pass supports "builds" claims. Each test statically links the full device
   image (~280 MB), so the runbook builds `p100_op_tests`/`p100_model_tests` (45 tests) instead of
   all 133; shared-library test builds are deferred (T-014).
+
+## D-13 Keep Volta (and Ampere/Ada) builds alongside Pascal (C-5)
+- **Reasoning:** Volta code is near-identical to upstream; leaving it in place keeps upstream merges
+  mostly conflict-free, and upkeep is limited to the flag classification and an sm_70 regression
+  build after shared-file changes. The full upkeep inventory is kept in T-015 so removal is mechanical.
+- **Would change if:** Volta upkeep blocks Pascal work or the owner drops V100 (then execute T-015).

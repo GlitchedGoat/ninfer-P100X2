@@ -9,7 +9,7 @@
 | C-2 | P100 host details: `nvidia-smi topo -m`, IOMMU mode, driver version, host RAM, OS. | Needed for T-007/T-008. Same root complex + `iommu=pt` gives direct P2P. | deferred to host agent (T-013); info lives on the P100 machine |
 | C-3 | Owner's llama.cpp P100 branch | **Answered 2026-10-05:** lives on the P100 machine. It uses FP16 accumulation arranged to limit FP16 addition error (owner recalls sorting and/or adding in batches; unconfirmed). Host agent locates it, summarizes the technique into T-009 and measures it as the C-4 baseline (T-013 step 9a). | resolved (details via host agent) |
 | C-4 | Acceptance target? | **Answered 2026-10-05:** committed **decode** tok/s above the owner's llama.cpp P100 setup at the same occupied context (3k/32k/85k; slightly reduced capacity OK). Q4_K_M vs Q4_K_M like for like; NVFP4 `.ninfer` must beat llama.cpp Q4_K_M. Prefill above llama.cpp desired, secondary ("faster on all fronts" ideal). Recorded in AGENTS.md "Performance work". | resolved |
-| C-5 | Keep `sm_70`/`sm_86`/`sm_89` builds in this fork, or make it P100-only? | Keep them; Pascal is an added single-arch build, V100 routes untouched. | open |
+| C-5 | Keep `sm_70`/`sm_86`/`sm_89` builds in this fork, or make it P100-only? | **Answered 2026-10-05:** keep them while upkeep stays minor (eases upstream merges). Volta upkeep inventory and removal plan in backlog ticket T-015. | resolved |
 | C-6 | Is 180000-token capacity still the goal on 2×16 GB with FP32 routes (more workspace)? | Keep 180k as target; fall back to 131072 if FP32 prefill workspace does not fit — decided by measurement. | open |
 | C-7 | Flash attention: owner asked for it (VRAM). | Implemented a native direct-paged FP32 kernel (zero workspace) instead of vendoring llama.cpp's tile kernel, which would need the 368 MB FP16 staging (T-011). | resolved |
 | C-8 | Which NVFP4 artifact? | **Answered 2026-10-05:** the official upstream v3 container `neroued/Qwen3.8-27B-nvfp4-NInfer` → `qwen3_8_27b_nvfp4.ninfer` (23.72 GB, identity `qwen3.8-27b/nvfp4`). Its DFlash2 package and Vision objects are not loaded on Pascal. Still needed: its path on the P100 host. | resolved (path pending) |
@@ -35,3 +35,4 @@
 | W-10 | Dockerfile variant on CUDA 12.8 for Pascal | T-008 | done (parameterized `CUDA_VERSION`/`CUDA_ARCH`) |
 | W-12 | Umbrella targets `p100_op_tests` (40) / `p100_model_tests` (5): ~12 GB instead of 26 GB | T-008 | done |
 | W-13 | Opt-in `NINFER_SHARED_LIBS` for dev/test builds (~1 GB of tests instead of 26 GB) | T-014 | deferred (later improvement) |
+| W-18 | Remove Volta (V100) support — only if needed | T-015 | backlog |
