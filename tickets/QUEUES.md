@@ -4,7 +4,7 @@
 
 | ID | Question | Agent recommendation | Status |
 |---|---|---|---|
-| C-0 | **Push blocked:** the Claude GitHub App has no write access to `GlitchedGoat/ninfer-P100X2` (HTTP 403). | Reconnect GitHub at https://claude.ai/connect-github or install the Claude app on the repo; commits are local until then. | open |
+| C-0 | **Push blocked:** the Claude GitHub App has no write access to `GlitchedGoat/ninfer-P100X2` (HTTP 403). | Reconnect GitHub at https://claude.ai/connect-github or install the Claude app on the repo; commits are local until then. | resolved (2026-10-05, app installed; push works) |
 | C-1 | Which identities/features must the P100 build admit first? | **Answered 2026-10-05: NVFP4 `.ninfer` (`qwen3.8-27b/nvfp4`) is the main quant.** Admitted on SM60: `qwen3.8-27b/nvfp4` + `gguf-q4-k-m`, TP1/TP2, Text/None/MTP. | resolved |
 | C-2 | P100 host details: `nvidia-smi topo -m`, IOMMU mode, driver version, host RAM, OS. | Needed for T-007/T-008. Same root complex + `iommu=pt` gives direct P2P. | open |
 | C-3 | Link/branch of your llama.cpp P100 FP16 work. | Reference for T-009 (FP16x2 with FP32 flush) and T-011 tile configs. | open |
