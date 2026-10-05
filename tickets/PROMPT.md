@@ -33,6 +33,16 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
 - `AGENTS.md` at the repo root governs all work (scope, numerics, tests, commits). Its "current
   product contract" includes the P100X2 port scope, and "Performance work" has the P100 acceptance bar.
 - Develop on branch `claude/ninfer-p100-adaptation-xicv3d` (or the branch the owner names).
+- **Commit and push standing rule (owner, 2026-10-05).** For this branch, this overrides AGENTS.md
+  "commit only when requested". Whenever you are idle (no running task or background job), bring
+  the tickets and docs up to date, then commit and push. Sessions and containers can be reclaimed
+  without warning.
+- **Owner questions.** Put them in the QUEUES.md conversation queue and work on anything else
+  meanwhile. At an idle point, walk through open items with the owner **one at a time**, and record
+  each answer (QUEUES + DECISIONS + affected tickets/AGENTS.md) before the next one.
+- **Other architectures.** Keep sm_70/86/89 building (C-5, D-13): this eases upstream merges.
+  After shared pre-Ampere changes, run an sm_70 regression build. The upkeep inventory and removal
+  plan are T-015 (backlog).
 - Every unit of work is a ticket `tickets/T-NNN-<slug>.md`. Keep its **Status**, **Log** and
   **Results** current as you work; log real commands and outcomes, not intentions.
 - **Decision log:** `tickets/DECISIONS.md` records the reasoning behind every non-obvious choice

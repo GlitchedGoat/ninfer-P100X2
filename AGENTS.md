@@ -129,7 +129,8 @@ Tensor Cores, no NVLink) with CUDA 12.x (CUDA 13 cannot compile Pascal). Its sco
 TP1/TP2 Text/None/MTP with FP32 SIMT arithmetic; every other identity, Vision, DFlash, TP4 and
 RAM-KV are rejected at startup on `sm_60`. Build macros:
 `NINFER_PRE_AMPERE_BUILD` (sm_60 and sm_70 shared SIMT routes), `NINFER_VOLTA_BUILD` (sm_70
-Tensor-Core routes only), `NINFER_PASCAL_BUILD` (GP100 SIMT replacements). Work, open questions and
+Tensor-Core routes only), `NINFER_PASCAL_BUILD` (GP100 SIMT replacements). The sm_70/86/89 builds stay
+supported alongside it (owner, 2026-10-05; Volta removal is backlog `tickets/T-015`). Work, open questions and
 the hardware validation runbook are tracked in `tickets/` (start at `tickets/PROMPT.md`). FP16x2
 arithmetic requires explicit error control and evidence against the FP64 oracle before admission.
 The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
