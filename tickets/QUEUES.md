@@ -22,12 +22,15 @@
 | W-2 | Admit `CMAKE_CUDA_ARCHITECTURES=60`, add Pascal flags | T-003 | done |
 | W-3 | Build `ninfer` for sm_60; fix compile/link errors | T-004 | done (`acb5e75`) |
 | W-4 | Classify every `NINFER_VOLTA_BUILD` site (pre-Ampere vs Tensor Core) | T-004 | done (first pass) |
-| W-5 | Pascal GGML_K routes (T=5–127 tile, prefill SIMT SGEMM) | T-005 | written, compiling |
+| W-5 | Pascal GGML_K routes (T=5–127 tile, prefill SIMT SGEMM) | T-005 | done (builds; numerics on host) |
 | W-6 | sm_70 regression build after the rename | T-004 | running (`4315bc4`) |
 | W-7 | Build all tests for sm_60 | T-004/T-008 | done (`4315bc4`, 133 tests) |
-| W-8 | Static audit: resource usage dump, warp-sync patterns | T-006 | resource + trap audit done; warp-sync review todo |
+| W-8 | Static audit: resource usage dump, warp-sync patterns | T-006 | done (sanitizer runs on host) |
 | W-9 | Pascal flash prefill attention | T-011 | implemented, builds (155 regs, 32 KiB smem) |
-| W-11 | NVFP4 identity on Pascal: dual-arch dense prefill GEMMs (FP8/NVFP4), admission | T-012 | in progress |
+| W-11 | NVFP4 identity on Pascal: dual-arch dense prefill GEMMs (FP8/NVFP4), admission | T-012 | done (builds; numerics on host) |
+| W-14 | O-12: chunk FP32 dense-prefill workspace for NVFP4/FP8 (capacity) | T-010 | proposed |
+| W-15 | O-16: fused A16 residual add for NVFP4/FP8 on Pascal | T-010 | proposed |
+| W-16 | Review SIMT small-T kernels now on Pascal routes vs trap audit | T-006/T-012 | proposed |
 | W-10 | Dockerfile variant on CUDA 12.8 for Pascal | T-008 | done (parameterized `CUDA_VERSION`/`CUDA_ARCH`) |
 | W-12 | Umbrella targets `p100_op_tests` (40) / `p100_model_tests` (5): ~12 GB instead of 26 GB | T-008 | done |
 | W-13 | Opt-in `NINFER_SHARED_LIBS` for dev/test builds (~1 GB of tests instead of 26 GB) | T-014 | deferred (later improvement) |
