@@ -48,8 +48,12 @@ nice cmake --build build-p100 -j3 --target ninfer -- -k 0 > build-p100.log 2>&1
 - **Stopping a build:** `pkill ninja`/`pkill cmake` leaves orphaned `nvcc`/`cicc`/`ptxas` children
   running (they kept the load at 9 on 4 cores). Also kill them:
   `pkill -f 'cicc|ptxas|nvcc'` (only when no other build is meant to run).
-- **Editing sources while a build runs** makes the build compile a mix of old and new files; if
-  CMakeLists changed, the running build does not reconfigure. Restart the build after such edits.
+- **No edits to `src/`, `tests/`, `apps/`, `bench/` or any CMakeLists while a build runs.** Ninja
+  fixes its work list at the start of a pass: files edited after they compiled leave stale objects
+  in that pass, and CMake changes are not seen until the next pass. A pass that saw edits is
+  *diagnostic only* (use it to collect errors). Claims such as "builds for sm_60" require a
+  **build of record**: a pass started after the last source edit with no edits during it.
+  Editing `tickets/` or other docs during a build is fine.
 - Long foreground `sleep` is blocked in the agent harness; run the build with
   `run_in_background` and use a Monitor on `^FAILED|ninja: build stopped|Linking` in the log.
 - **Pushing:** `git push` returned 403 until the owner grants the Claude GitHub App write access
