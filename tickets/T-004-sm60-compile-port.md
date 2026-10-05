@@ -1,6 +1,6 @@
 # T-004 — Make every translation unit compile and link for `sm_60`
 
-**Status:** all sm_60 targets build (build of record `4315bc4`); sm_70 regression running
+**Status:** done — all sm_60 targets build (`4315bc4`); sm_70 regression builds (`4315bc4`)
 **Depends on:** T-003
 
 ## Approach
@@ -51,3 +51,7 @@
   `d81c49b`); fixed by passing `{}` as production does.
 - Test executables (~280 MB each, 26 GB total) were deleted afterwards to free disk for the sm_70
   regression build; they relink in minutes from the retained objects.
+- **sm_70 regression, build of record `4315bc4`:** fresh `build-v100` (`-DCMAKE_CUDA_ARCHITECTURES=70`,
+  `BUILD_TESTING=OFF`), `--target ninfer`: 297/297 steps, links, `sm_70` cubins only (17 min). The
+  flag split and the dual-arch prefill GEMM config leave the V100 build intact (compile-level; V100
+  numerics untouched by construction: same tile shapes, operand types and epilogue widths).
