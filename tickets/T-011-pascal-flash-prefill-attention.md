@@ -1,43 +1,43 @@
-# T-011 — Pascal SIMT flash-attention prefill route
+# T-011 — Pascal flash-attention prefill route
 
-**Status:** design ready; implementation next (decision C-7)
-**Depends on:** T-004 green build
+**Status:** implemented (compiles pending); numerical validation on P100 pending (T-008 step 3)
+**Depends on:** T-004
 
-## Problem
+## Why (corrected analysis)
 
-On V100, wide single-request prefill attention uses **VoltaFlash**: stage the visible INT8 KV once per
-layer into contiguous FP16, build a causal mask from device positions, run the vendored llama.cpp
-`fattn-mma-f16` kernel (SM70 Tensor Cores), scatter the output. Pascal currently falls back to
-`ChunkedSmallT`, which re-reads the whole visible history for every 5-token chunk:
-≈ T²/10 key reads per attention layer — fine for short prompts, impractical at 85k tokens.
+Owner requirement (2026-10-05): a flash-attention implementation, for its VRAM savings.
 
-## Proposed design
+- Attention prefill is O(T × visible keys) on every route; on GP100 (no Tensor Cores) it is
+  **compute-bound**: ≈ width × QHeads × keys × 512 FMA ≈ 0.5 TFMA per attention layer per
+  1024-token chunk at 85k keys (TP2), i.e. ~0.1 s/layer at FP32 peak.
+- The inherited pre-Ampere fallback (`ChunkedSmallT`) does **not** materialize a score matrix, so it
+  is not a VRAM problem. Its cost is efficiency: one 5-shuffle warp reduction per (row, key), split
+  partials and a launch per 5 tokens. (An earlier note in T-005 called it "quadratic re-reads,
+  impractical" — that overstated it; both routes are quadratic, the difference is a constant factor.)
+- Volta's flash route stages the INT8 KV into a contiguous **FP16 copy** each layer: at 180k
+  context, TP2, that staging is ≈ 368 MB of workspace — the real VRAM cost to avoid.
 
-Reuse VoltaFlash's staging and swap only the arithmetic kernel:
+## Implementation (`src/ops/launcher/gqa_attention_pascal_flash.cu`)
 
-- **Kernel:** vendor llama.cpp `ggml/src/ggml-cuda/fattn-tile.cuh` (MIT, SIMT, supports
-  DKQ=DV=256, runs on Pascal), pinned to one commit, beside the existing
-  `third_party/llama_cpp_fattn/` (same provenance pattern, same `common.cuh` shim).
-  Build it with `FAST_FP16_AVAILABLE` **undefined** so the KQ and VKQ accumulations run in FP32
-  (owner's FP32-first requirement); FP16 tile becomes a T-009 candidate.
-- **Staging (shared with Volta):** factor `volta_flash_{append_kv,append_kv_i8,gather_kv,
-  gather_kv_i8,convert_q,convert_out,build_mask}` out of `gqa_attention_volta_flash.cu` into a
-  `gqa_attention_flash_staging.cuh` used by both routes. Gather INT8-G64 → FP16 rounds
-  `code × fp16 scale` once (same boundary as V100).
-- **Route:** rename `GqaAttentionRoute::VoltaFlash` → `Flash` with arch-specific launchers
-  (`gqa_attention_volta_flash.cu` sm70, new `gqa_attention_pascal_flash.cu` sm60); the wrapper's
-  workspace contract (`allocate_volta_flash_workspace`) is shared.
-- **Tile config for GP100:** 48 KiB smem/block; pick `ncols2=2` (GQA ratio 6) and the smallest
-  `ncols1` that fits, using llama.cpp's FP32 Nvidia config table as the starting point.
+- Route `GqaAttentionRoute::PascalFlash` (Pascal builds only): 27B geometries (24/12/6 Q heads),
+  B=1, INT8-G64 cache, width ≥ 64, exact prefill envelope. Honors `valid_columns` with the chunked
+  route's semantics (masked columns: not appended, output 0). Workspace: **0 bytes**.
+- Appends the chunk's K/V to the paged cache with the decode kernels' quantizer, then attends
+  reading the paged INT8 cache **in place** (no gather, no mask tensor, no split partials).
+- CTA = (KV head, 4 query tokens) = 24 rows; 8 warps × 3 rows; lane owns 8 head dims.
+  32-key K tile then V tile staged as FP32 in one 32 KiB smem buffer (< 48 KiB).
+  QK: 256 FMA/lane/row, butterfly reduce-scatter (31 shuffles) gives key `lane`'s score to lane
+  `lane`; base-2 online softmax (scale·log2e folded into Q); PV broadcasts p by shuffle.
+- All arithmetic FP32; `ex2.approx` as in the decode kernels.
 
-## Verification
+## Verification plan
 
-- `ninfer_gqa_attention_test` / `_long_context_test` already compare routes against an FP64
-  attention oracle; add Pascal widths ≥ 64 (route switch) on sm_60.
-- End-to-end: 8k/32k/85k prefill tok/s before/after (T-008 step 6).
+- `ninfer_gqa_attention_test` case `{66, 63, 129}` already routes here on sm_60 (width ≥ 64, exact
+  envelope) and is compared with the FP64 oracle, including the workspace high-water contract.
+- Add wider cases (width 256/1024, prefix 0/300/4000, masked) on the P100 host.
+- Measure prefill tok/s vs `ChunkedSmallT` at 8k/32k/85k (T-008 step 6).
 
-## Alternative considered
+## Tuning backlog
 
-Hand-written SIMT kernel reading paged INT8 directly (no FP16 staging): saves the staging pass but
-must fit Q/K/V tiles for D=256 in 48 KiB and avoid per-element `I2F` (1/4 rate on GP100). Higher
-risk without hardware; revisit only if staging shows up in the profile.
+Rows processed one at a time re-read K from smem 3×; process row pairs. I2F in staging →
+magic-number conversion. FP16x2 QK/PV under T-009 rules.

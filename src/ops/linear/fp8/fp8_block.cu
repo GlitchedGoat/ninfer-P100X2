@@ -1,7 +1,9 @@
 #include "ops/linear/fp8/fp8_block.h"
 #include "ops/linear/fp8/fp8_cutlass_sm70.h"
 #include "ops/linear/fp8/fp8_output.cuh"
+#ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
+#endif
 #include "core/layout.h"
 #include <algorithm>
 #include <stdexcept>

@@ -9,11 +9,17 @@ namespace ninfer::ops::detail {
 // qualified route's BF16 accumulator rounding before multiplying by that scale, then
 // round the scaled result to BF16. This removes a full output read/write and launch.
 // The owning GEMMs use alpha=1 and a single K slice; C is never an old output tensor.
+template <int Count = 8>
 class Fp8RowScaledBf16Epilogue
-    : public cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 8, float, float> {
-    using Base = cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 8, float, float>;
+    : public cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, Count, float, float> {
+    using Base = cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, Count, float, float>;
 
 public:
+    using typename Base::FragmentAccumulator;
+    using typename Base::FragmentCompute;
+    using typename Base::FragmentOutput;
+    using typename Base::FragmentSource;
+    using Base::kCount;
     using Base::Base;
     using Base::operator();
 

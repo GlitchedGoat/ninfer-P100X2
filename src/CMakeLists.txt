@@ -280,19 +280,15 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/attn_input_proj/fp8/fp8_attn_input_volta_qpn.cu
     ops/attn_input_proj/nvfp4/nvfp4_attn_input_sm70.cu
     ops/attn_input_proj/volta_tp4.cu
-    ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
     ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
     ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_sm70.cu
-    ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
     ops/linear/fp8/fp8_volta_qpn_gemm.cu
-    ops/linear/fp8/fp8_cutlass_sm70.cu
     ops/linear/fp8/fp8_prepack_sm70.cu
     ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
     ops/linear/nvfp4/nvfp4_volta_mma_gemm.cu
-    ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
     ops/linear/nvfp4/nvfp4_prepack_sm70.cu
     ops/linear/q4/q4_volta_mma_gemm.cu
     ops/linear/q4/q4_volta_qpn_gemm.cu
@@ -318,10 +314,20 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
       INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
       COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
 endif()
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(60|70)$")
+  # Decode-once + dense GEMM prefill routes. ops/common/pre_ampere_gemm.cuh selects FP16 SM70
+  # Tensor-Core GEMMs on Volta and FP32 SIMT GEMMs on Pascal.
+  target_sources(ninfer_ops PRIVATE
+    ops/linear/fp8/fp8_cutlass_sm70.cu
+    ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
+    ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu)
+endif()
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "60")
   # Pascal GP100: no Tensor Cores. Wide-T routes use CUTLASS SIMT GEMMs with FP32 operands.
   target_sources(ninfer_ops PRIVATE
     ops/linear/ggml_k/ggml_k_cutlass_simt.cu
+    ops/launcher/gqa_attention_pascal_flash.cu
     ops/linear_swiglu/swiglu_fp32.cu
     ops/volta_tc_sm60_stubs.cpp)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)

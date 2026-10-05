@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/common/pre_ampere_gemm.cuh"
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_cutlass_epilogue.cuh"
 #include "ops/linear/fp8/fp8_prepack_sm70.cuh"
@@ -20,9 +21,11 @@
 namespace ninfer::ops::detail {
 namespace {
 
-__global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
+using pre_ampere::Operand;
+
+__global__ void dequant_fp8_row_to_operand(const std::uint8_t* __restrict__ codes, int n, int k,
                                         bool prepacked, const __nv_bfloat16* scales,
-                                        bool block_scaled, cutlass::half_t* __restrict__ out) {
+                                        bool block_scaled, Operand* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
     const int pair_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= n || pair_idx >= k / 2) { return; }
@@ -35,35 +38,29 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
     const float2 weight = decode_fp8_e4m3x2(packed);
     const float scale = block_scaled ? __bfloat162float(scales[(row / 128) * (k / 128) + k0 / 128])
                                      : 1.0F;
-    cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[pair_idx * 2]     = cutlass::half_t(weight.x * scale);
-    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y * scale);
+    Operand* out_row = out + static_cast<std::int64_t>(row) * k;
+    out_row[pair_idx * 2]     = Operand(weight.x * scale);
+    out_row[pair_idx * 2 + 1] = Operand(weight.y * scale);
 }
 
-__global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
-                                    cutlass::half_t* __restrict__ out, std::int64_t count) {
+__global__ void bf16_to_operand_kernel(const __nv_bfloat16* __restrict__ in,
+                                    Operand* __restrict__ out, std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+    if (i < count) { out[i] = Operand(__bfloat162float(in[i])); }
 }
 
-using ElementAccumulator     = float;
-using ElementInput           = cutlass::half_t;
-using ElementOutput          = cutlass::bfloat16_t;
+using ElementOutput = cutlass::bfloat16_t;
 template <class EpilogueOp, class Output = ElementOutput>
-using Gemm = cutlass::gemm::device::Gemm<
-    ElementInput, cutlass::layout::RowMajor, ElementInput, cutlass::layout::ColumnMajor,
-    Output, cutlass::layout::RowMajor, ElementAccumulator, cutlass::arch::OpClassTensorOp,
-    cutlass::arch::Sm70, cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<8, 8, 4>,
-    EpilogueOp,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
-using PlainGemm = Gemm<cutlass::epilogue::thread::LinearCombination<ElementOutput, 8, float, float>>;
-using RowScaledGemm = Gemm<Fp8RowScaledBf16Epilogue>;
-using Fp32Gemm = Gemm<cutlass::epilogue::thread::LinearCombination<float, 4, float, float>, float>;
+using Gemm          = pre_ampere::Gemm<Output, EpilogueOp>;
+using PlainGemm     = Gemm<pre_ampere::LinearEpilogue<ElementOutput>>;
+using RowScaledGemm = Gemm<Fp8RowScaledBf16Epilogue<pre_ampere::kEpilogueVector<ElementOutput>>>;
+using Fp32Gemm      = Gemm<pre_ampere::LinearEpilogue<float>, float>;
 
 // The broadcast epilogue wins on wide output projections and gate/up. It slows
 // narrow calls and long-K residuals, which retain the separate scaling kernel.
+// The SIMT (Pascal) epilogue stores one element per access; it keeps the separate scaling kernel.
 bool fuse_row_scale(int n, int k, int t) {
+    if constexpr (!pre_ampere::kVectorEpilogue) { return false; }
     return t >= 1024 && (k == 3072 || (k == 5120 && n >= 16384));
 }
 
@@ -86,8 +83,8 @@ template <class Allocator>
 Scratch<Allocator> allocate_scratch(Allocator& allocator, int n, int k, int cols,
                                     std::size_t gemm_bytes) {
     Scratch<Allocator> out;
-    out.weight = allocator.alloc(DType::FP16, {k, n});
-    out.input  = allocator.alloc(DType::FP16, {k, cols});
+    out.weight = allocator.alloc(pre_ampere::kOperandDType, {k, n});
+    out.input  = allocator.alloc(pre_ampere::kOperandDType, {k, cols});
     if (gemm_bytes != 0) { out.gemm = allocator.alloc_bytes(gemm_bytes); }
     return out;
 }
@@ -100,7 +97,7 @@ std::size_t gemm_workspace_bytes(int n, int k, int cols) {
 }
 
 template <bool Fused, bool UnscaledFp32 = false>
-void run_gemm(const cutlass::half_t* input, const cutlass::half_t* weight, const Weight& w,
+void run_gemm(const Operand* input, const Operand* weight, const Weight& w,
               Tensor& out, int t, DeviceSpan scratch, cudaStream_t stream) {
     using Operation = std::conditional_t<UnscaledFp32, Fp32Gemm,
                                          std::conditional_t<Fused, RowScaledGemm, PlainGemm>>;
@@ -154,19 +151,19 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     const std::size_t gemm_bytes = gemm_workspace_bytes(n, k, t);
     auto scope = ws.scope();
     Scratch<WorkspaceArena> scratch = allocate_scratch(ws, n, k, t, gemm_bytes);
-    auto* weight = static_cast<cutlass::half_t*>(scratch.weight.data);
-    auto* input  = static_cast<cutlass::half_t*>(scratch.input.data);
+    auto* weight = static_cast<Operand*>(scratch.weight.data);
+    auto* input  = static_cast<Operand*>(scratch.input.data);
 
     const dim3 block(256);
     const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
-    dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
+    dequant_fp8_row_to_operand<<<grid, block, 0, stream>>>(
         static_cast<const std::uint8_t*>(w.qdata), n, k,
         w.layout == QuantLayout::VoltaQpnPrepacked,
         static_cast<const __nv_bfloat16*>(w.scales),
         w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S, weight);
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
-    bf16_to_fp16_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
+    bf16_to_operand_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), input, input_count);
     CUDA_CHECK(cudaGetLastError());
 

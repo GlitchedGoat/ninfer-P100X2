@@ -15,7 +15,7 @@ namespace ninfer::ops::detail {
 void gqa_remap_positions_launch(const Tensor& positions, const Tensor& page_indices,
                                 Tensor& out, cudaStream_t stream);
 
-enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt, VoltaFlash };
+enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt, VoltaFlash, PascalFlash };
 
 struct GqaSmallTInvocation {
     const Tensor* valid_columns = nullptr;
@@ -63,7 +63,20 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream);
 
-#ifdef NINFER_PRE_AMPERE_BUILD
+#ifdef NINFER_PASCAL_BUILD
+// Pascal (sm_60) prefill route: FP32 SIMT flash attention reading the paged INT8-G64 cache in
+// place (gqa_attention_pascal_flash.cu). Appends the chunk's K/V itself, honours valid_columns
+// with the chunked route's semantics, and needs no workspace.
+inline constexpr std::int32_t kPascalFlashMinimumWidth = 64;
+
+void gqa_attention_pascal_flash_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& positions, const Tensor& valid_columns,
+                                       const Tensor& table_rows, float scale,
+                                       PagedKVBatchLayerView cache, Tensor& out,
+                                       cudaStream_t stream);
+#endif // NINFER_PASCAL_BUILD
+
+#ifdef NINFER_VOLTA_BUILD
 // Volta (sm_70) flash-attention prefill route. Defined in
 // gqa_attention_volta_flash.cu, the only translation unit that sees the vendored
 // llama.cpp kernel. See the V100 performance summary.
@@ -99,6 +112,6 @@ void gqa_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Te
                                       Tensor& k_gathered, Tensor& v_gathered, Tensor& mask,
                                       Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
                                       cudaStream_t stream);
-#endif // NINFER_PRE_AMPERE_BUILD
+#endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

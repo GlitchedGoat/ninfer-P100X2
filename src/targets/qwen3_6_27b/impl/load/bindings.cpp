@@ -946,13 +946,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (tp == 4 || native_fp8) { throw std::invalid_argument("27B TP4 currently requires SM70"); }
 #endif
 #ifdef NINFER_PASCAL_BUILD
-    // GP100 has SIMT routes only for the preserved GGUF Q4_K/Q6_K projections; every other
-    // weight format still dispatches to Tensor-Core or Ampere-only kernels.
-    if (weights_profile != WeightsProfile::Qwen38GgmlK) {
-        throw std::invalid_argument("SM60 supports only qwen3.8-27b/gguf-q4-k-m");
+    // GP100 SIMT routes cover the Qwen3.8-27B NVFP4 package (NVFP4/FP8 row/W8/Q4G64/BF16 Text
+    // and MTP) and the preserved GGUF Q4_K/Q6_K projections. Other identities and Vision/DFlash
+    // still dispatch to Tensor-Core or Ampere-only kernels.
+    if (weights_profile != WeightsProfile::Qwen38Nvfp4 &&
+        weights_profile != WeightsProfile::Qwen38GgmlK) {
+        throw std::invalid_argument(
+            "SM60 supports only qwen3.8-27b/nvfp4 and qwen3.8-27b/gguf-q4-k-m");
     }
     if (features.vision || features.dflash()) {
-        throw std::invalid_argument("SM60 qwen3.8-27b/gguf-q4-k-m supports Text/None/MTP only");
+        throw std::invalid_argument("SM60 supports Text/None/MTP only");
     }
 #endif
     if (tp == 4 && features.dflash()) {

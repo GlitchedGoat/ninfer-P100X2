@@ -119,7 +119,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
                                bool expert_storage) {
 #ifdef NINFER_PASCAL_BUILD
     // The 35B-A3B sparse-MoE and W8 routes have no GP100 SIMT implementation yet.
-    throw std::invalid_argument("SM60 supports only qwen3.8-27b/gguf-q4-k-m");
+    throw std::invalid_argument(
+        "SM60 supports only qwen3.8-27b/nvfp4 and qwen3.8-27b/gguf-q4-k-m");
 #endif
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;

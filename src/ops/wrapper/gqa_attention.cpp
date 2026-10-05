@@ -425,9 +425,13 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
         return GqaAttentionRoute::VoltaFlash;
     }
 #else
-    // Pascal has no VoltaFlash (SM70 Tensor Cores). ChunkedSmallT is correct for every width
-    // but re-reads the visible history once per chunk; a SIMT tiled prefill kernel is pending.
-    (void)cache_dtype;
+    // Pascal: FP32 SIMT flash attention over the paged INT8 cache, no staging workspace.
+    if ((q_heads == 24 || q_heads == 12 || q_heads == 6) && batch_size == 1 &&
+        cache_dtype == DType::I8 && width >= detail::kPascalFlashMinimumWidth &&
+        envelope.min_visible_keys == envelope.max_visible_keys &&
+        envelope.max_visible_keys >= static_cast<std::uint32_t>(width)) {
+        return GqaAttentionRoute::PascalFlash;
+    }
 #endif
     // GqaAttentionRoute::Prompt (gqa_attention_prompt_{launch,attention_launch} ->
     // ops/kernel/gqa_attention_prefill_{bf16,i8}.cuh) is a tensor-core flash-attention kernel
@@ -464,6 +468,8 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
         return "prompt";
     case GqaAttentionRoute::VoltaFlash:
         return "volta_flash";
+    case GqaAttentionRoute::PascalFlash:
+        return "pascal_flash";
     }
     return "unknown";
 }
@@ -494,7 +500,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
             detail::gqa_attention_resolve_route(q_heads, width, batch_size, cache_dtype, envelope);
-        if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::GqaAttentionRoute::Prompt ||
+            route == detail::GqaAttentionRoute::PascalFlash) {
+            return std::size_t{0};
+        }
         // The VoltaFlash route carries its own staging, declared once from max_width below.  A
         // masked B=1 call cannot use that route (the flash launcher has no valid-column input) and
         // falls back to ChunkedSmallT, so retain the chunked high-water here as well.  The extra
@@ -615,6 +624,13 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         route = detail::GqaAttentionRoute::ChunkedSmallT;
     }
 #endif // NINFER_VOLTA_BUILD
+#ifdef NINFER_PASCAL_BUILD
+    if (route == detail::GqaAttentionRoute::PascalFlash) {
+        detail::gqa_attention_pascal_flash_launch(q, k, v, positions, valid_columns, kv_table_rows,
+                                                  scale, cache, out, stream);
+        return;
+    }
+#endif // NINFER_PASCAL_BUILD
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);

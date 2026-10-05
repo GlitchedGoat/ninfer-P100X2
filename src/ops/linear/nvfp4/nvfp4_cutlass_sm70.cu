@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/common/pre_ampere_gemm.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include "cutlass/bfloat16.h"
@@ -18,14 +19,16 @@
 namespace ninfer::ops::detail {
 namespace {
 
+using pre_ampere::Operand;
+
 // The artifact stores adjacent E2M1 values in each code byte and one E4M3 scale per K16 group.
 // Scales use the BlockScaleK16M128x4 swizzle. Materializing once is intentionally a wide-T
-// strategy: CUTLASS can reuse the resulting FP16 matrix across every token tile instead of
+// strategy: CUTLASS can reuse the resulting dense matrix across every token tile instead of
 // decoding the packed weights again for each tile.
 __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes,
                                            const std::uint8_t* __restrict__ scales, int n, int k,
                                            float inverse_weight_divisor,
-                                           cutlass::half_t* __restrict__ out) {
+                                           Operand* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
     const int byte_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int bytes_per_row = k / 2;
@@ -42,15 +45,17 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
     const float coefficient = decode_nvfp4_e4m3(scales[scale_offset]) * inverse_weight_divisor;
     const float2 value = decode_nvfp4_e2m1x2(
         codes[static_cast<std::int64_t>(row) * bytes_per_row + byte_idx]);
-    cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[k0]     = cutlass::half_t(value.x * coefficient);
-    out_row[k0 + 1] = cutlass::half_t(value.y * coefficient);
+    Operand* out_row = out + static_cast<std::int64_t>(row) * k;
+    out_row[k0]     = Operand(value.x * coefficient);
+    out_row[k0 + 1] = Operand(value.y * coefficient);
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// QPN prepacking (and this decoder) exists only on Volta; Pascal keeps the canonical layout.
 __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes,
                                           const std::uint8_t* __restrict__ scales, int n, int k,
                                           float inverse_weight_divisor,
-                                          cutlass::half_t* __restrict__ out) {
+                                          Operand* __restrict__ out) {
     // Consecutive lanes read consecutive packed K16 tuples. The old row-wise traversal made
     // adjacent lanes skip 256 input bytes and decoded every tuple twice. Each lane now loads
     // its eight code bytes once and writes the complete, aligned 32-byte FP16 group.
@@ -66,50 +71,31 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
     const uint2 packed_words = __ldg(reinterpret_cast<const uint2*>(codes) + tuple);
     const auto* packed = reinterpret_cast<const std::uint8_t*>(&packed_words);
     const float coefficient = decode_nvfp4_e4m3(scales[tuple]) * inverse_weight_divisor;
-    alignas(16) cutlass::half_t values[16];
+    alignas(16) Operand values[16];
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
         const int position  = inverse_order[j];
         const float2 pair   = decode_nvfp4_e2m1x2(packed[position / 2]);
-        values[j] = cutlass::half_t(((position & 1) == 0 ? pair.x : pair.y) * coefficient);
+        values[j] = Operand(((position & 1) == 0 ? pair.x : pair.y) * coefficient);
     }
     auto* destination = reinterpret_cast<uint4*>(
         out + static_cast<std::int64_t>(row) * k + group * 16);
     destination[0] = reinterpret_cast<const uint4*>(values)[0];
     destination[1] = reinterpret_cast<const uint4*>(values)[1];
 }
+#endif // NINFER_VOLTA_BUILD
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
-                                    cutlass::half_t* __restrict__ out, std::int64_t count) {
+                                    Operand* __restrict__ out, std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+    if (i < count) { out[i] = Operand(__bfloat162float(in[i])); }
 }
 
 int div_up_i(int a, int b) { return (a + b - 1) / b; }
 
-using ElementAccumulator     = float;
-using ElementComputeEpilogue = ElementAccumulator;
-using ElementInputA          = cutlass::half_t;
-using ElementInputB          = cutlass::half_t;
-using LayoutInputA           = cutlass::layout::RowMajor;
-using LayoutInputB           = cutlass::layout::ColumnMajor;
-using LayoutOutput           = cutlass::layout::RowMajor;
-using MMAOp                  = cutlass::arch::OpClassTensorOp;
-using SmArch                 = cutlass::arch::Sm70;
-using ShapeMMAWarp           = cutlass::gemm::GemmShape<64, 64, 32>;
-using ShapeMMAOp             = cutlass::gemm::GemmShape<8, 8, 4>;
-using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-constexpr int kNumStages = 2;
-template <class ElementOutput>
-using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-    ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
-    ElementComputeEpilogue>;
+using ElementComputeEpilogue = float;
 template <class ElementOutput, int TileN = 128>
-using GemmFor = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
-                                         ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
-                                         SmArch, cutlass::gemm::GemmShape<128, TileN, 32>,
-                                         ShapeMMAWarp, ShapeMMAOp,
-                                         EpilogueOp<ElementOutput>, SwizzleThreadBlock, kNumStages>;
+using GemmFor = pre_ampere::Gemm<ElementOutput, pre_ampere::LinearEpilogue<ElementOutput>, TileN>;
 using Gemm = GemmFor<cutlass::bfloat16_t>;
 
 template <class Allocator>
@@ -124,8 +110,8 @@ CutlassWorkspace<Allocator> allocate_cutlass_workspace(Allocator& allocator, std
                                                        std::int32_t k, std::int32_t cols,
                                                        std::size_t gemm_workspace_bytes) {
     CutlassWorkspace<Allocator> out;
-    out.w_fp16 = allocator.alloc(DType::FP16, {k, n});
-    out.x_fp16 = allocator.alloc(DType::FP16, {k, cols});
+    out.w_fp16 = allocator.alloc(pre_ampere::kOperandDType, {k, n});
+    out.x_fp16 = allocator.alloc(pre_ampere::kOperandDType, {k, cols});
     if (gemm_workspace_bytes > 0) { out.gemm_workspace = allocator.alloc_bytes(gemm_workspace_bytes); }
     return out;
 }
@@ -158,16 +144,20 @@ void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
     auto scratch_scope = ws.scope();
     CutlassWorkspace<WorkspaceArena> scratch =
         allocate_cutlass_workspace(ws, n, k, cols, gemm_workspace_bytes);
-    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
-    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
+    auto* w_fp16 = static_cast<Operand*>(scratch.w_fp16.data);
+    auto* x_fp16 = static_cast<Operand*>(scratch.x_fp16.data);
 
     const dim3 block(256);
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+#ifndef NINFER_VOLTA_BUILD
+        throw std::invalid_argument("nvfp4 prefill: QPN-prepacked weights exist only on SM70");
+#else
         const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
         dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
             w_fp16);
+#endif
     } else {
         const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(n), 1u);
         dequant_nvfp4_row_to_fp16<<<grid, block, 0, stream>>>(

@@ -4,22 +4,18 @@
 // whose dispatchers still require one of these routes (see qwen3_6_27b bind_artifact), so they are
 // unreachable from the Engine; reaching one is a routing bug, never a silent no-op.
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
-#include "ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.h"
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q5/q5_launch.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.h"
-#include "ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.h"
 #include "ops/linear/bf16/bf16_launch.h"
-#include "ops/linear/fp8/fp8_cutlass_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
-#include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #include "ops/linear/w8/w8_launch.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_cutlass_sm70.h"
@@ -44,16 +40,6 @@ namespace {
 void bf16_attn_input_cutlass_sm70_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v,
                                          cudaStream_t stream) { unavailable("bf16_attn_input_cutlass_sm70_launch"); }
-
-void fp8_attn_input_cutlass_sm70_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                        Tensor& gate, Tensor& k, Tensor& v,
-                                        WorkspaceArena& workspace, cudaStream_t stream) { unavailable("fp8_attn_input_cutlass_sm70_launch"); }
-
-void fp8_attn_input_cutlass_sm70_launch_shard(const Tensor& x, const Weight& weight, Tensor& q,
-                                              Tensor& gate, Tensor& k, Tensor& v,
-                                              WorkspaceArena& workspace, cudaStream_t stream) { unavailable("fp8_attn_input_cutlass_sm70_launch_shard"); }
-
-std::size_t fp8_attn_input_cutlass_workspace_bytes(std::int32_t tokens) { unavailable("fp8_attn_input_cutlass_workspace_bytes"); }
 
 bool fp8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                            std::int32_t t) noexcept { return false; }
@@ -99,15 +85,6 @@ bool q5_volta_mma_supported(std::int32_t n, std::int32_t k,
 std::size_t q5_volta_mma_workspace_bytes(std::int32_t n, std::int32_t k,
                                                       std::int32_t t) noexcept { return 0; }
 
-void fp8_gdn_input_cutlass_sm70_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                       Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) { unavailable("fp8_gdn_input_cutlass_sm70_launch"); }
-
-void fp8_gdn_input_cutlass_sm70_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                             Tensor& z, WorkspaceArena& workspace,
-                                             cudaStream_t stream) { unavailable("fp8_gdn_input_cutlass_sm70_launch_shard"); }
-
-std::size_t fp8_gdn_input_cutlass_workspace_bytes(std::int32_t tokens) { unavailable("fp8_gdn_input_cutlass_workspace_bytes"); }
-
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream) { unavailable("launch_fp8_gdn_input_volta_qpn"); }
 
@@ -136,24 +113,9 @@ void launch_bf16_cutlass_sm70(const Tensor& x, const Weight& weight, Tensor& out
 void launch_bf16_volta_qpn(const Tensor& x, const Weight& weight, Tensor& out,
                           cudaStream_t stream) { unavailable("launch_bf16_volta_qpn"); }
 
-void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                             cudaStream_t stream) { unavailable("fp8_cutlass_sm70_launch"); }
-
-void fp8_cutlass_sm70_unscaled_fp32_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                           WorkspaceArena& ws, cudaStream_t stream) { unavailable("fp8_cutlass_sm70_unscaled_fp32_launch"); }
-
-std::size_t fp8_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
-                                                            std::int32_t cols) { unavailable("fp8_cutlass_sm70_workspace_bytes"); }
-
 void launch_fp8_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t) { unavailable("launch_fp8_volta_qpn"); }
 
 void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t) { unavailable("launch_nvfp4_volta_qpn"); }
-
-void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream) { unavailable("nvfp4_cutlass_sm70_launch"); }
-
-std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
-                                                              std::int32_t cols) { unavailable("nvfp4_cutlass_sm70_workspace_bytes"); }
 
 bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept { return false; }
@@ -186,9 +148,6 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
 
 bool fp8_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
                                                           std::int32_t t) noexcept { return false; }
-
-void nvfp4_cutlass_sm70_fp32_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                    WorkspaceArena& ws, cudaStream_t stream) { unavailable("nvfp4_cutlass_sm70_fp32_launch"); }
 
 void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           float* gate_scratch, void* activation_scratch,

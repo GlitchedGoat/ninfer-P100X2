@@ -10,7 +10,7 @@ property the owner values: **tensor-parallel TP2 that keeps both GPUs busy on ev
 (not llama.cpp-style layer split). First numerical target is **FP32 SIMT arithmetic**; FP16x2
 (`HFMA2`, 2× FP32 rate on GP100) comes later with explicit error control.
 
-Primary workload (inherited from V100X2): `qwen3.8-27b/gguf-q4-k-m`, TP2, Text + MTP (≤3 drafts),
+Primary workload: **`qwen3.8-27b/nvfp4`** (`.ninfer`, owner direction 2026-10-05), also `gguf-q4-k-m`; TP2, Text + MTP (≤3 drafts),
 INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first scope
 (see conversation queue C-1).
 
@@ -27,6 +27,9 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
   `T-008` (validation plan) as a concrete step, not a guess presented as a result.
 
 ## Build environment (no NVIDIA apt repo needed)
+
+Full procedure and pitfalls: [`ENV-SETUP.md`](ENV-SETUP.md). Session summaries live in
+`session-summaries/` at the repo root; write one at the end of each session and commit it.
 
 ```bash
 scripts/p100/setup_cuda_toolchain.sh /opt/cuda-12.8      # CUDA 12.8 from conda-forge
@@ -53,4 +56,5 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | T-008 | P100 hardware validation plan | see ticket |
 | T-009 | FP16x2 error-controlled arithmetic (post-FP32) | blocked on C-3 |
 | T-010 | P100 performance tuning | blocked on hardware |
-| T-011 | Pascal SIMT flash-attention prefill | design ready (C-7) |
+| T-011 | Pascal flash-attention prefill (paged INT8, 0 workspace) | implemented |
+| T-012 | NVFP4 `.ninfer` identity on Pascal | in progress |
