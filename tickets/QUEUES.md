@@ -28,4 +28,6 @@
 | W-8 | Static audit: resource usage dump, warp-sync patterns | T-006 | resource + trap audit done; warp-sync review todo |
 | W-9 | Pascal flash prefill attention | T-011 | implemented, builds (155 regs, 32 KiB smem) |
 | W-11 | NVFP4 identity on Pascal: dual-arch dense prefill GEMMs (FP8/NVFP4), admission | T-012 | in progress |
-| W-10 | Dockerfile variant on CUDA 12.8 for Pascal | T-008 | todo |
+| W-10 | Dockerfile variant on CUDA 12.8 for Pascal | T-008 | done (parameterized `CUDA_VERSION`/`CUDA_ARCH`) |
+| W-12 | `p100_validation_tests` umbrella target (only the T-008 tests; ~5 GB instead of 26 GB) | T-008 | todo (after sm_70 build) |
+| W-13 | Opt-in `NINFER_SHARED_LIBS` for dev/test builds: one device-resolved `.so` per library, host-only tests link it (~1 GB instead of 26 GB); product builds stay static | T-004 | todo (after sm_70 build) |
