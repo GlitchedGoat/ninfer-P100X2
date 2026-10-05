@@ -2,8 +2,11 @@
 """List GP100 resource risks in an sm_60 build: per-kernel static shared memory above the
 48 KiB per-block limit, local-memory spills, and register pressure that caps occupancy.
 
-Usage: scripts/p100/audit_resources.py build-p100/src/libninfer_ops.a [--all]
+Usage: scripts/p100/audit_resources.py build-p100/src/libninfer_ops.a [--all] [--traps]
 Dynamic shared memory is a launch-time value and is not visible here (see T-006).
+
+--traps lists kernels whose SASS contains BPT.TRAP: Ampere-only bodies compiled as `__trap()`
+stubs below SM80 (ops/common/mma.cuh). None of them may be reachable from a Pascal route.
 """
 import re
 import subprocess
@@ -12,10 +15,31 @@ import sys
 SHARED_LIMIT = 48 * 1024
 
 
+def list_traps(path: str) -> int:
+    sass = subprocess.run(["cuobjdump", "-sass", path], check=True, capture_output=True,
+                          text=True).stdout
+    trapping = set()
+    name = None
+    for line in sass.splitlines():
+        match = re.search(r"Function : (\S+)", line)
+        if match:
+            name = match.group(1)
+        elif name and "BPT.TRAP" in line:
+            trapping.add(name)
+    names = subprocess.run(["c++filt"], input="\n".join(sorted(trapping)), capture_output=True,
+                           text=True).stdout.splitlines()
+    for pretty in sorted(names):
+        print(pretty[:200])
+    print(f"{len(trapping)} kernels contain BPT.TRAP")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
+    if "--traps" in sys.argv:
+        return list_traps(sys.argv[1])
     show_all = "--all" in sys.argv
     dump = subprocess.run(["cuobjdump", "--dump-resource-usage", sys.argv[1]],
                           check=True, capture_output=True, text=True).stdout
