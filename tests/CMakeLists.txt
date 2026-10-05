@@ -550,3 +550,46 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+# --- P100X2 validation subsets (tickets/T-008) ----------------------------------------------------
+# Every test executable statically links the whole device image (~280 MB each, ~26 GB for all of
+# them), so the Pascal runbook builds only the tests covering the SM60-admitted identities
+# (qwen3.8-27b/nvfp4, qwen3.8-27b/gguf-q4-k-m; TP1/TP2 Text/MTP):
+#   cmake --build build-p100 --target p100_op_tests      # operators, TP2 splits, device/runtime
+#   cmake --build build-p100 --target p100_model_tests   # real-model TP2 checks (need artifacts)
+set(NINFER_P100_OP_TESTS
+  # GGML_K and every format the NVFP4 artifact uses (NVFP4, row FP8, W8 MTP, Q4G64 draft head, BF16)
+  ninfer_ggml_k_test
+  ninfer_linear_nvfp4_a16_test ninfer_linear_fp8_a16_test ninfer_linear_w8_a16_test
+  ninfer_linear_q4_a16_test ninfer_linear_bf16_a16_test
+  ninfer_linear_swiglu_nvfp4_test ninfer_linear_swiglu_fp8_test ninfer_linear_swiglu_w8_a16_test
+  ninfer_linear_add_nvfp4_test ninfer_linear_add_fp8_test ninfer_linear_add_w8_a16_test
+  ninfer_linear_pair_w8_a16_test
+  ninfer_attn_input_proj_test ninfer_gdn_input_proj_test ninfer_gdn_input_proj_conv_snapshot_test
+  ninfer_gdn_input_proj_conv_record_test ninfer_gated_delta_net_replay_record_test
+  ninfer_gdn_replay_fold_test
+  # Attention (incl. the Pascal flash prefill route), KV cache, MTP mechanics
+  ninfer_gqa_attention_test ninfer_gqa_attention_long_context_test ninfer_kv_cache_append_prefix_test
+  ninfer_prepare_masked_block_test ninfer_mtp_pack_test ninfer_mtp_round_test
+  ninfer_speculative_round_test
+  # TP2 shards and the collective
+  ninfer_linear_split_test ninfer_linear_add_split_test ninfer_linear_swiglu_split_test
+  ninfer_attn_input_proj_split_test ninfer_gdn_projections_split_test ninfer_output_head_split_test
+  ninfer_attention_headlocal_test ninfer_gdn_headsplit_test ninfer_mtp_split_test
+  ninfer_allreduce_test
+  # Device and runtime mechanisms
+  ninfer_device_test ninfer_decode_graph_test ninfer_kv_cache_test ninfer_kv_capacity_tp2_test)
+set(NINFER_P100_MODEL_TESTS
+  ninfer_qwen3_8_27b_tp2_real_test ninfer_qwen3_8_27b_mtp_tp2_real_test
+  ninfer_qwen3_8_27b_tp2_parity_test ninfer_qwen3_8_27b_graph_tp2_test
+  ninfer_qwen3_8_27b_v100x2_real_test)
+foreach(subset IN ITEMS OP MODEL)
+  string(TOLOWER "p100_${subset}_tests" subset_target)
+  add_custom_target(${subset_target})
+  foreach(test_target IN LISTS NINFER_P100_${subset}_TESTS)
+    if(NOT TARGET ${test_target})
+      message(FATAL_ERROR "${subset_target}: unknown test target ${test_target}")
+    endif()
+    add_dependencies(${subset_target} ${test_target})
+  endforeach()
+endforeach()

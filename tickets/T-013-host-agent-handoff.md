@@ -29,7 +29,9 @@ Record everything in the tickets (not only in chat), commit after each step, and
 2. **Toolchain.** If CUDA 12.8 (or any 12.x ≥ 12.8) is installed, use it; otherwise run
    `scripts/p100/setup_cuda_toolchain.sh /opt/cuda-12.8`. Do not use CUDA 13.
 3. **Build of record.** T-008 step 1 (`build-p100/`, `-DCMAKE_CUDA_ARCHITECTURES=60`,
-   `-DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON`). No source edits while it builds. Record the
+   `-DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON`), building only
+   `--target ninfer ninfer-serve ninfer_bench p100_op_tests` (all tests need ~26 GB of disk;
+   add `p100_model_tests` once an artifact is present). No source edits while it builds. Record the
    source commit and result in T-004. If a test target fails to compile, record it and continue
    with the rest (`-- -k 0`).
 4. **Device + transport (T-007).** T-008 step 2. Record P2P on/off, bandwidth both directions and

@@ -20,8 +20,8 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
   ~280 MB because every one statically links the whole device image. The cloud container's
   allowance is ~39 GB, so a second build tree (e.g. an sm_70 regression build) will not fit
   alongside it, and the failure shows up as `ld: No space left on device` at link time. Build
-  only the targets you need (`--target ninfer` or the T-008 test list), or delete linked test
-  binaries first (see `ENV-SETUP.md` §4). W-12/W-13 in `QUEUES.md` track reducing this.
+  only the targets you need (`--target ninfer`, `p100_op_tests`, `p100_model_tests`), or delete
+  linked test binaries first (see `ENV-SETUP.md` §4). T-014 tracks shared-library test builds.
 - **A full sm_60 build takes well over an hour** on 4 cores at `-j3`; some CUDA TUs take 5–10 min.
 - **No source/CMake edits while a build runs**; only an edit-free pass is a build of record.
 - **Stopping a build leaves orphaned `nvcc`/`cicc`/`ptxas` processes**; kill them too.
@@ -77,3 +77,4 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | T-011 | Pascal flash-attention prefill (paged INT8, 0 workspace) | implemented |
 | T-012 | NVFP4 `.ninfer` identity on Pascal | in progress |
 | T-013 | Handoff prompt for the P100 host agent | ready |
+| T-014 | Opt-in shared libraries for test builds | todo (later) |

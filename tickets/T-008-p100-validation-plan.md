@@ -23,7 +23,9 @@ scripts/p100/setup_cuda_toolchain.sh /opt/cuda-12.8      # or NVIDIA's cuda-tool
 export PATH=/opt/cuda-12.8/bin:$PATH CUDAToolkit_ROOT=/opt/cuda-12.8
 cmake -S . -B build-p100 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=60 \
       -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON
-cmake --build build-p100 -j"$(( $(nproc) * 8 / 10 ))"
+cmake --build build-p100 -j"$(( $(nproc) * 8 / 10 ))" --target ninfer ninfer-serve ninfer_bench p100_op_tests
+# later, once a model artifact is present: --target p100_model_tests
+# (all 133 tests need ~26 GB of disk; the subsets ~12 GB — see PROMPT.md gotchas)
 cuobjdump --list-elf build-p100/apps/ninfer | head          # expect sm_60 cubins
 ```
 Pass: build succeeds; binary contains `sm_60` code.
