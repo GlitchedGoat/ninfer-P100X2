@@ -1,6 +1,6 @@
 # T-006 — GP100 shared-memory, ISA and warp-synchronization audit
 
-**Status:** todo (partially covered while porting)
+**Status:** resource/trap audit done; warp-sync review and hardware sanitizer runs pending
 **Depends on:** T-004
 
 ## Why
@@ -35,3 +35,10 @@ Three GP100 limits do not show up as compile errors everywhere:
   allreduce, MTP round).
 - On the P100 host: `compute-sanitizer --tool synccheck` and `--tool racecheck` on
   `ninfer_gqa_attention_test`, `ninfer_ggml_k_test`, `ninfer_gdn_input_proj_test` (T-008 step 3).
+
+## Results (2026-10-05, build of record `acb5e75`)
+
+`scripts/p100/audit_resources.py build-p100/src/libninfer_ops.a`: 7,764 kernels; 0 over 48 KiB
+static smem; 0 spills; 916 with >128 registers. `--traps`: 1,199 kernels contain `BPT.TRAP`.
+New Pascal kernels: flash prefill 155 regs / 32 KiB smem (1 CTA/SM — tuning item); GGML_K SIMT tile
+48–56 regs / 26–35 KiB smem.

@@ -1,6 +1,6 @@
 # T-004 — Make every translation unit compile and link for `sm_60`
 
-**Status:** in progress
+**Status:** apps done (build of record `acb5e75`); tests building; sm_70 regression pending
 **Depends on:** T-003
 
 ## Approach
@@ -35,4 +35,13 @@
 
 ## Results
 
-(pending first full pass)
+- **Build of record, source `acb5e75`:** `ninfer` and `ninfer-serve` compile and link for sm_60
+  (CUDA 12.8.93, GCC 13.3). `cuobjdump --list-elf` shows `sm_60` cubins only. `ninfer --help` runs
+  (host side; container has no driver, checked with the toolkit's stub `libcuda.so`).
+- Diagnostic passes found: WMMA in `ggml_k.cu` (fixed: Pascal SIMT tile), Volta TC header include in
+  `fp8_block.cu` (fixed: Volta-only), and one missing link symbol `q4_volta_qpn_supported` (stubbed
+  `false`). The `#error` guards caught every Tensor-Core include at compile time as designed.
+- Static audit of `libninfer_ops.a` (7,764 sm_60 kernels): **0** kernels over 48 KiB static smem,
+  **0** with local-memory spills; 916 use >128 registers (occupancy, not correctness).
+  1,199 kernels contain `BPT.TRAP` (Ampere-only bodies compiled as trap stubs); reachability from
+  Pascal routes is argued per route in T-005/T-012 and must be confirmed by T-008 step 3.
