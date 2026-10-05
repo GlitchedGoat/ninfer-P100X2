@@ -51,3 +51,11 @@ through the same workspace queries; whether 180k context still fits is C-6 / T-0
 - 2026-10-05: admission widened (`bindings.cpp`); `pre_ampere_gemm.cuh` added; `fp8_cutlass_sm70.cu`,
   `nvfp4_cutlass_sm70.cu`, FP8 attention/GDN-input CUTLASS TUs moved to the shared SM60/SM70
   source list; corresponding stubs removed.
+- 2026-10-05: **bug fixed** — NVFP4 SwiGLU on pre-Ampere routed every non-QPN width (2..∞) to the
+  dense dequant+CUTLASS route; with no QPN on Pascal that meant MTP-verify widths (T=2–4)
+  dequantized the full gate/up matrix to FP32 every call. Pascal now uses the fused SIMT
+  small-T kernel for T ≤ 16 (decode T=1 already used the fused SIMT decode kernel).
+- 2026-10-05: audited FP8 SwiGLU (falls back to chunked SIMT), NVFP4/FP8 residual add
+  (`LinearThenAdd` → `linear()` → SIMT/dense): correct on Pascal. Tuning candidate: on Pascal
+  NVFP4 weights are never QPN-prepacked, so the fused A16 residual-add kernels could replace
+  `LinearThenAdd` (T-010).

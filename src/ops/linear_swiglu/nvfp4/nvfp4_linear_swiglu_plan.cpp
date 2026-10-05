@@ -44,7 +44,12 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-#ifdef NINFER_PRE_AMPERE_BUILD
+#ifdef NINFER_PASCAL_BUILD
+        // GP100 has no QPN route: the fused SIMT kernel owns MTP-verify widths, and only wide
+        // calls materialize the dequantized matrix for the dense SIMT GEMM.
+        if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+        return Nvfp4LinearSwiGluRoute::VoltaCutlass;
+#elif defined(NINFER_PRE_AMPERE_BUILD)
         if (nvfp4_linear_swiglu_qpn_split_supported(
                 Nvfp4MlpGateUpGeometry::kOutputRows,
                 Nvfp4MlpGateUpGeometry::kInputRows, tokens)) {
