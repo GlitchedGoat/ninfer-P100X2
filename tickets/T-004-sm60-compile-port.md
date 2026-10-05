@@ -55,3 +55,5 @@
   `BUILD_TESTING=OFF`), `--target ninfer`: 297/297 steps, links, `sm_70` cubins only (17 min). The
   flag split and the dual-arch prefill GEMM config leave the V100 build intact (compile-level; V100
   numerics untouched by construction: same tile shapes, operand types and epilogue widths).
+- **`9ac42c7` (W-14/15/17):** sm_60 build of record — apps + 11 touched-area tests, 306/306 (13 min);
+  `ninfer_pascal_convert_test` passes from the build tree. sm_70 incremental build of record — 31/31.
