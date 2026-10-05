@@ -52,6 +52,14 @@ Effect estimates are reasoning, not measurements. "Scope" is where to measure.
 2. `nsys` whole-request profile → rank the backlog by measured share of time.
 3. Implement the top item, re-check its oracle test, re-measure at the same scope, log here.
 
+## Implemented, not yet measured
+
+| ID | Commit | What | How to A/B on the host |
+|---|---|---|---|
+| O-12 | `9ac42c7` | FP8/NVFP4 dense prefill decodes ≤64 MiB FP32 row chunks (`pre_ampere::weight_chunk_rows`) | capacity at load (`--max-context` that fits); prefill tok/s vs chunk size |
+| O-16 | `9ac42c7` | NVFP4/FP8 residual add uses fused SIMT A16 kernels for T < 128 on Pascal | decode/verify step time; `ninfer_linear_add_{nvfp4,fp8}_test` for correctness |
+| O-4, O-8, O-14 | `9ac42c7` | `NINFER_PASCAL_FAST_CONVERT` (default ON): exact bit-construction for E4M3FN/E2M1 decode, GGML_K codes, INT8 KV staging | build twice (`-DNINFER_PASCAL_FAST_CONVERT=ON/OFF`), compare decode/prefill tok/s; outputs must be bit-identical (exhaustively checked by `ninfer_pascal_convert_test`) |
+
 ## Log
 
 - 2026-10-05: backlog consolidated from the porting work (T-005, T-006, T-011, T-012).

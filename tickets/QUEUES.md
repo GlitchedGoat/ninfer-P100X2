@@ -28,9 +28,9 @@
 | W-8 | Static audit: resource usage dump, warp-sync patterns | T-006 | done (sanitizer runs on host) |
 | W-9 | Pascal flash prefill attention | T-011 | implemented, builds (155 regs, 32 KiB smem) |
 | W-11 | NVFP4 identity on Pascal: dual-arch dense prefill GEMMs (FP8/NVFP4), admission | T-012 | done (builds; numerics on host) |
-| W-14 | O-12: chunk FP32 dense-prefill workspace for NVFP4/FP8 (capacity) | T-010 | in progress |
-| W-15 | O-16: fused A16 residual add for NVFP4/FP8 on Pascal | T-010 | in progress |
-| W-17 | O-8/O-14: avoid slow conversions (I2F, FP4/FP8 software decode) behind CMake `NINFER_PASCAL_FAST_CONVERT` (default ON, exact) for host A/B | T-010 | approved; after W-14/15 |
+| W-14 | O-12: chunk FP32 dense-prefill workspace for NVFP4/FP8 (capacity) | T-010 | done (`9ac42c7`); build of record running |
+| W-15 | O-16: fused A16 residual add for NVFP4/FP8 on Pascal | T-010 | done (`9ac42c7`); build of record running |
+| W-17 | O-8/O-14: avoid slow conversions behind CMake `NINFER_PASCAL_FAST_CONVERT` (default ON, exact) for host A/B | T-010 | done (`9ac42c7`); exactness test passes on host CPU |
 | W-16 | Review SIMT small-T kernels now on Pascal routes vs trap audit | T-006/T-012 | done (no trap kernel reachable) |
 | W-10 | Dockerfile variant on CUDA 12.8 for Pascal | T-008 | done (parameterized `CUDA_VERSION`/`CUDA_ARCH`) |
 | W-12 | Umbrella targets `p100_op_tests` (40) / `p100_model_tests` (5): ~12 GB instead of 26 GB | T-008 | done |
