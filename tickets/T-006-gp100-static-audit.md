@@ -59,3 +59,25 @@ Heuristic: in kernels outside Volta/Ampere-only files, find a thread- or lane-de
 New Pascal flash kernel: every shuffle sits outside lane-dependent branches (masking is applied to
 the reduced score, not around the reduction). Remaining evidence: `compute-sanitizer --tool
 synccheck` on the P100 host (T-008 step 3).
+
+## W-16: trap-bearing kernels vs Pascal routes (2026-10-05)
+
+`audit_resources.py --traps` grouped by kernel family (1,199 instantiations). Every family is an
+Ampere `mma.m16n8k16`/`ldmatrix` kernel compiled as a trap stub below SM80. Reachability on the
+SM60-admitted identities (NVFP4 artifact: NVFP4, row-FP8, W8 MTP, Q4G64 draft head, BF16 GDN
+control; GGUF Q4_K_M):
+
+| Trapping family (count) | Used by | Pascal route instead | Verdict |
+|---|---|---|---|
+| `w8_small_t_mma` (563), `w8_rowsplit_gemm_mma` (120), `w8_rowsplit_medium_t_splitk` (42), `w8_pair_gemm_mma` (10), W8 GDN/SwiGLU split-K | W8 (MTP layer) | `launch_w8_small_t` → SIMT `r8_c8` under `NINFER_PRE_AMPERE_BUILD`; W8 attn-input/linear-add/pair/SwiGLU plans all have pre-Ampere SIMT tables | not reachable |
+| `fp8_a16_mma` (96) | FP8 vocabulary head | only launch site `fp8_dispatch.cpp:142` is guarded by `!kVoltaBuild` (true for all pre-Ampere) → SIMT chunks | not reachable |
+| `q4_small_t_mma` (26 + 31 in SwiGLU GEMV), `q4_rowsplit_gemm_mma` (27), `q4_linear_swiglu_mma_*` | Q4G64 draft head; groupwise-int | draft head small-T redirects to SIMT `r8_c8` on pre-Ampere; groupwise-int not admitted | not reachable |
+| `bf16_gdn_gating_proj_gemm_mma` (28) | BF16 GDN control | pre-Ampere route table uses SIMT `GemvPairedRows`/`SmallTSplit10` | not reachable |
+| `bf16_gemm_mma` (12) | BF16 linear/attn-input/linear-add (DFlash, 35B) | not admitted on SM60 | not reachable |
+| `q5_/q6_rowsplit_gemm_mma`, `rowsplit_grouped_mma` | groupwise-int identities | not admitted | not reachable |
+| `gqa_attention_prefill_{bf16,i8}` (24) | Ampere `Prompt` route | pre-Ampere resolves to SmallT/ChunkedSmallT/PascalFlash | not reachable |
+| GDN `chunked::*` (6) | Ampere chunked GDN | pre-Ampere uses the recurrent FP32 kernels | not reachable |
+| `vision_attention_flash` (3) | Vision | Vision rejected on SM60 | not reachable |
+
+Conclusion: no trap-stub kernel is on an admitted Pascal route by static routing analysis. The
+P100 operator tests (`p100_op_tests`) are the runtime confirmation.
