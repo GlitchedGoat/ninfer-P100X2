@@ -124,9 +124,10 @@ source E4M3 codes and BF16 block multipliers without requantization and requires
 TP4 Vision/DFlash and other TP4 identities are not admitted. Operator checks on the local two
 cards do not substitute for four-card whole-model/state or end-to-end performance evidence.
 The explicitly requested P100X2 port targets two Tesla P100 PCIe 16 GB cards (`sm_60`, Pascal, no
-Tensor Cores, no NVLink) with CUDA 12.x (CUDA 13 cannot compile Pascal). Its first scope is
-`qwen3.8-27b/gguf-q4-k-m` TP1/TP2 Text/None/MTP with FP32 SIMT arithmetic; every other identity,
-Vision, DFlash, TP4 and RAM-KV are rejected at startup on `sm_60`. Build macros:
+Tensor Cores, no NVLink) with CUDA 12.x (CUDA 13 cannot compile Pascal). Its scope is
+`qwen3.8-27b/nvfp4` (the official v3 container, main target) and `qwen3.8-27b/gguf-q4-k-m`,
+TP1/TP2 Text/None/MTP with FP32 SIMT arithmetic; every other identity, Vision, DFlash, TP4 and
+RAM-KV are rejected at startup on `sm_60`. Build macros:
 `NINFER_PRE_AMPERE_BUILD` (sm_60 and sm_70 shared SIMT routes), `NINFER_VOLTA_BUILD` (sm_70
 Tensor-Core routes only), `NINFER_PASCAL_BUILD` (GP100 SIMT replacements). Work, open questions and
 the hardware validation runbook are tracked in `tickets/` (start at `tickets/PROMPT.md`). FP16x2
@@ -309,6 +310,13 @@ loss: about 45 committed decode tok/s at roughly 85000 occupied context tokens, 
 measurement. Both sides use 180000 capacity, Q4_K_M weights, Q8/INT8 KV, and a maximum draft
 window of three. Record actual token counts, sampling, acceptance, and committed throughput.
 Short prompts, draft throughput, or inherited RTX 5090 tables cannot establish this acceptance.
+
+The P100X2 acceptance (owner, 2026-10-05) is **committed decode tok/s above the owner's llama.cpp
+P100 setup** on the same two P100s at the same occupied context (measure at least 3k, 32k and 85k
+occupied tokens; a slightly reduced capacity is acceptable if 180000 does not fit), with no further
+quality loss. Compare like for like: Q4_K_M GGUF in both engines; for the NVFP4 `.ninfer` target the
+bar is beating llama.cpp's Q4_K_M at the same context. Prefill above llama.cpp is desired but
+secondary; the goal is to be faster on all fronts through full use of both GPUs (TP2).
 
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
