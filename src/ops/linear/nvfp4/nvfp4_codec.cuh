@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/pascal_convert.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -12,15 +13,23 @@
 namespace ninfer::ops::detail {
 
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+#ifdef NINFER_PASCAL_FAST_CONVERT
+    return {pascal_convert::e2m1_to_float(storage & 0xFu), pascal_convert::e2m1_to_float(storage >> 4)};
+#else
     __nv_fp4x2_e2m1 value;
     value.__x = storage;
     return static_cast<float2>(value);
+#endif
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
+#ifdef NINFER_PASCAL_FAST_CONVERT
+    return pascal_convert::e4m3fn_to_float(storage);
+#else
     __nv_fp8x2_e4m3 value;
     value.__x = static_cast<std::uint16_t>(storage) | (static_cast<std::uint16_t>(storage) << 8);
     return static_cast<float2>(value).x;
+#endif
 }
 
 struct alignas(8) Nvfp4QuantizedK16 {

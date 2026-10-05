@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/pascal_convert.cuh"
+
 // Reusable row-scaled FP8 T=1 CUDA-core mainloop. Each warp owns contiguous output rows and reads
 // naturally aligned E4M3 code packs. The persistent codes are decoded exactly, multiplied by the
 // represented BF16 activation with FP32 FMA, reduced within the warp, and scaled once by the
@@ -66,9 +68,14 @@ __device__ __forceinline__ Fp8CodePack<Values> load_fp8_codes(const std::uint8_t
 }
 
 __device__ __forceinline__ float2 decode_fp8_e4m3x2(std::uint16_t storage) {
+#ifdef NINFER_PASCAL_FAST_CONVERT
+    return {pascal_convert::e4m3fn_to_float(storage & 0xFFu),
+            pascal_convert::e4m3fn_to_float(static_cast<std::uint32_t>(storage) >> 8)};
+#else
     __nv_fp8x2_e4m3 value;
     value.__x = storage;
     return static_cast<float2>(value);
+#endif
 }
 
 template <int Values, int Rows, int AccumulatorChains>

@@ -25,6 +25,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "ops/common/math.cuh"
+#include "ops/common/pascal_convert.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
@@ -52,6 +53,15 @@ constexpr unsigned kFull    = 0xffffffffu;
 constexpr float kLog2E      = 1.4426950408889634074f;
 static_assert(kLaneDims * 8 == kGqaKvQuantGroup, "a lane's dimensions lie in one quant group");
 static_assert(kKeyTile * kHeadDim * sizeof(float) <= 32 * 1024, "tile must fit GP100 smem");
+
+// INT8 cache code -> FP32. Exact either way; the Pascal form avoids I2F (T-010 O-4).
+__device__ __forceinline__ float code_to_float(std::int8_t code) {
+#ifdef NINFER_PASCAL_FAST_CONVERT
+    return pascal_convert::small_int_to_float(code);
+#else
+    return static_cast<float>(code);
+#endif
+}
 
 __device__ __forceinline__ const std::int32_t* select_block_table(const std::int32_t* tables,
                                                                   const std::int32_t* table_rows,
@@ -151,10 +161,9 @@ __device__ __forceinline__ void stage_tile(float* __restrict__ tile,
 #pragma unroll
         for (int i = 0; i < 16; i += 4) {
             *reinterpret_cast<float4*>(row + half * 16 + i) =
-                make_float4(static_cast<float>(bytes[i]) * scale,
-                            static_cast<float>(bytes[i + 1]) * scale,
-                            static_cast<float>(bytes[i + 2]) * scale,
-                            static_cast<float>(bytes[i + 3]) * scale);
+                make_float4(code_to_float(bytes[i]) * scale, code_to_float(bytes[i + 1]) * scale,
+                            code_to_float(bytes[i + 2]) * scale,
+                            code_to_float(bytes[i + 3]) * scale);
         }
     }
 }

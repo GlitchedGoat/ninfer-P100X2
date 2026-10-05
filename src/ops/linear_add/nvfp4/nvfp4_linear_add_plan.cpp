@@ -47,7 +47,13 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) {
-#ifdef NINFER_PRE_AMPERE_BUILD
+#ifdef NINFER_PASCAL_BUILD
+        // Pascal keeps NVFP4 weights row-major (no QPN prepack), and below linear()'s dense
+        // threshold linear() runs the same SIMT kernels, so the fused A16 kernels avoid the
+        // projected round trip. Wide calls keep the dense GEMM followed by the residual add.
+        constexpr std::int32_t kDenseMinT = 128; // nvfp4_dispatch.cpp launch_a16
+        return tokens < kDenseMinT ? Nvfp4LinearAddRoute::A16 : Nvfp4LinearAddRoute::LinearThenAdd;
+#elif defined(NINFER_PRE_AMPERE_BUILD)
         // Volta's loader pre-packs NVFP4 MLP weights for QPN. The fused row-major decode/small-T
         // kernels cannot consume that layout, so use the ordinary linear route (QPN for narrow T,
         // CUTLASS materialization for wide T) and add the residual afterward at every width.

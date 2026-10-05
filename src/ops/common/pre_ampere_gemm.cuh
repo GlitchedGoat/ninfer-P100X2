@@ -20,6 +20,9 @@
 #include "cutlass/half.h"
 #include "cutlass/numeric_types.h"
 
+#include <algorithm>
+#include <cstdint>
+
 namespace ninfer::ops::detail::pre_ampere {
 
 #if defined(NINFER_VOLTA_BUILD)
@@ -65,5 +68,21 @@ using Gemm = cutlass::gemm::device::Gemm<
     Operand, cutlass::layout::RowMajor, Operand, cutlass::layout::ColumnMajor, Output,
     cutlass::layout::RowMajor, float, OpClass, Arch, ThreadblockShape<TileN>, WarpShape,
     InstructionShape, Epilogue, cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
+
+// Rows of decoded weight materialized per GEMM. Volta materializes the whole matrix in FP16 (the
+// measured route). Pascal's FP32 operands would double that workspace (e.g. 356 MB for a TP2
+// gate/up shard), so Pascal decodes and multiplies bounded row chunks; each chunk is a multiple of
+// 128 rows, which keeps NVFP4's M128 scale tiles and FP8's 128-row scale blocks whole.
+inline int weight_chunk_rows(int n, int k) {
+#if defined(NINFER_PASCAL_BUILD)
+    constexpr std::int64_t kChunkBytes = std::int64_t{64} << 20;
+    const std::int64_t rows = kChunkBytes / (static_cast<std::int64_t>(k) * sizeof(Operand));
+    return static_cast<int>(
+        std::min<std::int64_t>(n, std::max<std::int64_t>(128, rows / 128 * 128)));
+#else
+    (void)k;
+    return n;
+#endif
+}
 
 } // namespace ninfer::ops::detail::pre_ampere

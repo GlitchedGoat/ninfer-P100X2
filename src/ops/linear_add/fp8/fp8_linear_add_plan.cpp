@@ -47,7 +47,13 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) {
-#ifdef NINFER_PRE_AMPERE_BUILD
+#ifdef NINFER_PASCAL_BUILD
+        // Pascal has no QPN route: below linear()'s dense threshold linear() runs the same SIMT
+        // families, so the fused A16 kernels avoid the projected round trip. Wide calls keep the
+        // dense GEMM followed by the residual add.
+        constexpr std::int32_t kDenseMinT = 128; // fp8_dispatch.cpp launch_a16
+        return tokens < kDenseMinT ? Fp8LinearAddRoute::A16 : Fp8LinearAddRoute::LinearThenAdd;
+#elif defined(NINFER_PRE_AMPERE_BUILD)
         // T==1 keeps the fused decode kernel; T>=2 takes linear()+residual_add() instead of the
         // fused small_t kernel, exactly mirroring the NVFP4 linear_add fix -- linear() now reaches
         // QPN8 (fp8_dispatch.cpp's launch_a16) and this op's fused kernel never did. Safe the same

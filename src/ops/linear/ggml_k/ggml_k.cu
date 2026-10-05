@@ -1,4 +1,5 @@
 #include "ops/linear/ggml_k/ggml_k.h"
+#include "ops/common/pascal_convert.cuh"
 #include "ops/linear/ggml_k/ggml_k_codec.cuh"
 #ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/ggml_k/ggml_k_prefill.h"
@@ -11,6 +12,15 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+// Quantized code (|code| < 2^22) -> FP32. Exact either way; the Pascal form avoids I2F.
+__device__ __forceinline__ float code_to_float(int code) {
+#ifdef NINFER_PASCAL_FAST_CONVERT
+    return pascal_convert::small_int_to_float(code);
+#else
+    return static_cast<float>(code);
+#endif
+}
 
 struct Outputs {
     void* data[4] = {};
@@ -104,8 +114,8 @@ __device__ __forceinline__ void gemv_q4_row(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
         for (int byte = 0; byte < 4; ++byte) {
             const unsigned char code = static_cast<unsigned char>(packed >> (byte * 8));
-            w0[byte] = scale_f[0] * static_cast<float>(code & 15) - minimum_f[0];
-            w1[byte] = scale_f[1] * static_cast<float>(code >> 4) - minimum_f[1];
+            w0[byte] = scale_f[0] * code_to_float(code & 15) - minimum_f[0];
+            w1[byte] = scale_f[1] * code_to_float(code >> 4) - minimum_f[1];
         }
 #pragma unroll
         for (int t = 0; t < Tokens; ++t) {
@@ -151,8 +161,8 @@ __device__ __forceinline__ void gemv_q6_row(const __nv_bfloat16* __restrict__ x,
             const unsigned l0 = lo0 >> (8 * byte), l1 = lo1 >> (8 * byte), h = hi >> (8 * byte);
             const int q0 = int(((l0 >> (4 * pair)) & 15) | (((h >> (4 * pair)) & 3) << 4)) - 32;
             const int q1 = int(((l1 >> (4 * pair)) & 15) | (((h >> (4 * pair + 2)) & 3) << 4)) - 32;
-            w0[byte] = s0 * q0;
-            w1[byte] = s1 * q1;
+            w0[byte] = s0 * code_to_float(q0);
+            w1[byte] = s1 * code_to_float(q1);
         }
 #pragma unroll
         for (int t = 0; t < Tokens; ++t) {
@@ -240,9 +250,9 @@ __device__ __forceinline__ void decode_half_block(Elem* __restrict__ a_row,
             for (int byte = 0; byte < 4; ++byte) {
                 const unsigned code = (packed >> (byte * 8)) & 255;
                 a_row[local_segment * 64 + inner * 4 + byte] =
-                    to_operand<Elem>(scale_f0 * static_cast<float>(code & 15) - min_f0);
+                    to_operand<Elem>(scale_f0 * code_to_float(static_cast<int>(code & 15)) - min_f0);
                 a_row[local_segment * 64 + 32 + inner * 4 + byte] =
-                    to_operand<Elem>(scale_f1 * static_cast<float>(code >> 4) - min_f1);
+                    to_operand<Elem>(scale_f1 * code_to_float(static_cast<int>(code >> 4)) - min_f1);
             }
         }
     } else {
@@ -265,7 +275,7 @@ __device__ __forceinline__ void decode_half_block(Elem* __restrict__ a_row,
                     ((lo >> (byte * 8 + (section >> 1) * 4)) & 15) |
                     (((hi >> (byte * 8 + section * 2)) & 3) << 4)) - 32;
                 a_row[section * 32 + inner * 4 + byte] =
-                    to_operand<Elem>(scale_f * static_cast<float>(code));
+                    to_operand<Elem>(scale_f * code_to_float(code));
             }
         }
     }

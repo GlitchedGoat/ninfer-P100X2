@@ -551,6 +551,9 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
 
+ninfer_add_test(ninfer_pascal_convert_test
+  SOURCES ops/test_pascal_convert.cpp)
+
 # --- P100X2 validation subsets (tickets/T-008) ----------------------------------------------------
 # Every test executable statically links the whole device image (~280 MB each, ~26 GB for all of
 # them), so the Pascal runbook builds only the tests covering the SM60-admitted identities
@@ -558,6 +561,7 @@ endforeach()
 #   cmake --build build-p100 --target p100_op_tests      # operators, TP2 splits, device/runtime
 #   cmake --build build-p100 --target p100_model_tests   # real-model TP2 checks (need artifacts)
 set(NINFER_P100_OP_TESTS
+  ninfer_pascal_convert_test
   # GGML_K and every format the NVFP4 artifact uses (NVFP4, row FP8, W8 MTP, Q4G64 draft head, BF16)
   ninfer_ggml_k_test
   ninfer_linear_nvfp4_a16_test ninfer_linear_fp8_a16_test ninfer_linear_w8_a16_test

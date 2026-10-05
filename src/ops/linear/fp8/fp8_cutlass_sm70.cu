@@ -15,6 +15,7 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <type_traits>
 
@@ -23,10 +24,13 @@ namespace {
 
 using pre_ampere::Operand;
 
+// Decodes rows [row_begin, row_begin + gridDim.y) into a chunk-local operand matrix.
 __global__ void dequant_fp8_row_to_operand(const std::uint8_t* __restrict__ codes, int n, int k,
                                         bool prepacked, const __nv_bfloat16* scales,
-                                        bool block_scaled, Operand* __restrict__ out) {
-    const int row      = static_cast<int>(blockIdx.y);
+                                        bool block_scaled, int row_begin,
+                                        Operand* __restrict__ out) {
+    const int local    = static_cast<int>(blockIdx.y);
+    const int row      = row_begin + local;
     const int pair_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= n || pair_idx >= k / 2) { return; }
     const int k0 = pair_idx * 2;
@@ -38,7 +42,7 @@ __global__ void dequant_fp8_row_to_operand(const std::uint8_t* __restrict__ code
     const float2 weight = decode_fp8_e4m3x2(packed);
     const float scale = block_scaled ? __bfloat162float(scales[(row / 128) * (k / 128) + k0 / 128])
                                      : 1.0F;
-    Operand* out_row = out + static_cast<std::int64_t>(row) * k;
+    Operand* out_row = out + static_cast<std::int64_t>(local) * k;
     out_row[pair_idx * 2]     = Operand(weight.x * scale);
     out_row[pair_idx * 2 + 1] = Operand(weight.y * scale);
 }
@@ -83,31 +87,32 @@ template <class Allocator>
 Scratch<Allocator> allocate_scratch(Allocator& allocator, int n, int k, int cols,
                                     std::size_t gemm_bytes) {
     Scratch<Allocator> out;
-    out.weight = allocator.alloc(pre_ampere::kOperandDType, {k, n});
+    out.weight = allocator.alloc(pre_ampere::kOperandDType, {k, pre_ampere::weight_chunk_rows(n, k)});
     out.input  = allocator.alloc(pre_ampere::kOperandDType, {k, cols});
     if (gemm_bytes != 0) { out.gemm = allocator.alloc_bytes(gemm_bytes); }
     return out;
 }
 
 std::size_t gemm_workspace_bytes(int n, int k, int cols) {
-    const cutlass::gemm::GemmCoord shape(cols, n, k);
+    const cutlass::gemm::GemmCoord shape(cols, pre_ampere::weight_chunk_rows(n, k), k);
     typename PlainGemm::Arguments args{shape, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
                                   {1.0F, 0.0F}, 1};
     return PlainGemm::get_workspace_size(args);
 }
 
+// One GEMM over weight rows [begin, begin + rows): output columns begin.. of every token.
 template <bool Fused, bool UnscaledFp32 = false>
-void run_gemm(const Operand* input, const Operand* weight, const Weight& w,
-              Tensor& out, int t, DeviceSpan scratch, cudaStream_t stream) {
+void run_gemm(const Operand* input, const Operand* weight, const Weight& w, Tensor& out, int t,
+              int begin, int rows, DeviceSpan scratch, cudaStream_t stream) {
     using Operation = std::conditional_t<UnscaledFp32, Fp32Gemm,
                                          std::conditional_t<Fused, RowScaledGemm, PlainGemm>>;
     using Output = typename Operation::ElementC;
-    const cutlass::gemm::GemmCoord shape(t, w.n, w.k);
+    const cutlass::gemm::GemmCoord shape(t, rows, w.k);
+    Output* destination = static_cast<Output*>(out.data) + begin;
     typename Operation::Arguments args{
         shape, {input, w.k}, {weight, w.k},
-        {Fused ? static_cast<const Output*>(w.scales)
-               : static_cast<const Output*>(out.data), Fused ? 0 : w.n},
-        {static_cast<Output*>(out.data), w.n}, {1.0F, 0.0F}, 1};
+        {Fused ? static_cast<const Output*>(w.scales) + begin : destination, Fused ? 0 : w.n},
+        {destination, w.n}, {1.0F, 0.0F}, 1};
     Operation op;
     cutlass::Status status = op.can_implement(args);
     if (status != cutlass::Status::kSuccess) {
@@ -122,14 +127,14 @@ void run_gemm(const Operand* input, const Operand* weight, const Weight& w,
         throw std::runtime_error("fp8_cutlass_sm70: CUTLASS gemm failed");
     }
     CUDA_CHECK(cudaGetLastError());
-    if constexpr (!Fused && !UnscaledFp32) {
-        if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) { return; }
-        const std::int64_t count = static_cast<std::int64_t>(t) * w.n;
-        scale_rows_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(out.data), static_cast<const __nv_bfloat16*>(w.scales),
-            count, w.n);
-        CUDA_CHECK(cudaGetLastError());
-    }
+}
+
+void scale_rows(const Weight& w, Tensor& out, int t, cudaStream_t stream) {
+    const std::int64_t count = static_cast<std::int64_t>(t) * w.n;
+    scale_rows_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(out.data), static_cast<const __nv_bfloat16*>(w.scales), count,
+        w.n);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
@@ -154,26 +159,32 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     auto* weight = static_cast<Operand*>(scratch.weight.data);
     auto* input  = static_cast<Operand*>(scratch.input.data);
 
-    const dim3 block(256);
-    const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
-    dequant_fp8_row_to_operand<<<grid, block, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), n, k,
-        w.layout == QuantLayout::VoltaQpnPrepacked,
-        static_cast<const __nv_bfloat16*>(w.scales),
-        w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S, weight);
-    CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
     bf16_to_operand_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), input, input_count);
     CUDA_CHECK(cudaGetLastError());
 
-    if constexpr (UnscaledFp32) {
-        run_gemm<false, true>(input, weight, w, out, t, scratch.gemm, stream);
-    } else if (w.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S && fuse_row_scale(n, k, t)) {
-        run_gemm<true>(input, weight, w, out, t, scratch.gemm, stream);
-    } else {
-        run_gemm<false>(input, weight, w, out, t, scratch.gemm, stream);
+    const bool block_scaled = w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S;
+    const bool fused        = !UnscaledFp32 && !block_scaled && fuse_row_scale(n, k, t);
+    const int step          = pre_ampere::weight_chunk_rows(n, k);
+    for (int begin = 0; begin < n; begin += step) {
+        const int rows = std::min(step, n - begin);
+        const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(rows), 1u);
+        dequant_fp8_row_to_operand<<<grid, 256, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), n, k,
+            w.layout == QuantLayout::VoltaQpnPrepacked,
+            static_cast<const __nv_bfloat16*>(w.scales), block_scaled, begin, weight);
+        CUDA_CHECK(cudaGetLastError());
+        if constexpr (UnscaledFp32) {
+            run_gemm<false, true>(input, weight, w, out, t, begin, rows, scratch.gemm, stream);
+        } else if (fused) {
+            run_gemm<true>(input, weight, w, out, t, begin, rows, scratch.gemm, stream);
+        } else {
+            run_gemm<false>(input, weight, w, out, t, begin, rows, scratch.gemm, stream);
+        }
     }
+    // Row scales of the unfused route apply once, after every chunk has written its columns.
+    if (!UnscaledFp32 && !fused && !block_scaled) { scale_rows(w, out, t, stream); }
 }
 
 } // namespace

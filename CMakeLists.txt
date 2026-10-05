@@ -29,6 +29,12 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(60|70)$")
     add_compile_definitions(NINFER_VOLTA_BUILD=1)
   else()
     add_compile_definitions(NINFER_PASCAL_BUILD=1)
+    # Exact integer-bit replacements for GP100's quarter-rate type conversions
+    # (ops/common/pascal_convert.cuh). OFF restores CUDA's conversions for A/B measurement.
+    option(NINFER_PASCAL_FAST_CONVERT "Pascal: exact bit-construction conversions" ON)
+    if(NINFER_PASCAL_FAST_CONVERT)
+      add_compile_definitions(NINFER_PASCAL_FAST_CONVERT=1)
+    endif()
   endif()
   include(FetchContent)
   set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
