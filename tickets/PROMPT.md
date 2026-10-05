@@ -21,6 +21,9 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
 - Develop on branch `claude/ninfer-p100-adaptation-xicv3d` (or the branch the owner names).
 - Every unit of work is a ticket `tickets/T-NNN-<slug>.md`. Keep its **Status**, **Log** and
   **Results** current as you work; log real commands and outcomes, not intentions.
+- **Optimization backlog:** `T-010-p100-perf-tuning.md` is the single list of Pascal/P100 tuning
+  opportunities. Append every opportunity you notice there (ID, location, reason, how to verify),
+  even if you do not act on it.
 - `tickets/QUEUES.md` holds the **conversation queue** (needs the owner) and the **work queue**
   (executable now). Move items between them; never silently drop one.
 - **Where sessions run.** Early sessions ran in a GPU-less cloud container (build + static checks
@@ -58,7 +61,7 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | T-007 | Runtime admission and TP2 over PCIe on P100 | see ticket |
 | T-008 | P100 hardware validation plan | see ticket |
 | T-009 | FP16x2 error-controlled arithmetic (post-FP32) | blocked on C-3 |
-| T-010 | P100 performance tuning | blocked on hardware |
+| T-010 | **P100 optimization backlog** (append here) | open; measuring blocked on hardware |
 | T-011 | Pascal flash-attention prefill (paged INT8, 0 workspace) | implemented |
 | T-012 | NVFP4 `.ninfer` identity on Pascal | in progress |
 | T-013 | Handoff prompt for the P100 host agent | ready |
