@@ -54,6 +54,11 @@ nice cmake --build build-p100 -j3 --target ninfer -- -k 0 > build-p100.log 2>&1
   *diagnostic only* (use it to collect errors). Claims such as "builds for sm_60" require a
   **build of record**: a pass started after the last source edit with no edits during it.
   Editing `tickets/` or other docs during a build is fine.
+- **Disk:** the container's writable allowance is ~39 GB. A full sm_60 build with tests is ~27 GB,
+  of which 26 GB is the 133 statically linked test executables (~280 MB each). Build only the
+  targets you need, and delete linked test binaries (`find build-p100/tests -maxdepth 1 -type f
+  -name 'ninfer_*' -executable -delete`) before starting a second build tree. "No space left on
+  device" at link time is this, not a code error.
 - Long foreground `sleep` is blocked in the agent harness; run the build with
   `run_in_background` and use a Monitor on `^FAILED|ninja: build stopped|Linking` in the log.
 - **Pushing:** `git push` returned 403 until the owner grants the Claude GitHub App write access

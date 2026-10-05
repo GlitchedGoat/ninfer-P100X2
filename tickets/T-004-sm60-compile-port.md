@@ -1,6 +1,6 @@
 # T-004 — Make every translation unit compile and link for `sm_60`
 
-**Status:** apps done (build of record `acb5e75`); tests building; sm_70 regression pending
+**Status:** all sm_60 targets build (build of record `4315bc4`); sm_70 regression running
 **Depends on:** T-003
 
 ## Approach
@@ -45,3 +45,9 @@
   **0** with local-memory spills; 916 use >128 registers (occupancy, not correctness).
   1,199 kernels contain `BPT.TRAP` (Ampere-only bodies compiled as trap stubs); reachability from
   Pascal routes is argued per route in T-005/T-012 and must be confirmed by T-008 step 3.
+- **All targets, build of record `4315bc4`:** apps + all 133 test executables link for sm_60. The only
+  test failure was inherited, not Pascal-related: `tests/targets/qwen3_6_27b/test_load_plan.cpp`
+  passed `nullptr` to `create_program`'s TP2 `std::span` peer-model parameter (broken since
+  `d81c49b`); fixed by passing `{}` as production does.
+- Test executables (~280 MB each, 26 GB total) were deleted afterwards to free disk for the sm_70
+  regression build; they relink in minutes from the retained objects.

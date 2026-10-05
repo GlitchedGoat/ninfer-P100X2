@@ -23,8 +23,8 @@
 | W-3 | Build `ninfer` for sm_60; fix compile/link errors | T-004 | done (`acb5e75`) |
 | W-4 | Classify every `NINFER_VOLTA_BUILD` site (pre-Ampere vs Tensor Core) | T-004 | done (first pass) |
 | W-5 | Pascal GGML_K routes (T=5–127 tile, prefill SIMT SGEMM) | T-005 | written, compiling |
-| W-6 | sm_70 regression build after the rename | T-004 | todo |
-| W-7 | Build all tests for sm_60 | T-004/T-008 | in progress |
+| W-6 | sm_70 regression build after the rename | T-004 | running (`4315bc4`) |
+| W-7 | Build all tests for sm_60 | T-004/T-008 | done (`4315bc4`, 133 tests) |
 | W-8 | Static audit: resource usage dump, warp-sync patterns | T-006 | resource + trap audit done; warp-sync review todo |
 | W-9 | Pascal flash prefill attention | T-011 | implemented, builds (155 regs, 32 KiB smem) |
 | W-11 | NVFP4 identity on Pascal: dual-arch dense prefill GEMMs (FP8/NVFP4), admission | T-012 | in progress |
