@@ -54,6 +54,13 @@ Record everything in the tickets (not only in chat), commit after each step, and
 9. **Baseline numbers (helps C-4).** If time allows, T-008 step 6 occupancy suite at 3k/8k/32k
    occupied tokens (85k only if capacity permits), and one `nsys` profile of an 8k request.
    If the owner's llama.cpp P100 setup is on this host, measure it on the same prompts.
+9a. **Owner's llama.cpp P100 branch (C-3).** It is on this machine. Find it (ask the owner if not
+    obvious; e.g. `find / -name ggml-cuda -type d 2>/dev/null`), record its path, remote/branch and
+    `git log -5 --oneline`, and diff it against upstream llama.cpp. Summarize in
+    `tickets/T-009-fp16x2-error-controlled.md` **how it accumulates in FP16 while limiting error**
+    (blocked/pairwise sums? sorting? FP32 flush points? scaling?), which kernels it changes (matmul,
+    MMQ/dequant, flash attention, prefill), and any build flags. Then measure it as the C-4
+    baseline: decode and prefill tok/s with the Q4_K_M GGUF at the same occupied contexts as step 9.
 10. **Report.** Update `tickets/QUEUES.md` (close answered items, add new questions), write
     `session-summaries/<date>-p100-host-session-<n>.md`, commit, and `git push`. Stop and ask the
     owner before any change to drivers, BIOS/IOMMU/GRUB settings, power or clocks.

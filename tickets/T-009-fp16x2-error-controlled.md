@@ -1,6 +1,6 @@
 # T-009 — FP16x2 arithmetic with controlled error (after the FP32 baseline)
 
-**Status:** blocked on C-3 (owner's llama.cpp P100 branch) and T-008 FP32 baseline
+**Status:** blocked on the host agent's summary of the owner's llama.cpp P100 branch (T-013 step 9a) and the T-008 FP32 baseline
 **Depends on:** T-005, T-008
 
 ## Motivation
@@ -35,3 +35,12 @@ bandwidth-bound, but MTP verification (4 tokens) and prefill are ALU-bound in FP
 2. GGML_K wide-T prefill (CUTLASS SIMT HGEMM with FP32 accumulate is *not* faster on GP100 —
    2× only applies to FP16 accumulate — so this needs the blocked scheme in a custom kernel).
 3. Attention QK/PV dot products (INT8 KV → FP16 is exact for codes; scales in FP32).
+
+## Owner's llama.cpp P100 branch (C-3, 2026-10-05)
+
+Lives on the P100 machine. Owner's recollection: FP16 accumulation arranged to minimize FP16
+addition error, possibly by sorting and/or adding in batches. Unconfirmed until the host agent
+reads the diff (T-013 step 9a). Our current reasoning (above): batched/blocked accumulation with
+FP32 flush gives the error bound that matters; full sorting is unlikely to pay for itself in a
+bandwidth-bound GEMV, but if the branch does sort (or partially orders by exponent), measure its
+accuracy/speed trade-off against blocked accumulation before choosing.
