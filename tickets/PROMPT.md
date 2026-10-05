@@ -22,14 +22,16 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
   alongside it, and the failure shows up as `ld: No space left on device` at link time. Build
   only the targets you need (`--target ninfer`, `p100_op_tests`, `p100_model_tests`), or delete
   linked test binaries first (see `ENV-SETUP.md` §4). T-014 tracks shared-library test builds.
-- **A full sm_60 build takes well over an hour** on 4 cores at `-j3`; some CUDA TUs take 5–10 min.
+- **Build time:** `ninfer` from scratch took ~15–20 min at `-j3` on the 4-core cloud container
+  (sm_70: 17 min); single CUTLASS/attention TUs take several minutes. On another machine, use
+  ~80 % of `nproc` jobs (AGENTS.md CPU ceiling).
 - **No source/CMake edits while a build runs**; only an edit-free pass is a build of record.
 - **Stopping a build leaves orphaned `nvcc`/`cicc`/`ptxas` processes**; kill them too.
 
 ## Ground rules
 
 - `AGENTS.md` at the repo root governs all work (scope, numerics, tests, commits). Its "current
-  product contract" still describes V100X2; T-003 onward updates it as the P100 contract lands.
+  product contract" includes the P100X2 port scope, and "Performance work" has the P100 acceptance bar.
 - Develop on branch `claude/ninfer-p100-adaptation-xicv3d` (or the branch the owner names).
 - Every unit of work is a ticket `tickets/T-NNN-<slug>.md`. Keep its **Status**, **Log** and
   **Results** current as you work; log real commands and outcomes, not intentions.
@@ -55,8 +57,9 @@ Full procedure and pitfalls: [`ENV-SETUP.md`](ENV-SETUP.md). Session summaries l
 scripts/p100/setup_cuda_toolchain.sh /opt/cuda-12.8      # CUDA 12.8 from conda-forge
 export PATH=/opt/cuda-12.8/bin:$PATH CUDAToolkit_ROOT=/opt/cuda-12.8
 cmake -S . -B build-p100 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=60 \
-      -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ -DBUILD_TESTING=ON
+      -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON
 cmake --build build-p100 -j3 --target ninfer        # keep host CPU < ~85 % (4-core box: -j3)
+# P100 host: the exact target list is T-008 step 1
 ```
 
 CUDA 12.x is mandatory: CUDA 13 removed offline compilation for Maxwell/Pascal/Volta. The
@@ -67,17 +70,17 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | Ticket | Title | Status |
 |---|---|---|
 | T-001 | Research and port plan | done |
-| T-002 | Build environment (CUDA 12.8, sm_70 baseline) | see ticket |
-| T-003 | Admit `sm_60` in CMake; Pascal build flags | see ticket |
-| T-004 | Make every translation unit compile for `sm_60` | see ticket |
-| T-005 | Pascal SIMT routes for the Q4_K_M TP2 Text/MTP path | see ticket |
-| T-006 | Shared-memory / occupancy / ISA audit for GP100 | see ticket |
-| T-007 | Runtime admission and TP2 over PCIe on P100 | see ticket |
-| T-008 | P100 hardware validation plan | see ticket |
-| T-009 | FP16x2 error-controlled arithmetic (post-FP32) | blocked on C-3 |
+| T-002 | Build environment (CUDA 12.8, sm_70 baseline) | done |
+| T-003 | Admit `sm_60` in CMake; Pascal build flags | done |
+| T-004 | Make every translation unit compile for `sm_60` | done (sm_60 + sm_70 builds of record) |
+| T-005 | Pascal SIMT routes for the Q4_K_M TP2 Text/MTP path | implemented; numerics on host |
+| T-006 | Shared-memory / occupancy / ISA audit for GP100 | static done; sanitizer on host |
+| T-007 | Runtime admission and TP2 over PCIe on P100 | admission done; transport on host |
+| T-008 | P100 hardware validation plan | **ready to run on the P100 host** |
+| T-009 | FP16x2 error-controlled arithmetic (post-FP32) | blocked on host (T-013 step 9a) + FP32 baseline |
 | T-010 | **P100 optimization backlog** (append here) | open; measuring blocked on hardware |
-| T-011 | Pascal flash-attention prefill (paged INT8, 0 workspace) | implemented |
-| T-012 | NVFP4 `.ninfer` identity on Pascal | in progress |
+| T-011 | Pascal flash-attention prefill (paged INT8, 0 workspace) | implemented; numerics on host |
+| T-012 | NVFP4 `.ninfer` identity on Pascal | implemented; numerics on host |
 | T-013 | Handoff prompt for the P100 host agent | ready |
 | T-014 | Opt-in shared libraries for test builds | todo (later) |
 | T-015 | Remove Volta (V100) support; Volta upkeep inventory | backlog |

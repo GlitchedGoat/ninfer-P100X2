@@ -1,6 +1,6 @@
 # T-012 — NVFP4 `.ninfer` (`qwen3.8-27b/nvfp4`) on Pascal
 
-**Status:** in progress (routes in place; compile pending; numerics need the P100 host)
+**Status:** implemented and builds for sm_60 (`9ac42c7`); numerics and real-model smoke need the P100 host (T-008 steps 3–4)
 **Depends on:** T-004, T-005, T-011
 
 ## Goal

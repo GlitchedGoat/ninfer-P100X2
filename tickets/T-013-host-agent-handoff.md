@@ -1,6 +1,6 @@
 # T-013 — Handoff prompt for the P100 host agent
 
-**Status:** ready to send (host offline as of 2026-10-05)
+**Status:** ready — paste the prompt into the first Claude Code session on the P100 host
 **Depends on:** T-004 (sm_60 build of record), T-008 (runbook)
 
 The cloud sessions have no GPUs. Paste the prompt below into Claude Code on the P100 host.
@@ -63,7 +63,8 @@ Record everything in the tickets (not only in chat), commit after each step, and
     `tickets/T-009-fp16x2-error-controlled.md` **how it accumulates in FP16 while limiting error**
     (blocked/pairwise sums? sorting? FP32 flush points? scaling?), which kernels it changes (matmul,
     MMQ/dequant, flash attention, prefill), and any build flags. Then measure it as the C-4
-    baseline: decode and prefill tok/s with the Q4_K_M GGUF at the same occupied contexts as step 9.
+    baseline: decode and prefill tok/s with the Q4_K_M GGUF at the same occupied contexts as step 9,
+    on the same `.ids` corpora (T-008 step 6: `tools/v100/compare_llama.py` against its `llama-server`).
 10. **Report.** Update `tickets/QUEUES.md` (close answered items, add new questions), write
     `session-summaries/<date>-p100-host-session-<n>.md`, commit, and `git push`. Stop and ask the
     owner before any change to drivers, BIOS/IOMMU/GRUB settings, power or clocks.

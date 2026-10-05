@@ -1,6 +1,6 @@
 # T-006 — GP100 shared-memory, ISA and warp-synchronization audit
 
-**Status:** resource/trap audit done; warp-sync review and hardware sanitizer runs pending
+**Status:** static audits done (resources, trap reachability, warp-sync review); sanitizer runs pending on the P100 host (T-008 step 3)
 **Depends on:** T-004
 
 ## Why

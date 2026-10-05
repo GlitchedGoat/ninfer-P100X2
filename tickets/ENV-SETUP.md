@@ -39,8 +39,8 @@ nice cmake --build build-p100 -j3 --target ninfer -- -k 0 > build-p100.log 2>&1
 
 - Use the **system** g++ 13 as host compiler (the conda env also contains a gcc; don't mix them).
 - CUTLASS v4.4.2 is fetched by CMake `FetchContent` from GitHub; git through the proxy works.
-- `-j3` on 4 cores respects the owner's ~85 % CPU ceiling. A full build is ~260 steps and takes
-  well over an hour; a few CUTLASS/attention TUs take 5–10 minutes each.
+- `-j3` on 4 cores respects the owner's ~85 % CPU ceiling. `ninfer` from scratch (~300 steps)
+  took ~15–20 min here; a few CUTLASS/attention TUs take several minutes each.
 - `-- -k 0` keeps compiling past failures so one pass lists every broken TU.
 
 ## 4. Pitfalls
@@ -61,8 +61,8 @@ nice cmake --build build-p100 -j3 --target ninfer -- -k 0 > build-p100.log 2>&1
   device" at link time is this, not a code error.
 - Long foreground `sleep` is blocked in the agent harness; run the build with
   `run_in_background` and use a Monitor on `^FAILED|ninja: build stopped|Linking` in the log.
-- **Pushing:** `git push` returned 403 until the owner grants the Claude GitHub App write access
-  to the repository (conversation queue C-0). Commits otherwise stay local to the container.
+- **Pushing:** `git push` returned 403 until the owner installed the Claude GitHub App on the
+  repository (C-0, resolved). If it recurs, commits stay local until access is fixed.
 - Docs at `docs.nvidia.com` are blocked for WebFetch; WebSearch summaries work.
 
 ## 5. Useful checks without a GPU
@@ -72,3 +72,13 @@ cuobjdump --list-elf build-p100/apps/ninfer | head            # sm_60 cubins pre
 python3 scripts/p100/audit_resources.py <object-or-binary>    # smem > 48 KiB, spills, regs
 nvcc -arch=sm_60 -std=c++20 smoke.cu                           # quick intrinsic availability test
 ```
+
+## 6. On the P100 host
+
+The cloud container steps above do not all apply on the owner's machine.
+- **Toolchain and packages:** use an installed CUDA 12.x (≥ 12.8) if present; otherwise use the same script. Install the §2 packages with the host's package manager.
+- **Driver:** must be R525–R580 (R580 is the last branch supporting Pascal).
+- **Jobs:** use ~80 % of `nproc`.
+- **Disk:** apps plus `p100_op_tests` and `p100_model_tests` need ~12 GB; all 133 tests need ~26 GB.
+
+The runbook is `T-008-p100-validation-plan.md`, started from the prompt in `T-013-host-agent-handoff.md`.

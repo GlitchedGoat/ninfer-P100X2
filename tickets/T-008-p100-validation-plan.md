@@ -1,6 +1,6 @@
 # T-008 — P100X2 hardware validation plan (runbook for the P100 host)
 
-**Status:** plan written; execution blocked on hardware access
+**Status:** ready to run on the P100 host (not yet executed; the cloud sessions have no GPUs)
 **Depends on:** T-004 (build), T-005 (routes), T-007 (admission)
 
 Run the steps in order; each has a pass criterion. Record results in the **Results** table below
@@ -43,53 +43,94 @@ Pass: tests green; record P2P on/off, bandwidth, 10 KiB all-reduce latency (V100
 
 ## 3. Operator correctness against FP64 oracles (sm_60 routes)
 
+`p100_op_tests` (step 1) builds exactly the operator, TP2-split, attention and device/runtime tests
+covering the SM60-admitted identities (list: `NINFER_P100_OP_TESTS` in `tests/CMakeLists.txt`).
+
 ```bash
-for t in ggml_k gqa_attention gqa_attention_long_context gdn_input_proj gated_delta_net_replay_record \
-         gdn_replay_fold kv_cache_append_prefix mtp_pack mtp_round speculative_round \
-         linear_split linear_swiglu_split attn_input_proj_split gdn_projections_split \
-         output_head_split attention_headlocal gdn_headsplit mtp_split; do
-  build-p100/tests/ninfer_${t}_test || echo "FAIL $t"; done
+for t in build-p100/tests/ninfer_*_test; do "$t" > "${t##*/}.log" 2>&1 || echo "FAIL ${t##*/}"; done
 compute-sanitizer --tool synccheck build-p100/tests/ninfer_gqa_attention_test
 compute-sanitizer --tool racecheck build-p100/tests/ninfer_ggml_k_test
+compute-sanitizer --tool memcheck  build-p100/tests/ninfer_linear_nvfp4_a16_test
 ```
-Pass: every GGML_K case (T=1–4 GEMV, 5–127 SIMT tile, ≥128 CUTLASS SIMT prefill, GDN tiled
-input, residual add, FP32/BF16 outputs) within the test's FP64-oracle criterion; tests for
-formats that Pascal does not admit are expected to report "unavailable on SM60", not wrong values;
-no sanitizer errors.
+Pass: every case within the test's FP64-oracle criterion. This covers:
+- **GGML_K:** T=1–4 GEMV, T=5–127 SIMT tile, T≥128 chunked SIMT prefill.
+- **NVFP4/row-FP8/W8/Q4/BF16 linear:** small-T and dense prefill routes.
+- **Fused forms:** SwiGLU and residual add.
+- **Attention:** the `pascal_flash` wide-prefill cases (T-011).
+
+A case for a format/route Pascal does not admit may throw "SM70 Tensor-Core route is unavailable
+on SM60"; record it as expected, do not "fix" it. No sanitizer errors.
 
 ## 4. Real-model smoke (TP1, then TP2)
 
+The main target is NVFP4; repeat with the Q4_K_M `.ninfer` if present.
+
 ```bash
-W=/path/to/qwen3_8_27b_q4_k_m.ninfer      # converted from the LM Studio Q4_K_M GGUF (artifact doc §14)
-build-p100/apps/ninfer $W --tp 2 --devices 0,1 --max-context 8192 --kv-dtype int8 \
-  --prefill-chunk 1024 --spec mtp --draft-tokens 3 --lm-head-draft --no-thinking --greedy \
-  --max-new 256 --prompt 'Write a bounded blocking queue in C++.'
-build-p100/tests/ninfer_qwen3_8_27b_v100x2_real_test        # same identity, TP2 real checks
-build-p100/tests/ninfer_qwen3_8_27b_tp2_parity_test          # TP1 vs TP2 greedy parity
+W=/path/to/qwen3_8_27b_nvfp4.ninfer        # official v3 container (C-8)
+for tp in "--device 0" "--tp 2 --devices 0,1"; do
+  build-p100/apps/ninfer $W $tp --max-context 8192 --kv-dtype int8 --prefill-chunk 1024 \
+    --spec mtp --draft-tokens 3 --lm-head-draft --no-thinking --greedy --max-new 256 \
+    --prompt 'Write a bounded blocking queue in C++.'
+done
+cmake --build build-p100 -j"$(( $(nproc) * 8 / 10 ))" --target p100_model_tests
+NINFER_QWEN3_8_27B_WEIGHTS=$W build-p100/tests/ninfer_qwen3_8_27b_tp2_real_test
+NINFER_QWEN3_8_27B_WEIGHTS=$W build-p100/tests/ninfer_qwen3_8_27b_mtp_tp2_real_test
+NINFER_QWEN3_8_27B_WEIGHTS=$W build-p100/tests/ninfer_qwen3_8_27b_tp2_parity_test   # TP1 vs TP2
+NINFER_QWEN3_8_27B_WEIGHTS=$W build-p100/tests/ninfer_qwen3_8_27b_graph_tp2_test
+NINFER_V100X2_ARTIFACT=/path/to/qwen3_8_27b_q4_k_m.ninfer build-p100/tests/ninfer_qwen3_8_27b_v100x2_real_test
 ```
-Pass: coherent output; MTP acceptance reported; TP2 parity test green. Unsupported identities
-(NVFP4/FP8/QUASAR/35B) must fail at startup with "SM60 supports only qwen3.8-27b/gguf-q4-k-m".
+Model tests skip (exit 77) when their artifact variable is unset; check each test's source for the
+variable it reads if one does not run. These tests were written for V100X2 artifacts, so one may
+assert expectations specific to another identity. Read the assertion before calling it a Pascal bug.
 
-## 5. Quality vs reference (FP32 route)
+Pass:
+- coherent output and MTP acceptance reported;
+- the real/parity/graph tests are green;
+- any other identity (FP8, QUASAR, groupwise, 35B) fails at startup with "SM60 supports only
+  qwen3.8-27b/nvfp4 and qwen3.8-27b/gguf-q4-k-m". Confirm one if such an artifact is at hand.
 
-- Greedy token agreement P100 vs the V100X2 run of the same prompts (fixed corpus, 512 tokens):
-  report first divergence position per prompt. FP32 SIMT vs V100 FP16-operand prefill can
-  legitimately diverge late; early divergence (<32 tokens) is a bug signal.
-- Optional: perplexity on a fixed text with the CLI's scoring path vs llama.cpp on the same GGUF.
+## 5. Quality (FP32 route)
+
+There is no V100 on this host, so the references are:
+- **TP1 vs TP2 greedy parity** (step 4).
+- **Q4_K_M GGUF in the owner's llama.cpp vs Q4_K_M `.ninfer` in NInfer:** greedy token agreement on
+  the same corpus prompts (512 tokens; report the first divergence position per prompt). Late
+  divergence is expected from different reduction orders. Divergence within the first 32 tokens
+  is a bug signal.
+- **NVFP4:** coherent output plus MTP acceptance comparable to Q4_K_M. NVFP4 is a different
+  quantization, so tokens are not expected to match.
 
 ## 6. Capacity and performance
 
+Build exact-token corpora once with the corpus tool (built with `NINFER_BUILD_BENCHMARKS=ON`).
+List plenty of distinct C++/CUDA sources, because the tool never repeats text. The file names below
+are the ones `tools/v100/bench_tp.py` expects:
+
 ```bash
+mkdir -p profiles/bench/p100
+SRC=$(git ls-files 'src/*.cpp' 'src/*.cu' 'src/*.h' 'src/*.cuh')
+for n in 3072 8192 16384 32768 65536 85000; do
+  out=profiles/bench/p100/code-$n.ids; [ $n = 85000 ] && out=profiles/bench/p100/v100-code-85000-iommu-pt.ids
+  build-p100/bench/ninfer_v100_corpus $W $out --code-chat $n --output-tokens 1024 $SRC
+done
 python3 tools/v100/bench_tp.py --weights $W --bench build-p100/bench/ninfer_bench --tp 2 \
-  --devices 0,1 --corpus-dir <corpus> --output-dir results/p100x2 --prefill-chunk 1024 --suite occupancy
+  --devices 0,1 --corpus-dir profiles/bench/p100 --output-dir profiles/bench/p100x2 \
+  --prefill-chunk 1024 --capacity <step-8 capacity> --suite occupancy
 ```
-- Capacity: confirm 180000-token INT8 KV allocates on 2×16 GB with the FP32 prefill workspace
-  (C-6); otherwise find the largest capacity that loads.
-- Record prefill tok/s and committed decode tok/s at 3k/8k/32k/85k occupied tokens, MTP
-  acceptance, and the same for the owner's llama.cpp P100 baseline (C-4).
-- Attention prefill uses the Pascal flash route (T-011); confirm the load log or profile shows
-  `pascal_flash` for long prompts.
-- `nsys profile` one 8k-prompt request to attribute time (attention vs GGML_K vs all-reduce).
+- **Capacity:** find the largest `--max-context` that loads on 2×16 GB with INT8 KV, MTP3 and the
+  FP32 prefill workspace (C-6). The target is 180000, and slightly less is acceptable. It must
+  leave room for 85000 + 1024 tokens. Pass it as `--capacity`.
+- **Acceptance (C-4):** committed decode tok/s at **3k, 32k and 85k** occupied tokens. The suite
+  also runs 8k/16k/64k. Record prefill tok/s and MTP acceptance as well, for NVFP4 and Q4_K_M.
+- **llama.cpp baseline:** run the owner's P100 llama.cpp `llama-server` with the Q4_K_M GGUF on
+  both GPUs. Feed it the same `.ids` corpora via `tools/v100/compare_llama.py --url <server>
+  --corpus <file> --prompt-tokens N --decode-tokens 512 --output <json>`. The script needs a
+  llama-server that accepts token-array prompts and `return_tokens`; if the owner's branch is
+  older, record the gap and use `llama-bench -p N -n 512` instead, noting it in the result.
+  Record its exact build flags and split mode.
+- Attention prefill uses the Pascal flash route (T-011); confirm `pascal_flash` appears in the
+  load log or profile for long prompts.
+- `nsys profile` one 8k-prompt request to attribute time (attention vs GEMV vs all-reduce).
 
 ### 6a. A/B: exact fast conversions (`NINFER_PASCAL_FAST_CONVERT`, D-11, W-17)
 

@@ -27,8 +27,9 @@ intentionally omitted.
 
 This branch adds a Pascal `sm_60` build for **2 × Tesla P100 PCIe 16 GB** that keeps the TP2
 tensor-parallel route (both GPUs work on every layer). GP100 has no Tensor Cores, so the Volta
-Tensor-Core routes are replaced by FP32 SIMT routes; the first admitted identity is
-`qwen3.8-27b/gguf-q4-k-m` (Text/MTP, TP1/TP2). It needs CUDA 12.x:
+Tensor-Core routes are replaced by FP32 SIMT routes. Admitted on `sm_60`: `qwen3.8-27b/nvfp4`
+(the official v3 container, main target) and `qwen3.8-27b/gguf-q4-k-m`, Text/MTP, TP1/TP2. Prefill
+attention uses a native flash kernel over the paged INT8 KV cache. It needs CUDA 12.x (not 13):
 
 ```bash
 scripts/p100/setup_cuda_toolchain.sh /opt/cuda-12.8      # or NVIDIA's cuda-toolkit-12-8

@@ -59,15 +59,18 @@ def main():
     parser.add_argument("--prefill-chunk", type=int, default=2560)
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--suite", choices=("occupancy", "capacity", "plain"), required=True)
+    parser.add_argument("--capacity", type=int, default=180000,
+                        help="KV capacity for the occupancy/plain suites")
     args = parser.parse_args()
     if len(args.devices.split(",")) != args.tp or args.repetitions < 1:
         parser.error("device count must equal TP width and repetitions must be positive")
     if args.suite == "occupancy":
-        cases = [(180000, n, 3) for n in (3072, 8192, 16384, 32768, 65536, 85000)]
+        cases = [(args.capacity, n, 3) for n in (3072, 8192, 16384, 32768, 65536, 85000)
+                 if n + 1024 <= args.capacity]
     elif args.suite == "capacity":
         cases = [(n, 512, 3) for n in (1024, 2048, 4096, 8192, 16384, 32768, 65536)]
     else:
-        cases = [(180000, n, 0) for n in (3072, 85000)]
+        cases = [(args.capacity, n, 0) for n in (3072, 85000) if n + 1024 <= args.capacity]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     # 512 prompt + 1 prefill output + 512 decode would exceed the 1024-capacity row.

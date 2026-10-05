@@ -1,6 +1,6 @@
 # T-011 — Pascal flash-attention prefill route
 
-**Status:** implemented (compiles pending); numerical validation on P100 pending (T-008 step 3)
+**Status:** implemented and builds for sm_60 (155 regs, 32 KiB smem); numerical validation on P100 pending (T-008 step 3)
 **Depends on:** T-004
 
 ## Why (corrected analysis)

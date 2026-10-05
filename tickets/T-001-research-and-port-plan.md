@@ -1,6 +1,6 @@
 # T-001 — Research and P100 port plan
 
-**Status:** done (plan accepted pending conversation-queue answers C-1…C-6)
+**Status:** done (owner answers C-1…C-6 recorded in QUEUES.md)
 **Owner:** agent · **Created:** 2026-10-05
 
 ## Deliverable

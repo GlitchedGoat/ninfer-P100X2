@@ -1,6 +1,6 @@
 # T-005 — Pascal SIMT routes for the Q4_K_M TP2 Text/MTP path
 
-**Status:** in progress
+**Status:** implemented and builds for sm_60 (`4315bc4`, `9ac42c7`); numerics pending on the P100 host (T-008 step 3)
 **Depends on:** T-004
 
 ## Scope
