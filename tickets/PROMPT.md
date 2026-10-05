@@ -23,8 +23,11 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
   **Results** current as you work; log real commands and outcomes, not intentions.
 - `tickets/QUEUES.md` holds the **conversation queue** (needs the owner) and the **work queue**
   (executable now). Move items between them; never silently drop one.
-- The build host has **no P100**. Anything needing hardware goes into
-  `T-008` (validation plan) as a concrete step, not a guess presented as a result.
+- **Where sessions run.** Early sessions ran in a GPU-less cloud container (build + static checks
+  only). Future sessions will usually run Claude Code **on the P100 host itself** (2 × P100 PCIe
+  installed): there, run the T-008 runbook directly and record measured results. In a GPU-less
+  session, anything needing hardware goes into T-008/T-013 as a concrete step, never as a guessed
+  result. First host session: start from the prompt in `T-013-host-agent-handoff.md`.
 
 ## Build environment (no NVIDIA apt repo needed)
 
@@ -58,3 +61,4 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | T-010 | P100 performance tuning | blocked on hardware |
 | T-011 | Pascal flash-attention prefill (paged INT8, 0 workspace) | implemented |
 | T-012 | NVFP4 `.ninfer` identity on Pascal | in progress |
+| T-013 | Handoff prompt for the P100 host agent | ready |
