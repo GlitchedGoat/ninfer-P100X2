@@ -613,7 +613,7 @@ int verify_registry() {
         {QType::W8G32_F16S, 5120, 8704, kA8},
         // BF16 control.
         {QType::BF16_CTRL, 7168, 5120, kA16},    {QType::BF16_CTRL, 5120, 3072, kA16},
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // SM70's registered BF16 entry also admits its general CUTLASS projection route.
         {QType::BF16_CTRL, 8192, 5120, kA16},
 #endif
@@ -639,7 +639,7 @@ int verify_registry() {
         {QType::NVFP4, 5120, 5120, kA16},
         {QType::NVFP4, 3584, 5120, kA16},
         {QType::Q5G64_F16S, 4096, 5120, kA16},
-#ifndef NINFER_VOLTA_BUILD
+#ifndef NINFER_PRE_AMPERE_BUILD
         {QType::BF16_CTRL, 8192, 5120, kA16},
 #endif
         // FP8's residual/gdn_input shards are not vocabulary problems, so AllowA4 (a policy FP8

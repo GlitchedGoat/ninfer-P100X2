@@ -16,7 +16,7 @@ if [[ ! -x "$WORK/bin/micromamba" ]]; then
 fi
 MAMBA_ROOT_PREFIX="$WORK/root" "$WORK/bin/micromamba" create -y -q -p "$PREFIX" -c conda-forge \
   "cuda-version=12.8" "cuda-nvcc=12.8.*" "cuda-cudart-dev=12.8.*" "cuda-nvtx-dev=12.8.*" \
-  "cuda-driver-dev=12.8.*" "cuda-nvml-dev=12.8.*" "cuda-cccl=12.8.*"
+  "cuda-driver-dev=12.8.*" "cuda-nvml-dev=12.8.*" "cuda-cccl=12.8.*" "cuda-cuobjdump=12.8.*"
 "$PREFIX/bin/nvcc" --version | tail -2
 cat <<MSG
 Configure with:

@@ -1,6 +1,11 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
+# Pascal sm_60 and Volta sm_70 require CUDA 12.x (CUDA 13 removed their offline compilation);
+# Ampere/Ada builds may pass a newer CUDA_VERSION. Example for 2 x P100:
+#   docker build --build-arg CUDA_ARCH=60 -t ninfer-p100 .
+ARG CUDA_VERSION=12.8.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
+ARG CUDA_ARCH=70
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update     && apt-get install --yes --no-install-recommends         cmake         libavcodec-dev         libavformat-dev         libavutil-dev         libcurl4-openssl-dev         libswscale-dev         ninja-build         pkg-config     && rm -rf /var/lib/apt/lists/*
@@ -8,9 +13,9 @@ RUN apt-get update     && apt-get install --yes --no-install-recommends         
 WORKDIR /src
 COPY . .
 
-RUN cmake -S . -B /build -G Ninja         -DCMAKE_BUILD_TYPE=Release         -DNINFER_BUILD_APPS=ON         -DBUILD_TESTING=OFF         -DNINFER_BUILD_BENCHMARKS=OFF     && cmake --build /build --parallel 4 --target ninfer ninfer-serve
+RUN cmake -S . -B /build -G Ninja         -DCMAKE_BUILD_TYPE=Release         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}         -DNINFER_BUILD_APPS=ON         -DBUILD_TESTING=OFF         -DNINFER_BUILD_BENCHMARKS=OFF     && cmake --build /build --parallel 4 --target ninfer ninfer-serve
 
-FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update     && apt-get install --yes --no-install-recommends         ca-certificates         libavcodec60         libavformat60         libavutil58         libcurl4t64         libswscale7     && rm -rf /var/lib/apt/lists/*
@@ -23,7 +28,7 @@ RUN apt-get update     && apt-get install --yes --no-install-recommends         
 #   on non supported HW
 # Removing them lets the container use the host driver through ordinary CUDA
 # minor-version compatibility, which is what an RTX 3090/3060 needs.
-RUN rm -rf /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
+RUN rm -rf /usr/local/cuda*/compat
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve

@@ -23,6 +23,23 @@ The starting point combines the RTX 3060 TP2 work and the Volta implementation f
 and measurements only; inherited RTX 5090/Ampere/Ada results and general upstream capabilities are
 intentionally omitted.
 
+## P100X2 port (in progress)
+
+This branch adds a Pascal `sm_60` build for **2 × Tesla P100 PCIe 16 GB** that keeps the TP2
+tensor-parallel route (both GPUs work on every layer). GP100 has no Tensor Cores, so the Volta
+Tensor-Core routes are replaced by FP32 SIMT routes; the first admitted identity is
+`qwen3.8-27b/gguf-q4-k-m` (Text/MTP, TP1/TP2). It needs CUDA 12.x:
+
+```bash
+scripts/p100/setup_cuda_toolchain.sh /opt/cuda-12.8      # or NVIDIA's cuda-toolkit-12-8
+export PATH=/opt/cuda-12.8/bin:$PATH CUDAToolkit_ROOT=/opt/cuda-12.8
+cmake -S . -B build-p100 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=60 -DBUILD_TESTING=ON
+cmake --build build-p100 --target ninfer ninfer-serve
+```
+
+No P100 measurements exist yet. Status, open questions and the hardware validation runbook are in
+[`tickets/`](tickets/PROMPT.md).
+
 ## V100X2 changes
 
 - **Q4_K_M prefill:** cooperative SM70 GGML-K block decoding materializes rows into caller-owned

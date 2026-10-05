@@ -1,7 +1,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ops/linear/ggml_k/ggml_k.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/ggml_k/ggml_k_prefill.h"
 #endif
 
@@ -115,7 +115,7 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
     weight.qdata = codes.p;
     weight.qhigh = table.p;
     Tensor xt(x.p, DType::BF16, {k, tokens}), yt(y.p, DType::BF16, {n, tokens});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (tokens >= 512) {
         WorkspaceArena workspace(std::max<std::size_t>(
             1, ops::detail::ggml_k_prefill_workspace_bytes(n, k, tokens)));
@@ -212,7 +212,7 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
             }
         }
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (n == 48 && k == 5120 && tokens == 512 && !tiled_gdn && !add) {
         DeviceBuffer first(std::size_t(n / 2) * tokens * sizeof(__nv_bfloat16));
         DeviceBuffer second(std::size_t(n / 2) * tokens * sizeof(__nv_bfloat16));
@@ -232,7 +232,7 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
                                         std::size_t(t) * (n / 2) + row % (n / 2)];
                 const auto expected = result[std::size_t(t) * n + row];
                 if (std::memcmp(&got, &expected, sizeof(got)) != 0) {
-                    throw std::runtime_error("GGML K SM70 split descriptor offset mismatch");
+                    throw std::runtime_error("GGML K pre-Ampere split descriptor offset mismatch");
                 }
             }
         }
@@ -240,7 +240,7 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
 #endif
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void run_fp32_output() {
     constexpr int n = 48;
     constexpr int k = 5120;
@@ -340,7 +340,7 @@ int main() {
         }
         run(48, 3072, 512, true, false);
         run(48, 3072, 512, true, true);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         run_fp32_output();
 #endif
     } catch (const std::exception& e) {

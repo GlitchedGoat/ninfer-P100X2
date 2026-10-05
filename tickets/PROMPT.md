@@ -53,3 +53,4 @@ P100 host needs driver R525+ for 12.x; R580 is the last branch supporting Pascal
 | T-008 | P100 hardware validation plan | see ticket |
 | T-009 | FP16x2 error-controlled arithmetic (post-FP32) | blocked on C-3 |
 | T-010 | P100 performance tuning | blocked on hardware |
+| T-011 | Pascal SIMT flash-attention prefill | design ready (C-7) |

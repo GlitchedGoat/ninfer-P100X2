@@ -123,6 +123,14 @@ single-request TP4 Text/MTP on Qwen3.8-27B NVFP4 and native block-128 FP8. Nativ
 source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
 TP4 Vision/DFlash and other TP4 identities are not admitted. Operator checks on the local two
 cards do not substitute for four-card whole-model/state or end-to-end performance evidence.
+The explicitly requested P100X2 port targets two Tesla P100 PCIe 16 GB cards (`sm_60`, Pascal, no
+Tensor Cores, no NVLink) with CUDA 12.x (CUDA 13 cannot compile Pascal). Its first scope is
+`qwen3.8-27b/gguf-q4-k-m` TP1/TP2 Text/None/MTP with FP32 SIMT arithmetic; every other identity,
+Vision, DFlash, TP4 and RAM-KV are rejected at startup on `sm_60`. Build macros:
+`NINFER_PRE_AMPERE_BUILD` (sm_60 and sm_70 shared SIMT routes), `NINFER_VOLTA_BUILD` (sm_70
+Tensor-Core routes only), `NINFER_PASCAL_BUILD` (GP100 SIMT replacements). Work, open questions and
+the hardware validation runbook are tracked in `tickets/` (start at `tickets/PROMPT.md`). FP16x2
+arithmetic requires explicit error control and evidence against the FP64 oracle before admission.
 The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
 directory, 180000-token context capacity, INT8 group-64 KV, CUDA Graphs, and MTP with at most
 three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
@@ -364,7 +372,7 @@ These are conventional project resources, not a checklist of resources every tas
 | normal build | `build-v100/` |
 | private dependency prefix | `build/_deps/install/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | 2 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8 |
+| hardware/toolchain | 2 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8; P100X2 port: 2 x Tesla P100 PCIe 16 GB, `sm_60`, CUDA 12.8 (`build-p100/`) |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
