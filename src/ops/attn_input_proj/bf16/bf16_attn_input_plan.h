@@ -20,7 +20,7 @@ void bf16_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tenso
                                     Tensor& k, Tensor& v, cudaStream_t stream);
 void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, cudaStream_t stream);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void bf16_attn_input_cutlass_sm70_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v,
                                          cudaStream_t stream);

@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // ninfer::ops - Volta (sm_70) tensor-core GQA small-T attention partial kernel.
 //
 // Structurally mirrors gqa_attention_small_t_tc_partial_bf16_kernel's Ampere+ branch

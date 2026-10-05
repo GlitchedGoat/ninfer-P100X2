@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Split-projection NVFP4 SwiGLU on Volta tensor cores (sm_70 only): two independent QPN2 launches
 // -- one per weight half, using the unmodified plain-QPN2 kernel -- into fp32 scratch, then a
 // small combine kernel applies silu(gate) * up in fp32 before the single BF16 round.

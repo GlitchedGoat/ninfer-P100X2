@@ -5,7 +5,7 @@
 #include "core/layout.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear/q4/q4_launch.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.h"
 #endif
@@ -36,14 +36,14 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Lower edge of the fused tensor-core route. At exactly 16 it is a wash (that is q4_simt_r8_c8's
 // best point -- two exact eight-column tiles); it wins from 17 up, and SmallTExact's own ceiling
 // of 32 bounds the split-K buffer.
 constexpr std::int32_t kVoltaMmaMinCols = 16;
 #endif
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // MmaSplitHalfPairR32C*/Materialized-via-linear() route through Ampere+ mma/ldmatrix kernels
 // (q4_rowsplit_gemm_mma.cuh and friends), trap-stubbed on sm_70. SmallTExact's Volta compose
 // (a tuned q4 SIMT launch + silu_mul) is fully general over T via for_each_token_slice, and stays
@@ -146,7 +146,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         };
         switch (route.schedule) {
         case Q4LinearSwiGluScheduleId::SmallTExact:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             // q4_small_t_mma_kernel (the fused tensor-core path this schedule normally
             // uses) traps below sm_80 — see q4_small_t_mma.cuh. On Volta this schedule
             // composes from the same already-proven pieces Materialized below uses
@@ -172,7 +172,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
             return plan;
         case Q4LinearSwiGluScheduleId::CutlassSm70TensorCore:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             // gate_up output buffer (materialized_workspace_bytes) plus the CUTLASS launcher's
             // own internal scratch (dequant FP16 weight buffer -- fixed size, independent of
             // cols -- FP16-cast activations, and CUTLASS's own GEMM workspace).
@@ -223,7 +223,7 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
         return;
     case Q4LinearSwiGluScheduleId::SmallTExact:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         {
             // Same compose as Materialized below, forcing the gate_up GEMM through the
             // known-Volta-safe SIMT kernel directly rather than the general linear()
@@ -274,7 +274,7 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
         q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x, w, out, stream);
         return;
     case Q4LinearSwiGluScheduleId::CutlassSm70TensorCore:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         {
             auto scratch_scope = ws.scope();
             Tensor gate_up = allocate_materialized_workspace(ws, problem.gate_up_rows, problem.cols);

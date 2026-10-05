@@ -105,7 +105,7 @@ template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kRe
           bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
 __global__
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // ncu (real hardware counters, unblocked this session via a host driver-permission fix) measured
 // this kernel's decode-shaped instantiations at 36 registers/thread with 512 threads/block,
 // capping occupancy at 3 blocks/SM (18432 regs/block into a 65536-register/SM budget) against a
@@ -223,7 +223,7 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // ncu measured this kernel family's default shared-memory carveout at 65.54KB/SM (not the full
 // 96KB Volta permits), which -- combined with the register fix above -- still caps occupancy at
 // 3 blocks/SM by shared memory (65.54KB / ~21.5KB per block) even after registers stop being the
@@ -249,7 +249,7 @@ inline void q5_rowsplit_gemv_launch_kernel(const __nv_bfloat16* x, const std::ui
                                            cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     q5_rowsplit_gemv_request_max_shared_carveout(
         q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>);
 #endif
@@ -264,7 +264,7 @@ q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8
                                         __nv_bfloat16* residual_out, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     q5_rowsplit_gemv_request_max_shared_carveout(
         q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>);
 #endif

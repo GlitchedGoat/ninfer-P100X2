@@ -23,7 +23,7 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
         // The eight-row SM70 schedule is tuned for the V100 TP2 MLP shard. Keep the
         // inherited one-row/eight-warp route on other targets until they have their own
         // qualification, because this table is shared by the Ampere builds too.
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (n == 17408) { return launch_q4_gemv_r8_w1_direct; }
 #endif
         return n >= 65536 ? launch_q4_gemv_r4_w1_direct : launch_q4_gemv_r1_w8_direct;
@@ -37,7 +37,7 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
 // can fall back to the tp2 shard table. It is consulted FIRST, so a geometry that is
 // both registered here and listed as a shard extent keeps its tuned tp1 launcher.
 Q4Launch select_q4_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Qwen3.8 NVFP4's exact Q4 optimized proposal-head quarter shard.
     if (n == 32768 && k == 5120) {
         if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
@@ -141,7 +141,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     throw std::invalid_argument("q4 linear: unsupported shape or T");
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 bool q4_launch_needs_volta_fallback(Q4Launch launch) noexcept {
     return launch != launch_q4_gemv_r1_w8_direct && launch != launch_q4_gemv_r4_w1_direct &&
            launch != launch_q4_gemv_r8_w1_direct && launch != launch_q4_draft_head_small_t &&
@@ -154,7 +154,7 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8: {
         const Q4Launch launch = select_q4_a16_launch(n, k, t);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (q4_launch_needs_volta_fallback(launch)) { return launch_q4_simt_r8_c8; }
 #endif
         return launch;
@@ -165,7 +165,7 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     throw std::invalid_argument("q4 linear: unsupported policy");
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Band in which the fused tensor-core route is routed. The lower bound is the measured crossover
 // at N=4096 K=5120, both routes through the same bench back to back: T=8 SIMT 72.7us vs fused
 // 93.2us, then T=9 129.0 vs ~93, T=12 146.4 vs 95.2, T=32 259.1 vs 110.6. T=8 is the only point
@@ -181,7 +181,7 @@ constexpr std::int32_t kVoltaMmaMaxT = 64;
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Quadpair-split-N maps T to the 8-row axis instead of the 32-row one, so it is the right
     // geometry exactly where the companion kernel pads its A rows away. Needs no workspace at
     // all, so unlike that route there is nothing to fall back from.

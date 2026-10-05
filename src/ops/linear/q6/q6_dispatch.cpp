@@ -91,7 +91,7 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     throw std::invalid_argument("q6 linear: unsupported shape or T");
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 bool q6_launch_needs_volta_fallback(Q6Launch launch) noexcept {
     return launch != launch_q6_simt_r8_c4 && launch != launch_q6_simt_r8_c5 &&
            launch != launch_q6_simt_r8_c6 && launch != launch_q6_simt_r8_c7 &&
@@ -104,7 +104,7 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8: {
         const Q6Launch launch = select_q6_a16_launch(n, k, t);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (q6_launch_needs_volta_fallback(launch)) { return launch_q6_simt_r8_c8; }
 #endif
         return launch;

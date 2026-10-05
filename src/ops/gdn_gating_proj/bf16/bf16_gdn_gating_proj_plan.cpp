@@ -26,7 +26,7 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Volta build: the MmaCooperative*/MmaUnsplit schedules below route through
 // bf16_gdn_gating_proj_gemm_mma_kernel, which is trap-stubbed on sm_70 (Ampere+ mma/ldmatrix).
 // SmallTSplit10 (ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu) is a plain SIMT
@@ -50,7 +50,7 @@ constexpr std::array<RouteSpec, 6> k27Routes{{
 }};
 #endif
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Same story as k27Routes above, for the 35B-A3B geometry: every Mma* schedule
 // routes through the trap-stubbed bf16_gdn_gating_proj_gemm_mma_kernel. Unlike
 // the 27B geometry, GemvPairedRows and SmallTSplit10 are not legal here (see
@@ -69,7 +69,7 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
@@ -172,7 +172,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             return problem.cols >= 2;
 #else
             return problem.cols >= 2 && problem.cols <= 8;
@@ -444,11 +444,11 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     // route table above, so the Volta k35Routes entry does not protect it. Its
     // Composed alternative is the same computation as rmsnorm + the routed gating
     // projection, which does go through the table.
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     constexpr bool fused_norm_gating_available = false;
 #else
     constexpr bool fused_norm_gating_available = true;
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
     if (fused_norm_gating_available && is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);

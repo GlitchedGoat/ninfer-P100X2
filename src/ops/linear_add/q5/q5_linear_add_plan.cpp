@@ -1,7 +1,7 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/q5/q5_launch.h"
 #include "ops/linear_add/q5/q5_linear_add_cutlass_sm70.h"
 #endif
@@ -45,7 +45,7 @@ constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 8704, 8704},
 }};
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // MmaResidualR64C* need Ampere+ mma/ldmatrix and are trap-stubbed on sm_70.
 // SimtWideTResidual (q5_linear_add_simt_wide_t_launch) is q5_rowsplit_gemm_simt_kernel with
 // AddResidual=true and cols as a runtime grid parameter, so it covers every width above
@@ -95,7 +95,7 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
 // TP2 row-parallel shard routes (K = 3072, 8704). Ampere MMA is not executable on sm_70.
 // Volta uses runtime-K SIMT for small T and CUTLASS for wide T; the fused Volta MMA band below
 // replaces the table's selection in its supported interval, just as for the full shapes.
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 constexpr std::array<RouteSpec, 2> kShardRoutes{{
     {{1, 16}, Q5LinearAddScheduleId::SimtWideTResidual},
     {{17, kAnyCols}, Q5LinearAddScheduleId::CutlassSm70TensorCoreResidual},
@@ -160,7 +160,7 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
     return "linear_add.q5.unknown";
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Band for the fused tensor-core route. Lower edge is the measured crossover against whatever the
 // table would otherwise pick, both routes through ninfer_q5_linear_add_bench back to back:
 //   k=17408  T=9 353 vs 419us (table wins), T=12 634 vs 433, T=16 949 vs 456, T=32 1253 vs 552
@@ -198,7 +198,7 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         for (const RouteSpec& route : routes) {
             if (!route.cols.contains(problem.cols)) { continue; }
             std::size_t workspace_bytes = 0;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             if (route.schedule == Q5LinearAddScheduleId::CutlassSm70TensorCoreResidual) {
                 workspace_bytes =
                     q5_linear_add_cutlass_workspace_bytes(problem.rows, problem.k, problem.cols);
@@ -230,7 +230,7 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
     const Q5LinearAddPlan at_min = q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
     const Q5LinearAddPlan at_max = q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
     std::size_t peak = std::max(at_min.workspace_bytes, at_max.workspace_bytes);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // CUTLASS workspace is monotonic in T, but fused MMA drops its accumulator when the
     // split count becomes one (currently T=33). Inspect the bounded fused band as well, so
     // intervals such as [1,64] reserve the actual interior peak rather than zero bytes.
@@ -250,7 +250,7 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
-#ifndef NINFER_VOLTA_BUILD
+#ifndef NINFER_PRE_AMPERE_BUILD
     (void)ws; // only CutlassSm70TensorCoreResidual (Volta-only) uses the workspace arena
 #endif
 
@@ -277,7 +277,7 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         q5_linear_add_simt_wide_t_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::VoltaMmaFusedResidual:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // Reads the residual as C and writes the sum back as D -- the same beta=1 epilogue
         // contract the CUTLASS schedule provides.
         if (ws == nullptr) { throw std::invalid_argument("Q5 Volta MMA requires workspace"); }
@@ -288,7 +288,7 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         throw std::logic_error("q5 linear_add: VoltaMmaFusedResidual is Volta-only");
 #endif
     case Q5LinearAddScheduleId::CutlassSm70TensorCoreResidual:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (ws == nullptr) { throw std::invalid_argument("Q5 CUTLASS requires workspace"); }
         q5_linear_add_cutlass_sm70_launch(x, w, residual_out, *ws, stream);
         return;

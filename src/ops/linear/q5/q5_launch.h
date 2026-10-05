@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 
 using Q5Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Fused-dequant tensor-core route (q5_volta_mma_gemm.cuh). Not in the Q5Launch table: split-K
 // needs an fp32 accumulator, and the linear_add form needs the residual flag.
 // `splits_override` is for the tuning bench only; 0 means "use the measured table".

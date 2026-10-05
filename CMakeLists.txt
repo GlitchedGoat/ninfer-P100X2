@@ -1,24 +1,35 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The implementation supports Volta sm_70, Ampere sm_86 and early Ada sm_89. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
+# The implementation supports Pascal sm_60, Volta sm_70, Ampere sm_86 and early Ada sm_89. Set and
+# validate the architecture before CUDA compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|86|89)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(60|70|86|89)$")
   message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 86 or 89; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=60, 70, 86 or 89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+# Pascal sm_60 and Volta sm_70 share the pre-Ampere ISA limits (no ldmatrix, cp.async, BF16 MMA).
+# NINFER_PRE_AMPERE_BUILD selects their common SIMT routes; NINFER_VOLTA_BUILD additionally selects
+# Volta Tensor-Core routes, and NINFER_PASCAL_BUILD selects the GP100 SIMT replacements for them.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(60|70)$")
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
-    message(FATAL_ERROR "Volta sm_70 requires CUDA 12.8; CUDA 13 removed Volta compilation")
+    message(FATAL_ERROR
+      "sm_${CMAKE_CUDA_ARCHITECTURES} requires CUDA 12.x; CUDA 13 removed Pascal/Volta compilation")
   endif()
-  add_compile_definitions(NINFER_VOLTA_BUILD=1)
+  add_compile_definitions(NINFER_PRE_AMPERE_BUILD=1)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+  add_link_options($<$<LINK_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+    add_compile_definitions(NINFER_VOLTA_BUILD=1)
+  else()
+    add_compile_definitions(NINFER_PASCAL_BUILD=1)
+  endif()
   include(FetchContent)
   set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
   set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "Disable CUTLASS tests")

@@ -157,12 +157,12 @@ void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>
     require_quantized(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 bool volta_prefill_supported(QType routed_gate_up, QType routed_down) noexcept {
     return routed_gate_up == QType::Q4G64_F16S &&
            (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 } // namespace
 
@@ -183,17 +183,17 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }
 
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     const std::int32_t small_last = std::min(max_tokens, detail::kSparseMoeSmallTMax);
 #else
     const std::int32_t small_last =
         std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
     if (small_first <= small_last) {
         required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(small_last));
     }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (max_tokens > detail::kSparseMoeSmallTMax) {
         required = std::max(required,
                             detail::sparse_moe_small_t_workspace_bytes(detail::kSparseMoeSmallTMax));
@@ -210,7 +210,7 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
         required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
     }
     return required;
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
@@ -230,7 +230,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     validate_weights(weights, ranges);
 
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     const bool use_prefill = volta_prefill_supported(weights.routed_gate_up.qtype,
                                                       weights.routed_down.qtype) &&
                              detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
@@ -240,7 +240,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
                                                              weights.routed_down.qtype);
     constexpr bool use_chunked = false;
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,

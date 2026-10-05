@@ -225,7 +225,7 @@ __global__ __launch_bounds__(
     __shared__ __align__(16) uint4 shared_codes[kRowsPerCta][kPipelineStages][kCodeVecsPerStage];
     __shared__ __align__(16)
         std::uint32_t shared_scales[kRowsPerCta][kPipelineStages][kScalePairsPerStage];
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // One stage's K-slice of activations for the whole column tile, shared by every warp in the
     // CTA. kColsPerTile x kStageK x 2B = 16 KiB at the widest (C8) schedule, on top of the
     // ~8.5 KiB of code/scale staging -- still inside the 48 KiB static budget, and free in
@@ -298,7 +298,7 @@ __global__ __launch_bounds__(
         const int active_groups =
             kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - stage * kGroupsPerStage);
         const int buffer = stage % kPipelineStages;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // Every warp in this CTA owns a different output row but reads the *same* activation
         // slice, so reading x straight from global (as the pre-staging code did, once per column
         // per phase per warp) costs kRowsPerCta-fold redundant L1/LSU traffic -- ~30x the weight

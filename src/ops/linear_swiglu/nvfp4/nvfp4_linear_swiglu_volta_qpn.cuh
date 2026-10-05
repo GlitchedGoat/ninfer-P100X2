@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Fused NVFP4 gate_up projection + SwiGLU on Volta tensor cores, quadpair-split-N form (sm_70
 // only). The SwiGLU sibling of nvfp4_volta_qpn_gemm.cuh: same decoder, same fragment maps, same
 // per-group loop shape -- what's different is that one CTA now computes *two* independent

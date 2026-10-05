@@ -3,8 +3,8 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/linear_dispatch.h"
 #include "ops/linear/ggml_k/ggml_k.h"
-#ifdef NINFER_VOLTA_BUILD
-#include "ops/linear/ggml_k/ggml_k_cutlass_sm70.h"
+#ifdef NINFER_PRE_AMPERE_BUILD
+#include "ops/linear/ggml_k/ggml_k_prefill.h"
 #endif
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
@@ -107,9 +107,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::fp8_block_launch(x, w, out, workspace, stream);
         return;
     case QType::GGML_K:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (workspace != nullptr && x.ne[1] >= 128) {
-            detail::ggml_k_cutlass_sm70_launch(x, w, out, *workspace, stream);
+            detail::ggml_k_prefill_launch(x, w, out, *workspace, stream);
             return;
         }
 #endif
@@ -162,9 +162,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
             policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear workspace: invalid GGML K profile");
         }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (max_tokens >= 128) {
-            return detail::ggml_k_cutlass_sm70_workspace_bytes(output_rows, input_rows,
+            return detail::ggml_k_prefill_workspace_bytes(output_rows, input_rows,
                                                                  max_tokens);
         }
 #endif
@@ -172,7 +172,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q4G64_F16S:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         {
             std::size_t capacity = 0;
             for (int t = std::max(min_tokens, 9); t <= std::min(max_tokens, 64); ++t) {

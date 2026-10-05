@@ -42,7 +42,7 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (gate_up_rows == 8704 && input_rows == 5120 &&
         (qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16S)) {
         return linear_swiglu_column_parallel_workspace_capacity_bytes(
@@ -112,7 +112,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
     bool quarter_shape = false;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     quarter_shape = x.ne[0] == 5120 && out.ne[0] == 4352 && gate_up_weight.n == 8704 &&
                     gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 8704 &&
                     gate_up_weight.padded_shape[1] == 5120;

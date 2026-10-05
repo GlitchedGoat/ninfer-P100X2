@@ -21,7 +21,7 @@ void vision_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
                                                std::int32_t segment_length, std::int32_t tile_size,
                                                Tensor& out, cudaStream_t stream);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Volta (sm_70) vision attention through the vendored llama.cpp flash-attention
 // kernel. Defined in vision_attention_volta_flash.cu, the only vision translation
 // unit that sees the vendored headers. See the V100 performance summary.
@@ -52,6 +52,6 @@ void vision_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
                                          Tensor& q_f32, Tensor& k_f16, Tensor& v_f16,
                                          Tensor& out_f32, Tensor& dst_meta, Tensor& out,
                                          cudaStream_t stream);
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 } // namespace ninfer::ops::detail

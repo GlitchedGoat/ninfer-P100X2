@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Fused-dequant Q4 x BF16 GEMM on Volta tensor cores (mma.sync.m8n8k4), sm_70 only.
 //
 // Both pre-existing routes are structurally wrong for the T values concurrency produces

@@ -22,7 +22,7 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      WorkspaceArena& workspace, cudaStream_t stream);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void nvfp4_linear_swiglu_volta_qpn_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           cudaStream_t stream);
 [[nodiscard]] bool nvfp4_linear_swiglu_volta_qpn_supported(std::int32_t k, std::int32_t t) noexcept;

@@ -744,7 +744,8 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     if (options.tp == 4 && options.speculative.backend == SpeculativeBackend::DFlash) {
         throw std::invalid_argument("--tp 4 does not support DFlash");
     }
-    if (device.sm() != 70 && device.sm() != 86 && device.sm() != 89 && device.sm() != 120) {
+    if (device.sm() != 60 && device.sm() != 70 && device.sm() != 86 && device.sm() != 89 &&
+        device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires a registered CUDA target");
     }
     return effective_max_context;

@@ -4,7 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #endif
 
@@ -18,7 +18,7 @@ namespace {
 
 enum class Nvfp4LinearAddRoute : std::uint8_t {
     A16,
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     LinearThenAdd,
 #endif
     W4A4,
@@ -34,7 +34,7 @@ bool is_17408_family(std::int32_t input_rows) { return input_rows == 17408 || in
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (tokens > 0 && output_rows == 5120 && (input_rows == 1536 || input_rows == 4352)) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("nvfp4 TP4 linear_add admits only SM70 A16");
@@ -47,7 +47,7 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // Volta's loader pre-packs NVFP4 MLP weights for QPN. The fused row-major decode/small-T
         // kernels cannot consume that layout, so use the ordinary linear route (QPN for narrow T,
         // CUTLASS materialization for wide T) and add the residual afterward at every width.
@@ -81,7 +81,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
     }
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 template <class Allocator>
 Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::int32_t tokens) {
     return allocator.alloc(DType::BF16, {output_rows, tokens}, 256);
@@ -117,7 +117,7 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
     (void)layout.alloc_bytes(linear_bytes, 256);
     return layout.peak_bytes(1);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 } // namespace
 
@@ -133,7 +133,7 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
     if (route == Nvfp4LinearAddRoute::W4A4) {
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (route == Nvfp4LinearAddRoute::LinearThenAdd) {
         return linear_then_add_workspace_bytes(output_rows, input_rows, max_tokens);
     }
@@ -149,7 +149,7 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
         launch_a16(x, weight, residual, stream);
         return;
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (route == Nvfp4LinearAddRoute::LinearThenAdd) {
         if (!workspace) throw std::invalid_argument("nvfp4 linear_add requires workspace");
         launch_linear_then_add(x, weight, residual, *workspace, stream);

@@ -46,7 +46,7 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
     }
 }
 
-#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_VOLTA_BUILD)
+#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_PRE_AMPERE_BUILD)
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::A16Only;
 constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::A16Only;
 #else

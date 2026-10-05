@@ -4,7 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #endif
 
@@ -25,7 +25,7 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     if (tokens <= 0 || !is_nvfp4_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (is_nvfp4_volta_tp4_problem(output_rows, input_rows)) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("nvfp4 TP4 SM70 linear admits only A16");
@@ -63,12 +63,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
                 WorkspaceArena* workspace,
 #endif
                 cudaStream_t stream) {
     const std::int32_t total_t = x.ne[1];
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Materialize each weight once for the whole prefill call, including QPN-prepacked TP2
     // shards. Repeated 32-token QPN launches reread the entire down projection per tile.
     if (workspace != nullptr && total_t >= 128) {
@@ -88,7 +88,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_nvfp4_volta_qpn(input_chunk, weight, output_chunk, stream);
             continue;
@@ -114,7 +114,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
     if (resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearRoute::W4A4) {
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (max_tokens >= 128) {
         return nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
     }
@@ -130,7 +130,7 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     }
 
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearRoute::A16) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         launch_a16(x, weight, out, workspace, stream);
 #else
         launch_a16(x, weight, out, stream);

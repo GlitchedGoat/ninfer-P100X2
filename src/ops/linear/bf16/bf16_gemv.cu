@@ -32,7 +32,7 @@ void launch_geometry(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
 } // namespace
 
 void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (weight.k == 5120 && weight.n == 1280) {
         launch_geometry<Bf16GemvGeometry<1280, 5120>>(x, weight, out, stream);
         return;

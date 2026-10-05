@@ -88,7 +88,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
         launch_q4_simt_route<Q4AttnSimtR8C8Schedule>(x, weight, q, key, stream);
         return;
     default:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // GroupedHomogeneousPairMma* (T>16) need Ampere+ mma/ldmatrix, trap-stubbed on sm_70.
         // launch_q4_simt_route already takes cols as a runtime grid parameter (the switch above
         // is only picking a tile-size schedule for tuning, not a kernel limit), so it
@@ -189,7 +189,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         launch_q5_simt<4>(x, weight, gate, value, stream);
         return;
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Same reasoning as launch_q4 above: launch_q5_simt<4> already takes cols as a runtime grid
     // parameter, so it generalizes past T=16 once GroupedHomogeneousPairMma* is unavailable.
     launch_q5_simt<4>(x, weight, gate, value, stream);

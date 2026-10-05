@@ -186,7 +186,7 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             std::int32_t value_heads, std::int32_t tokens,
                                             bool normalize_qk) {
     ChunkedWorkspace out;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (normalize_qk && tokens >= detail::gated_delta_net::kChunkSize) {
         out.normalized_q =
             allocator.alloc(DType::FP32, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
@@ -261,7 +261,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // The SM70 route retains the FP32 sequential state transition. For wide normalized
     // inputs, prepare Q/K once instead of repeating their norms for every state tile.
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);

@@ -1043,7 +1043,7 @@ union alignas(16) SparseMoeBf16x8 {
 };
 
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // ---------------------------------------------------------------------------
 // Volta: weight-stationary grouped expert GEMMs.
 //
@@ -1597,7 +1597,7 @@ __global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_w8_shared_dow
     }
 }
 
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 template <bool Adaptive>
 __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict__ grouped_output,
@@ -1691,7 +1691,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                                                                    : 0;
         const bool adaptive     = tokens >= 47 && tokens <= adaptive_last;
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         {
             constexpr int kSimtBN = 64;
             const dim3 grid((kRouterRows + kSimtRowsPerCta - 1) / kSimtRowsPerCta,
@@ -1704,14 +1704,14 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                                     (tokens + kRouterBN - 1) / kRouterBN),
                                                kRouterThreads, 0, stream>>>(input, router, scores,
                                                                             tokens);
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
             scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // Eight assignments over 256 experts average one packed column per 32
         // tokens.  BN=64 therefore becomes full only around T=2048; selecting it
         // at the Ampere-family T=768 seam makes the scalar Volta kernels spend
@@ -1720,7 +1720,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const bool wide_plan = tokens >= 2048;
 #else
         const bool wide_plan = tokens >= kSparseMoePrefillWideMin;
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
         const int route_job_bn = wide_plan ? 64 : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
@@ -1744,7 +1744,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // The grouped SIMT kernels take the same device-side job list and the same
         // BN as the scan was told to use, so the column tiling matches exactly.
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
@@ -1784,12 +1784,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         } else {
             throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
         }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
                                     (tokens + kExpertBN - 1) / kExpertBN);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         {
             constexpr int kSimtBN = 64;
             const dim3 grid(kIntermediate / kSimtRowsPerCta, (tokens + kSimtBN - 1) / kSimtBN);
@@ -1817,11 +1817,11 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                     input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
                     tokens, nullptr);
         }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:
             if (wide_plan) {
@@ -1898,7 +1898,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         default:
             throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
         }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
         CUDA_CHECK(cudaGetLastError());
 
         if (adaptive) {
@@ -1911,7 +1911,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         {
             constexpr int kSimtBN = 64;
             const dim3 grid(kHidden / kSimtRowsPerCta, (tokens + kSimtBN - 1) / kSimtBN);
@@ -1940,7 +1940,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                     shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
                     routed_sum, shared_scale, output, tokens, nullptr);
         }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
         CUDA_CHECK(cudaGetLastError());
     }
 }

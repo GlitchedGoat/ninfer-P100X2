@@ -70,7 +70,7 @@ __launch_bounds__(256, 6) __global__
 // replacement here (this kernel's callers need either a plain projection or a fused SwiGLU
 // combine that q4_rowsplit_gemm_simt_kernel doesn't natively do) — so the host callers
 // compose it from the existing, already-validated q4 SIMT kernel instead of calling this
-// one, under NINFER_VOLTA_BUILD. This body still needs its own stub purely to compile.
+// one, under NINFER_PRE_AMPERE_BUILD. This body still needs its own stub purely to compile.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     using Schedule              = Q4DraftSmallTSchedule;
     constexpr int kHidden       = Geometry::kInputRows;

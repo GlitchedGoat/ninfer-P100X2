@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Fused-dequant W8 x BF16 GEMM on Volta tensor cores, quadpair-split-N form (sm_70 only).
 //
 // The W8 sibling of q4_volta_qpn_gemm.cuh, for the same reason and on the shape where it matters

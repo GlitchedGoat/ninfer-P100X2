@@ -1,7 +1,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q5/q5_launch.h"
@@ -31,7 +31,7 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // GroupedMixedMmaR64C128 needs Ampere+ mma/ldmatrix and is trap-stubbed on sm_70.
 // IndependentDirectFixed's underlying kernels (q4_rowsplit_gemm_simt_kernel,
 // q5_rowsplit_gemm_simt_kernel) are plain SIMT with cols as a runtime grid parameter, so it
@@ -161,7 +161,7 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
         switch (route.schedule) {
         case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
         case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             if (gdn_uses_volta_mma(problem)) {
                 return {Q4Q5GdnInputScheduleId::VoltaMmaFused,
                         gdn_volta_mma_workspace_bytes(problem)};
@@ -172,7 +172,7 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
             plan.workspace_bytes = gdn_volta_mma_workspace_bytes(problem);
             return plan;
         case Q4Q5GdnInputScheduleId::CutlassSm70TensorCore:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             if (gdn_uses_volta_mma(problem)) {
                 return {Q4Q5GdnInputScheduleId::VoltaMmaFused,
                         gdn_volta_mma_workspace_bytes(problem)};
@@ -244,7 +244,7 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 
     switch (plan.schedule) {
     case Q4Q5GdnInputScheduleId::VoltaMmaFused: {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
         // value_z_weight is one [2*z_rows, k] parent: rows [0,z_rows) feed value, the rest feed z.
@@ -268,7 +268,7 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     case Q4Q5GdnInputScheduleId::CutlassSm70TensorCore:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         q4_q5_gdn_input_cutlass_sm70_launch(x, qk_weight, value_z_weight, qkv, z, workspace,
                                             stream);
         return;

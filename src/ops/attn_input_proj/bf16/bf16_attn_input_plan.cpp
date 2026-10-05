@@ -12,7 +12,7 @@ void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, 
         bf16_attn_input_small_t_launch(x, weight, q, gate, k, v, stream);
         return;
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     bf16_attn_input_cutlass_sm70_launch(x, weight, q, gate, k, v, stream);
 #else
     bf16_attn_input_mma_launch(x, weight, q, gate, k, v, stream);

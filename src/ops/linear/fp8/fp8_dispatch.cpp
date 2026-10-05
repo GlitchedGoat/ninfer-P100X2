@@ -4,7 +4,7 @@
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/fp8/fp8_launch.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/fp8/fp8_cutlass_sm70.h"
 #endif
 
@@ -15,7 +15,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 inline constexpr bool kVoltaBuild = true;
 #else
 inline constexpr bool kVoltaBuild = false;
@@ -31,7 +31,7 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     if (tokens <= 0 || !is_fp8_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("fp8 linear: unsupported shape");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (is_fp8_volta_tp4_problem(output_rows, input_rows)) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("fp8 TP4 SM70 linear admits only A16");
@@ -86,7 +86,7 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (is_fp8_volta_tp4_problem(weight.n, weight.k)) {
         if (workspace != nullptr && x.ne[1] >= 128 && weight.n != 62080) {
             fp8_cutlass_sm70_launch(x, weight, out, *workspace, stream);
@@ -104,7 +104,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     }
 #endif
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (workspace != nullptr && x.ne[1] >= 128 && !is_fp8_vocabulary_problem(problem)) {
         fp8_cutlass_sm70_launch(x, weight, out, *workspace, stream);
         return;
@@ -129,7 +129,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // The row-major GEMV cannot consume the resident QPN layout. This includes the
         // first generated token and a one-token tail after a full QPN chunk.
         if (fp8_volta_qpn_supported(weight.n, weight.k, active) ||
@@ -185,7 +185,7 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (is_fp8_volta_tp4_problem(output_rows, input_rows)) {
         (void)resolve_route(output_rows, input_rows, policy, min_tokens);
         (void)resolve_route(output_rows, input_rows, policy, max_tokens);
@@ -197,7 +197,7 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     (void)resolve_route(output_rows, input_rows, policy, max_tokens);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (policy == LinearPolicy::A16Only && max_tokens >= 128 &&
         !is_fp8_vocabulary_problem(problem)) {
         return fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);

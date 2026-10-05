@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 
 using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Fused-dequant tensor-core route (see q4_volta_mma_gemm.cuh). Kept out of the Q4Launch table
 // deliberately: split-K needs an fp32 accumulation workspace, which that signature cannot carry.
 // `weight_row_offset` selects a contiguous row band of a parent weight; see the Q5 sibling.

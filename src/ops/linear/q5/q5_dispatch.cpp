@@ -123,7 +123,7 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     throw std::invalid_argument("q5 linear: unsupported shape or T");
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 bool q5_launch_needs_volta_fallback(Q5Launch launch) noexcept {
     return launch != launch_q5_gemv_r16_s2_x && launch != launch_q5_simt_split4_exact &&
            launch != launch_q5_simt_split2_exact && launch != launch_q5_simt_r8_c4 &&
@@ -136,7 +136,7 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8: {
         const Q5Launch launch = select_q5_a16_launch(n, k, t);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // The exact split2/split4 routes are the best thing Q5 has on Volta, but the shared table
         // caps them at T<=6 because dispatch_exact_cols only instantiated [2,6]. That cap was the
         // single worst Q5 cliff: mlp_down T=6 194us (split2) -> T=7 670us (r8_c8), a 3.4x step for

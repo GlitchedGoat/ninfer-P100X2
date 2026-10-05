@@ -138,7 +138,7 @@ using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 // schedule's 16-row CTAs and leaves K untouched.
 using Fp8VocabularyTp2ColumnGeometry = Fp8Geometry<124160, 5120>;
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 using Fp8MlpGateUpTp4ColumnGeometry = Fp8Geometry<8704, 5120>;
 // Official NVFP4 v3 also contains row-scaled FP8 attention/GDN/MLP/head projections.
 // These finite quarter-shard shapes use the existing runtime-dimensioned SM70 leaf, with
@@ -222,7 +222,7 @@ enum class Fp8Problem : std::uint8_t {
 };
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (is_fp8_volta_tp4_problem(output_rows, input_rows)) { return true; }
 #endif
     return (output_rows == Fp8AttnInputGeometry::kOutputRows &&
@@ -404,7 +404,7 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry>
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry> =
     kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Upstream serves the vocabulary head only through the A16 MMA kernel, which is ldmatrix-based
 // (sm_75+) and has no SIMT sibling, so on Volta the head has no route at all. Register it on the
 // SIMT decode/small-T families instead. The schedules are the ones every other geometry measured
@@ -426,7 +426,7 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyGeometry> = kFp8L
 
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyTp2ColumnGeometry> = kFp8LastSmallT;
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     switch (problem) {
@@ -439,13 +439,13 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     case Fp8Problem::GdnInputTp2Column:
         return kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
     case Fp8Problem::Vocabulary:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         return kFp8LinearSmallTMax<Fp8VocabularyGeometry>;
 #else
         break;
 #endif
     case Fp8Problem::VocabularyTp2Column:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         return kFp8LinearSmallTMax<Fp8VocabularyTp2ColumnGeometry>;
 #else
         break;

@@ -3,7 +3,7 @@
 #include "ops/linear/fp8/fp8_launch.h"
 
 #include "ops/linear/fp8/fp8_config.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.h"
 #endif
 
@@ -34,7 +34,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
                 Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT) {
         if (workspace == nullptr) {
             throw std::invalid_argument("fp8 Volta attention prefill requires caller workspace");
@@ -66,7 +66,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_fp8_attn_input_volta_qpn(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
                                             value_chunk, stream);
@@ -94,7 +94,7 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
     if (resolve_route(policy, max_tokens) == Fp8AttnInputRoute::A8) {
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8AttnInputGeometry::kInputRows);
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (max_tokens >= kVoltaCutlassMinT) {
         return fp8_attn_input_cutlass_workspace_bytes(max_tokens);
     }
@@ -125,7 +125,7 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
                       Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr std::int32_t kQRows  = 3072;
     constexpr std::int32_t kKvRows = 512;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
         fp8_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);
         return;
@@ -153,7 +153,7 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (active > 1 && fp8_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_fp8_attn_input_volta_qpn_shard(input_chunk, weight, query_chunk, gate_chunk,
                                                   key_chunk, value_chunk, stream);

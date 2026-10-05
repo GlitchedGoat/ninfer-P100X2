@@ -100,7 +100,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
         throw std::invalid_argument(
             "W8 attention input: exact problem or column count is not admitted");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Same shape as the w8 linear_add override: every schedule in these tables
     // except SimtR8C4 and DecodeR8Direct reaches the trap-stubbed mma/split-K
     // kernels below sm_80, and SimtR8C4's grid derives its token extent from
@@ -120,7 +120,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     };
     if (is_companion_shape(problem)) { return resolve_from(kCompanionRoutes); }
     return resolve_from(kTargetRoutes);
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 }
 
 void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, const Weight& weight,

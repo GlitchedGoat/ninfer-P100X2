@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Fused FP8 (E4M3) gate_up projection + SwiGLU on Volta tensor cores, quadpair-split-N form
 // (sm_70 only). The FP8 sibling of nvfp4_linear_swiglu_volta_qpn.cuh, and simpler: FP8's scale is
 // one BF16 value per output row (not a swizzled per-16-k block plane), so it is read once per

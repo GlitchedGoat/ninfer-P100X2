@@ -318,7 +318,16 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
       INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
       COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
 endif()
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "60")
+  # Pascal GP100: no Tensor Cores. Wide-T routes use CUTLASS SIMT GEMMs with FP32 operands.
+  target_sources(ninfer_ops PRIVATE
+    ops/linear/ggml_k/ggml_k_cutlass_simt.cu
+    ops/linear_swiglu/swiglu_fp32.cu
+    ops/volta_tc_sm60_stubs.cpp)
+  target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
+  target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+endif()
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(60|70|86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_86 has no FP8 or FP4
@@ -329,7 +338,7 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|86|89)$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_fp8\\.cu$")
   set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp ops/fp8_sm86_stubs.cpp)
-  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
     target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)
   endif()
 endif()

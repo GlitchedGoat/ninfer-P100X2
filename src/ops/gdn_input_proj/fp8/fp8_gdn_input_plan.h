@@ -50,7 +50,7 @@ void fp8_gdn_input_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor
 void fp8_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                   LinearPolicy policy, WorkspaceArena* workspace,
                                   cudaStream_t stream);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream);
 void launch_fp8_gdn_input_volta_qpn_shard(const Tensor& x, const Weight& weight, Tensor& qkv,

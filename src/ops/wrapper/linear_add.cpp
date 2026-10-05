@@ -76,7 +76,7 @@ void validate_policy(LinearPolicy policy) {
 }
 
 bool is_volta_quarter_residual(std::int32_t rows, std::int32_t columns) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     return rows == 5120 && (columns == 1536 || columns == 4352);
 #else
     return false;

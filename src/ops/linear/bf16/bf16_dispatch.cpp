@@ -9,7 +9,7 @@
 namespace ninfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (k == 5120 && (n == 62080 || n == 32768) && t >= 1 && t <= 8) {
         return launch_bf16_volta_qpn;
     }
@@ -26,7 +26,7 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     // tuned kernel set. See q5_dispatch.cpp for the rules every family follows here.
     const bool tp2_shard = (n == 7168 && k == 5120) || (n == 5120 && k == 3072);
     if ((!supported_problem && !tp2_shard) || t <= 0) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // DFlash2 carries BF16 projections at draft-only geometries (6144x5120,
         // 34816x5120, 5120x17408, ...).  Volta's CUTLASS SIMT route is the
         // qualified general BF16 fallback for these contiguous matrices.
@@ -35,7 +35,7 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
     if (tp2_shard) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         return launch_bf16_cutlass_sm70;
 #else
         return launch_bf16_mma;
@@ -45,7 +45,7 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     const std::int32_t small_t_end =
         n == 5120 ? kBf16SmallTMaxTokens : kBf16LinearSmallTDispatchEnd;
     if (t <= small_t_end) { return launch_bf16_small_t; }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     return launch_bf16_cutlass_sm70;
 #else
     return launch_bf16_mma;

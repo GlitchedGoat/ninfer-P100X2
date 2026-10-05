@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Split-projection FP8 SwiGLU on Volta tensor cores (sm_70 only). The FP8 sibling of
 // nvfp4_linear_swiglu_qpn_split.cuh -- same reasoning throughout (see that file for the full
 // argument: the fused kernel's doubled accumulator and decode registers cost more than sharing

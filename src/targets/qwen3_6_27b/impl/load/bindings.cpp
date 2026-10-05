@@ -1,8 +1,10 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/common/split_launch.h"
+#endif
+#ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #endif
@@ -943,6 +945,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (quasar) { throw std::invalid_argument("QUASAR currently requires SM70"); }
     if (tp == 4 || native_fp8) { throw std::invalid_argument("27B TP4 currently requires SM70"); }
 #endif
+#ifdef NINFER_PASCAL_BUILD
+    // GP100 has SIMT routes only for the preserved GGUF Q4_K/Q6_K projections; every other
+    // weight format still dispatches to Tensor-Core or Ampere-only kernels.
+    if (weights_profile != WeightsProfile::Qwen38GgmlK) {
+        throw std::invalid_argument("SM60 supports only qwen3.8-27b/gguf-q4-k-m");
+    }
+    if (features.vision || features.dflash()) {
+        throw std::invalid_argument("SM60 qwen3.8-27b/gguf-q4-k-m supports Text/None/MTP only");
+    }
+#endif
     if (tp == 4 && features.dflash()) {
         throw std::invalid_argument("qwen3_6_27b: TP4 does not support DFlash");
     }
@@ -1151,7 +1163,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 // the shard.
 void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                         RuntimeModelView& runtime) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     const ::ninfer::ops::detail::CurrentDeviceScope device_scope;
     ::ninfer::ops::detail::CurrentDeviceScope::set(backing.physical_device(device));
 #endif

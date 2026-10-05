@@ -65,7 +65,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 // one genuinely IS on the decode-critical path (vocabulary/gate-up/down/attention-in-out
 // projections — see the V100 performance summary), so it doesn't just get trapped and forgotten:
 // launch_w8_small_t (w8_small_t.cu) routes to the already-Volta-validated warp-per-row
-// SIMT kernel (w8_rowsplit_gemm_simt.cuh) instead below sm_80, via the NINFER_VOLTA_BUILD
+// SIMT kernel (w8_rowsplit_gemm_simt.cuh) instead below sm_80, via the NINFER_PRE_AMPERE_BUILD
 // host-side signal (CMakeLists.txt) — __CUDA_ARCH__ isn't visible in that host function,
 // so the kernel body itself still needs its own guard purely so it compiles.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800

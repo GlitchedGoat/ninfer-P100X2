@@ -199,7 +199,7 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     if (!w8_linear_add_admits(problem)) {
         throw std::invalid_argument("w8 linear_add: exact problem or column count is not admitted");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Every schedule in the tables above except SimtR8C4 and the DecodeR* family
     // reaches the trap-stubbed mma/split-K kernels below sm_80. SimtR8C4's
     // launcher takes the token count as a runtime argument rather than a
@@ -223,7 +223,7 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 }
 
 void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, const Weight& w,

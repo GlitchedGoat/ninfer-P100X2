@@ -70,7 +70,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
         launch_q4_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, out, stream);
         return;
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // GroupedMixedMmaR64C128 (the T>16 route) needs Ampere+ mma/ldmatrix and is trap-stubbed on
     // sm_70. launch_q4_simt_route<Q4GdnSimtR8C8Schedule> is a plain SIMT dot-product kernel that
     // already takes cols as a runtime grid parameter (div_up(cols, kColsPerTile)) with no
@@ -171,7 +171,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Same reasoning as launch_q4 above: launch_q5_simt_r8_c8 is a plain SIMT kernel with cols
     // as a runtime grid parameter, so it generalizes past T=16 unchanged once
     // GroupedMixedMmaR64C128 is unavailable. See the V100 performance summary.

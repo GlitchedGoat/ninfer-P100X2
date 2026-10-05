@@ -20,7 +20,7 @@ struct RouteSpec {
     W8GdnInputScheduleId schedule;
 };
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // SplitKMmaDirect and MmaR64C128 both reach w8_small_t_mma_kernel / the
 // rowsplit mma family, which trap below sm_80, and DecodeR8Direct's
 // w8_k2048_decode_kernel has no token dimension at all -- it is strictly T=1.
@@ -46,7 +46,7 @@ constexpr std::array<RouteSpec, 3> kRoutes{{
     {2, 96, W8GdnInputScheduleId::SplitKMmaDirect},
     {97, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
 }};
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 constexpr bool catalog_is_closed() {
     std::int64_t expected = 1;
@@ -116,7 +116,7 @@ W8GdnInputConvPlan w8_gdn_input_conv_resolve_plan(const W8GdnInputProblem& probl
     }
     if (batch_size > 1) { return {W8GdnInputConvScheduleId::Materialized}; }
     if (problem.cols == 1) { return {W8GdnInputConvScheduleId::DecodeFused}; }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // The fused small-T convolution epilogue is implemented on the Ampere+
     // w8_small_t_mma family.  Volta must materialize the projection through its
     // qualified SIMT/CUTLASS route before applying the convolution separately.
@@ -124,7 +124,7 @@ W8GdnInputConvPlan w8_gdn_input_conv_resolve_plan(const W8GdnInputProblem& probl
 #else
     if (problem.cols <= 16) { return {W8GdnInputConvScheduleId::SplitKMmaFused}; }
     return {W8GdnInputConvScheduleId::Materialized};
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 }
 
 void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -161,7 +161,7 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
     throw std::logic_error("W8 GDN input: unknown schedule");
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 namespace {
 
 // Row view over a W8G32_F16S RowSplit parent, matching the construction the a3b
@@ -197,7 +197,7 @@ void w8_gdn_input_simt_row_view_split_launch(const Tensor& x, const Weight& weig
     launch_w8_simt_r8_c8(x, qkv_weight, qkv, stream);
     launch_w8_simt_r8_c8(x, z_weight, z, stream);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 std::size_t w8_gdn_input_workspace_bytes(std::int32_t min_cols, std::int32_t max_cols) {
     if (min_cols <= 0 || max_cols < min_cols) {

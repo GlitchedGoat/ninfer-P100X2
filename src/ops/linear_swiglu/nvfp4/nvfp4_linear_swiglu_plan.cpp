@@ -6,7 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #endif
@@ -25,7 +25,7 @@ enum class Nvfp4LinearSwiGluRoute {
     FusedW4A4,
     LinearW4A4Post,
     TmaFusedW4A4,
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     VoltaQpnFused,
     VoltaQpnSplit,
     VoltaCutlass,
@@ -44,7 +44,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (nvfp4_linear_swiglu_qpn_split_supported(
                 Nvfp4MlpGateUpGeometry::kOutputRows,
                 Nvfp4MlpGateUpGeometry::kInputRows, tokens)) {
@@ -103,7 +103,7 @@ std::size_t baseline_workspace_bytes(std::int32_t tokens) {
     return layout.peak_bytes(1);
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 struct Nvfp4QpnSplitWorkspace {
     DeviceSpan gate;
     DeviceSpan activation;
@@ -134,7 +134,7 @@ std::size_t cutlass_route_workspace_bytes(std::int32_t tokens) {
     return projected + nvfp4_cutlass_sm70_workspace_bytes(
                            Geometry::kOutputRows, Geometry::kInputRows, tokens);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 template <class Geometry>
 std::size_t fused_workspace_bytes(std::int32_t tokens) {
@@ -153,7 +153,7 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
     (void)resolve_route(policy, max_tokens);
     std::size_t maximum = 0;
     if (policy == LinearPolicy::A16Only) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // The Volta decode fast path is selected before resolve_route() for T=1. Keep the
         // capacity query in lock-step with that dispatch override; otherwise the caller creates
         // a one-byte arena and the QPN split's gate/activation scratch fails with bad_alloc.
@@ -169,7 +169,7 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
         if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post) {
             return baseline_workspace_bytes<Geometry>(max_tokens);
         }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (route == Nvfp4LinearSwiGluRoute::VoltaQpnSplit) {
             return qpn_split_workspace_bytes<Geometry>(max_tokens);
         }
@@ -248,7 +248,7 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
 template <class Geometry>
 void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (workspace && policy == LinearPolicy::A16Only && x.ne[1] == 1 &&
         nvfp4_linear_swiglu_qpn_split_supported(weight.n, weight.k, x.ne[1])) {
         auto scope = workspace->scope();
@@ -266,7 +266,7 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         launch_small_t<Geometry>(x, weight, out, stream);
         return;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     case Nvfp4LinearSwiGluRoute::VoltaQpnFused:
         nvfp4_linear_swiglu_volta_qpn_launch(x, weight, out, stream);
         return;
@@ -341,7 +341,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy,
                                                                 std::int32_t min_tokens,
                                                                 std::int32_t max_tokens, int tp) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (tp == 4 && policy == LinearPolicy::A16Only && min_tokens > 0 && max_tokens >= min_tokens) {
         using Geometry = Nvfp4MlpGateUpTp4ColumnGeometry;
         if (nvfp4_linear_swiglu_qpn_split_supported(
@@ -364,7 +364,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
 void nvfp4_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
                                         LinearPolicy policy, WorkspaceArena* workspace,
                                         cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (weight.n == 8704 && weight.k == 5120) {
         if (policy != LinearPolicy::A16Only || workspace == nullptr) {
             throw std::invalid_argument("nvfp4 TP4 linear_swiglu requires A16 and workspace");

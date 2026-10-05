@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Volta (sm_70) tensor-core primitives for GQA attention: the mma.sync.m8n8k4 QK^T/PV
 // instructions and their warp-level fragment addressing, transcribed faithfully from
 // llama.cpp's ggml-cuda/mma.cuh (MIT licensed) rather than re-derived -- this bit-twiddling

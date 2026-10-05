@@ -63,7 +63,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Volta (sm_70) flash-attention prefill route. Defined in
 // gqa_attention_volta_flash.cu, the only translation unit that sees the vendored
 // llama.cpp kernel. See the V100 performance summary.
@@ -99,6 +99,6 @@ void gqa_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Te
                                       Tensor& k_gathered, Tensor& v_gathered, Tensor& mask,
                                       Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
                                       cudaStream_t stream);
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 } // namespace ninfer::ops::detail

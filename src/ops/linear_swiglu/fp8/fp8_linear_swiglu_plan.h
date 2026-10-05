@@ -24,7 +24,7 @@ void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Ten
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void fp8_linear_swiglu_volta_qpn_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
 [[nodiscard]] bool fp8_linear_swiglu_volta_qpn_supported(std::int32_t k, std::int32_t t) noexcept;

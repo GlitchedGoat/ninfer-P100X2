@@ -13,7 +13,7 @@ namespace {
 constexpr int kRowsPerBlockDefault = 8;
 constexpr int kStages              = 2;
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Same "request the max shared-memory carveout once" pattern as q5_rowsplit_gemv's occupancy
 // fix -- ncu showed shared memory co-limiting at the same block count as registers once the
 // launch_bounds fix above landed, so raising the carveout gives the higher minBlocks target
@@ -38,7 +38,7 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
     const dim3 grid(static_cast<unsigned>(div_up(n, kRowsPerCta)),
                     static_cast<unsigned>(div_up(t, kColsPerCta)), 1u);
     const W8ContiguousOutput output{outp, n};
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     w8_simt_request_max_shared_carveout(
         w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerWarp, kRowsPerBlockDefault,
                                      kStages, Full, W8Epilogue::Store, W8ContiguousOutput,
@@ -79,7 +79,7 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     // mtp_attn_qkv_gv 0.41 -> 1.56 ms -- 3.3-4.3x, and T=8 is slower than T=16 in every shape.
     // With MTP3 that lands exactly on C2, which is where measured concurrency regresses.
     // No Volta route wants the full body; keep it for sm_120a, where it is a win.
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     constexpr bool kAllowFullSpecialization = false;
 #else
     constexpr bool kAllowFullSpecialization = true;

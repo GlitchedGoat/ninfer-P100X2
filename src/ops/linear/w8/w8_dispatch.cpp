@@ -196,13 +196,13 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     throw std::invalid_argument("w8 linear: unsupported shape or T");
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // select_w8_a16_launch's huge shape/T threshold table (above) routes most non-trivial T to one
 // of ~25 Ampere+ mma/ldmatrix schedules (the mma_*/exact_mma_* family) or the split-K composite
 // path (w8_rowsplit_gemm_splitk.cu, itself built on the trap-stubbed
 // w8_rowsplit_medium_t_splitk_kernel) -- all trap-stubbed on sm_70. Intercepting here rather
 // than rewriting that table: launch_w8_small_t already redirects unconditionally to
-// launch_w8_simt_r8_c8 under NINFER_VOLTA_BUILD (see w8_small_t.cu), which is fully general
+// launch_w8_simt_r8_c8 under NINFER_PRE_AMPERE_BUILD (see w8_small_t.cu), which is fully general
 // over T via for_each_token_slice, so it's a safe universal replacement for any of those
 // schedules regardless of which (n,k,t) triggered them. The genuinely SIMT-native schedules
 // (simt_r8_c4/c8, decode_r4, small_t itself) are left as originally selected. See
@@ -275,7 +275,7 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8: {
         const W8Launch launch = select_w8_a16_launch(n, k, t);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // The r4_c16 interception that used to sit here is deliberately gone. It was introduced to
         // route around the T=8 collapse, which turned out to be the full-specialization register
         // spill since fixed in w8_rowsplit_gemm_simt.cu. With the spill gone, sliced r8_c8 (via

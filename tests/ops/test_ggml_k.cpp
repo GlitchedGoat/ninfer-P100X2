@@ -2,7 +2,7 @@
 #include "core/device.h"
 #include "ops/linear/ggml_k/ggml_k.h"
 #ifdef NINFER_VOLTA_BUILD
-#include "ops/linear/ggml_k/ggml_k_cutlass_sm70.h"
+#include "ops/linear/ggml_k/ggml_k_prefill.h"
 #endif
 
 #include <cuda_bf16.h>
@@ -118,7 +118,7 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
 #ifdef NINFER_VOLTA_BUILD
     if (tokens >= 512) {
         WorkspaceArena workspace(std::max<std::size_t>(
-            1, ops::detail::ggml_k_cutlass_sm70_workspace_bytes(n, k, tokens)));
+            1, ops::detail::ggml_k_prefill_workspace_bytes(n, k, tokens)));
         ops::detail::ggml_k_project_split(xt, weight, &yt, 1, add, nullptr, tiled_gdn,
                                           &workspace);
     } else
@@ -218,7 +218,7 @@ void run(int n, int k, int tokens, bool tiled_gdn = false, bool add = false) {
         DeviceBuffer second(std::size_t(n / 2) * tokens * sizeof(__nv_bfloat16));
         const Tensor sections[]{Tensor(first.p, DType::BF16, {n / 2, tokens}),
                                 Tensor(second.p, DType::BF16, {n / 2, tokens})};
-        WorkspaceArena workspace(ops::detail::ggml_k_cutlass_sm70_workspace_bytes(
+        WorkspaceArena workspace(ops::detail::ggml_k_prefill_workspace_bytes(
             n / 2, k, tokens));
         ops::detail::ggml_k_project_split(xt, weight, sections, 2, false, nullptr, false,
                                           &workspace);
@@ -282,7 +282,7 @@ void run_fp32_output() {
     weight.qhigh = table.p;
     Tensor xt(x.p, DType::BF16, {k, tokens});
     Tensor yt(y.p, DType::FP32, {n, tokens});
-    WorkspaceArena workspace(ops::detail::ggml_k_cutlass_sm70_workspace_bytes(n, k, tokens));
+    WorkspaceArena workspace(ops::detail::ggml_k_prefill_workspace_bytes(n, k, tokens));
     ops::detail::ggml_k_project_split(xt, weight, &yt, 1, false, nullptr, false, &workspace);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<float> result(std::size_t(n) * tokens);

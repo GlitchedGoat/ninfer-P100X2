@@ -62,7 +62,7 @@ void argmax_with_value_launch(const Tensor& logits, Tensor& values, Tensor& indi
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t t_count       = logits.ne[1];
     if (t_count == 0) { return; }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // TP2's two represented vocabulary shards. At 1..64 columns, parallel row tiles plus
     // exact winner extraction beat a single CTA scanning the whole shard. At the sparse
     // 128-column anchor the direct route wins; other geometries retain the direct reduction.

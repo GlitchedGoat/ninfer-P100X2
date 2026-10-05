@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef NINFER_PASCAL_BUILD
+#error "Volta Tensor-Core code must not be compiled into a Pascal build; route Pascal to a SIMT path"
+#endif
+
 // Fused-dequant NVFP4 (E2M1 + E4M3 K16 block scale) x BF16 GEMM on Volta tensor cores,
 // quadpair-split-N form (sm_70 only). Fourth sibling of q4/w8/fp8_volta_qpn_gemm.cuh: same
 // geometry, same fragment maps, same one-barrier cross-warp K reduce. What changes is the decoder

@@ -19,7 +19,7 @@ using Bf16Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t)
 void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void launch_bf16_volta_qpn(const Tensor& x, const Weight& weight, Tensor& out,
                           cudaStream_t stream);
 void launch_bf16_cutlass_sm70(const Tensor& x, const Weight& weight, Tensor& out,

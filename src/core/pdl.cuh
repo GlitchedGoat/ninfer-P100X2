@@ -20,7 +20,7 @@ struct LaunchConfig {
 template <class... KernelArgs, class... CallArgs>
 [[nodiscard]] inline cudaError_t
 launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
-#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_VOLTA_BUILD)
+#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_PRE_AMPERE_BUILD)
     kernel<<<launch.grid, launch.block, launch.dynamic_smem_bytes, launch.stream>>>(
         std::forward<CallArgs>(args)...);
     return cudaGetLastError();

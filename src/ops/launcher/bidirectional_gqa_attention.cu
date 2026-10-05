@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "ops/kernel/bidirectional_gqa_attention.cuh"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/kernel/bidirectional_gqa_attention_volta.cuh"
 #endif
 
@@ -107,7 +107,7 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             plan.split_capacity > kBidirectionalGqaMaxSplit) {
             throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
         }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         const auto launch_volta = [&]<int KeyBlock, bool Direct>() {
             const dim3 partial_grid(kBidirectionalGqaQHeads * Tokens, plan.split_capacity,
                                     q.ne[3]);

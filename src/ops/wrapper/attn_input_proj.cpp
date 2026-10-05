@@ -12,7 +12,7 @@
 #include "ops/linear/fp8/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/attn_input_proj/volta_tp4.h"
 #endif
 
@@ -425,7 +425,7 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens, int tp) {
     if (tp == 4) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (policy == LinearPolicy::A16Only && min_tokens > 0 && max_tokens >= min_tokens) {
             return detail::attn_input_volta_tp4_workspace_bytes(qtype, max_tokens);
         }
@@ -486,7 +486,7 @@ void attn_input_proj_column_parallel(std::span<const Tensor> x,
         const auto slot = static_cast<std::size_t>(rank);
         const Weight& w  = query_key_gate_value_weight[slot];
         Tensor q_dst = q[slot], gate_dst = gate[slot], k_dst = k[slot], v_dst = v[slot];
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (ec.tp == 4) {
             detail::attn_input_volta_tp4_launch(x[slot], w, q_dst, gate_dst, k_dst, v_dst,
                                                workspace[slot], ec.dev[slot]->stream);

@@ -13,7 +13,7 @@ namespace ninfer::ops::detail {
 void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Quadpair-split-N form (nvfp4_volta_qpn_gemm.cuh), the fourth sibling of the q4/w8/fp8 QPN
 // kernels. The tile height is mirrored here because dispatch is host code and cannot see the
 // device header; the launcher static_asserts the two agree.
@@ -32,6 +32,6 @@ void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Works
 [[nodiscard]] std::size_t nvfp4_volta_mma_workspace_bytes(std::int32_t n, std::int32_t k,
                                                           std::int32_t t) noexcept;
 [[nodiscard]] int nvfp4_volta_mma_splits(std::int32_t n, std::int32_t k, std::int32_t t) noexcept;
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 } // namespace ninfer::ops::detail

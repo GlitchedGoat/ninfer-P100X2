@@ -19,7 +19,7 @@ void require_shape(int n, int k) {
 } // namespace
 
 namespace {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 void fp32_projection(const Tensor& x, const Weight& w, Tensor& out,
                       WorkspaceArena& workspace, cudaStream_t stream) {
     if (x.ne[1] >= 128) {
@@ -64,7 +64,7 @@ template <bool SwiGLU>
 void composite_launch(const Tensor& x, const Weight& w, Tensor& out,
                        WorkspaceArena& workspace, cudaStream_t stream) {
     validate_fp8_block_weight(w);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     auto scope = workspace.scope();
     Tensor projection = workspace.alloc(DType::FP32, {w.n, x.ne[1]});
     fp32_projection(x, w, projection, workspace, stream);
@@ -119,7 +119,7 @@ std::size_t fp8_block_workspace_bytes(int n, int k, int min_tokens, int max_toke
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("FP8 block128: invalid token interval");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     return max_tokens >= 128 ? fp8_cutlass_sm70_workspace_bytes(n, k, max_tokens) : 0;
 #else
     throw std::invalid_argument("FP8 block128 currently requires SM70");
@@ -129,7 +129,7 @@ std::size_t fp8_block_workspace_bytes(int n, int k, int min_tokens, int max_toke
 void fp8_block_launch(const Tensor& x, const Weight& w, Tensor& out,
                       WorkspaceArena* workspace, cudaStream_t stream) {
     validate_fp8_block_weight(w);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (x.ne[1] >= 128 && workspace) {
         fp8_cutlass_sm70_launch(x, w, out, *workspace, stream);
         return;

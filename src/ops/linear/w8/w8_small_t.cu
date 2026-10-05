@@ -60,7 +60,7 @@ constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeo
 } // namespace
 
 void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // w8_small_t_mma_kernel's tensor-core path (ldmatrix + mma.m16n8k16) traps below sm_80
     // (see w8_small_t_mma.cuh) — it doesn't have a Volta body at all, unlike the other
     // trap-stubbed kernels in this port, since this one is genuinely decode-critical.

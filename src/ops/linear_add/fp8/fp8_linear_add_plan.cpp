@@ -5,7 +5,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/linear/fp8/fp8_cutlass_sm70.h"
 #endif
 
@@ -19,7 +19,7 @@ namespace {
 
 enum class Fp8LinearAddRoute : std::uint8_t {
     A16,
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     LinearThenAdd,
 #endif
     A8,
@@ -27,7 +27,7 @@ enum class Fp8LinearAddRoute : std::uint8_t {
 
 Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                 LinearPolicy policy, std::int32_t tokens) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (tokens > 0 && output_rows == 5120 && (input_rows == 1536 || input_rows == 4352)) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("fp8 TP4 linear_add admits only SM70 A16");
@@ -47,7 +47,7 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // T==1 keeps the fused decode kernel; T>=2 takes linear()+residual_add() instead of the
         // fused small_t kernel, exactly mirroring the NVFP4 linear_add fix -- linear() now reaches
         // QPN8 (fp8_dispatch.cpp's launch_a16) and this op's fused kernel never did. Safe the same
@@ -86,7 +86,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
     }
 }
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 template <class Allocator>
 Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::int32_t tokens) {
     return allocator.alloc(DType::BF16, {output_rows, tokens}, 256);
@@ -122,7 +122,7 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
     (void)layout.alloc_bytes(linear_bytes, 256);
     return layout.peak_bytes(1);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 
 } // namespace
 
@@ -138,7 +138,7 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
     if (route == Fp8LinearAddRoute::A8) {
         return fp8_a8_workspace_capacity_bytes(max_tokens, input_rows);
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (route == Fp8LinearAddRoute::LinearThenAdd) {
         return linear_then_add_workspace_bytes(output_rows, input_rows, max_tokens);
     }
@@ -153,7 +153,7 @@ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& resi
         launch_a16(x, weight, residual, stream);
         return;
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (route == Fp8LinearAddRoute::LinearThenAdd) {
         launch_linear_then_add(x, weight, residual, workspace, stream);
         return;

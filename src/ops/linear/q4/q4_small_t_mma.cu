@@ -53,7 +53,7 @@ bool matches(const Tensor& x, const Weight& weight) {
 
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // q4_small_t_mma_kernel traps below sm_80 (see q4_small_t_mma.cuh) — this is a plain,
     // unfused projection (draft-head logits), so unlike linear_swiglu's fused case, it maps
     // directly onto the already-validated generic q4 SIMT kernel with no composition needed.

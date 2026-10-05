@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 // than taking the caller's, so a target that asks for A16 cannot reach them. On Volta the A4
 // route is a __trap() -- cvt.e2m1x2 is Blackwell hardware and always will be -- so those internal
 // choices have to collapse to A16 here. See the V100 performance summary.
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 inline constexpr LinearPolicy kNvfp4InternalPolicy = LinearPolicy::A16Only;
 #else
 inline constexpr LinearPolicy kNvfp4InternalPolicy = LinearPolicy::AllowA4;
@@ -146,7 +146,7 @@ using Nvfp4MlpGateUpTp2ColumnGeometry     = Nvfp4GemvGeometry<17408, 5120>;
 using Nvfp4Residual6144Tp2RowGeometry     = Nvfp4GemvGeometry<5120, 3072>;
 using Nvfp4Residual17408Tp2RowGeometry    = Nvfp4GemvGeometry<5120, 8704>;
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 using Nvfp4MlpGateUpTp4ColumnGeometry = Nvfp4GemvGeometry<8704, 5120>;
 // The registered four-way 27B shapes use the runtime-dimensioned SM70 QPN/CUTLASS leaf,
 // not an unqualified A4 or portable SIMT instantiation. This is a finite shape profile;
@@ -254,7 +254,7 @@ using Nvfp4ParentGeometryType = typename Nvfp4ParentGeometry<Geometry>::Type;
     X(Residual17408Tp2Row, Nvfp4Residual17408Tp2RowGeometry)
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (is_nvfp4_volta_tp4_problem(output_rows, input_rows)) { return true; }
 #endif
 #define NINFER_NVFP4_MATCH(name, geometry)                                                         \
@@ -286,7 +286,7 @@ struct Nvfp4LinearDecodeProductionSchedule {
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Volta (sm_70) cold winners, measured on all five registered geometries with a private
 // schedule sweep -- the reference card's schedules collapse here: 17.8 GB/s at T=16 against
 // 93.7 for the entry below, and 7.1 against 48.7 at T=24. One schedule covers every geometry
@@ -313,7 +313,7 @@ struct Nvfp4LinearSmallTProductionSchedule {
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-#else // NINFER_VOLTA_BUILD
+#else // NINFER_PRE_AMPERE_BUILD
 
 // RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
 // through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
@@ -379,7 +379,7 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
 // A tp2 shard inherits its parent's measured schedule. Attention-input and MLP gate-up shards need
 // no entry because their parents use the generic template above, which the shard geometry also
 // selects. The three below have a per-geometry specialization to inherit; without these the shard

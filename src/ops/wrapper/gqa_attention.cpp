@@ -24,7 +24,7 @@ constexpr float kExpectedScale                       = 0.0625f;
 // (passes/TokenTile) drops from 0.333 to 0.200 -- 1.67x less attention work for the same prompt,
 // despite the slightly smaller chunk. Attention measured 71.6% of a 12K prefill, so this is the
 // dominant term at long context. See the V100 performance summary.
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 constexpr std::int32_t kSmallTChunkTokens            = 5;
 #else
 constexpr std::int32_t kSmallTChunkTokens            = 6;
@@ -403,7 +403,7 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
                                               GqaExecutionEnvelope envelope) {
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // Volta tiled flash attention, for single-batch prefill wide enough to pay for
     // its staging. ChunkedSmallT stays reachable for everything else -- decode, MTP
     // verify, short prompts -- so a regression here can be bisected by routing alone.
@@ -418,11 +418,17 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
     //  - the envelope must cover the width, or `base` below would go negative.
     //  - the gather stages BF16 cache rows into FP16, or dequantizes INT8-G64
     //    cache rows into the same FP16 boundary once per layer.
+#ifdef NINFER_VOLTA_BUILD
     if (volta_flash_route_possible(q_heads, width, batch_size, cache_dtype) &&
         envelope.min_visible_keys == envelope.max_visible_keys &&
         envelope.max_visible_keys >= static_cast<std::uint32_t>(width)) {
         return GqaAttentionRoute::VoltaFlash;
     }
+#else
+    // Pascal has no VoltaFlash (SM70 Tensor Cores). ChunkedSmallT is correct for every width
+    // but re-reads the visible history once per chunk; a SIMT tiled prefill kernel is pending.
+    (void)cache_dtype;
+#endif
     // GqaAttentionRoute::Prompt (gqa_attention_prompt_{launch,attention_launch} ->
     // ops/kernel/gqa_attention_prefill_{bf16,i8}.cuh) is a tensor-core flash-attention kernel
     // (ldmatrix/mma.m16n8k16, sm_80+) with no SIMT sibling. ChunkedSmallT instead drives the

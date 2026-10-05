@@ -23,7 +23,7 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                 WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     nvfp4_gdn_input_sm70_launch(x, weight, qkv, z, workspace, stream);
 #else
     (void)workspace;
@@ -55,7 +55,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 // (Nvfp4GdnInputTp2ColumnGeometry's own qkv=5120=1024+1024+3072, z=3072).
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                       WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     nvfp4_gdn_input_sm70_launch(x, weight, qkv, z, workspace, stream);
 #else
     (void)workspace;
@@ -96,7 +96,7 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(std::int32_t output_rows,
     if (resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4) {
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows);
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     return nvfp4_gdn_input_sm70_workspace_bytes(output_rows, max_tokens);
 #else
     return 0;

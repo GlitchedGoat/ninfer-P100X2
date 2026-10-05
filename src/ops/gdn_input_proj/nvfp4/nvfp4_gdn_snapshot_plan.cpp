@@ -37,7 +37,7 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // QPN owns the SM70 A16 projection, including load-time-prepacked weights. Preserve the
     // convolution's explicit BF16 projected-input/state boundary through the existing post Op.
     if (policy == LinearPolicy::A16Only) { return {Nvfp4GdnConvScheduleId::Materialized}; }

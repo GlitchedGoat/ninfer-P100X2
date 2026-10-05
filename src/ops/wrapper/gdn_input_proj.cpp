@@ -916,11 +916,11 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     } else {
         (void)resolve_w8_conv_plan(min_width, 1);
         (void)resolve_w8_conv_plan(max_width, 1);
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (max_width >= 2) { largest_materialized_width = max_width; }
 #else
         if (max_width >= 17) { largest_materialized_width = max_width; }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_PRE_AMPERE_BUILD
     }
     if (largest_materialized_width == 0) { return 0; }
     // Same nesting concern as the batch_size>1 branch above: `scratch.projected` stays live
@@ -1030,7 +1030,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         const std::int32_t first_materialized = min_width;
 #else
         const std::int32_t first_materialized = std::max(min_width, 4);

@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 
 using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // Fused-dequant tensor-core route (w8_volta_mma_gemm.cuh). Unlike its Q4/Q5 siblings this one
 // fits the W8Launch signature, because the shapes it is selected for supply far more CTAs than
 // the machine holds resident and so need no split-K, and therefore no workspace.

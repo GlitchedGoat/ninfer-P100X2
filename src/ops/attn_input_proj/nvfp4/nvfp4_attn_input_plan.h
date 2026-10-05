@@ -45,7 +45,7 @@ struct Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry> {
                                                                     std::int32_t min_tokens,
                                                                     std::int32_t max_tokens);
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 [[nodiscard]] std::size_t nvfp4_attn_input_sm70_workspace_bytes(int rows, int tokens);
 void nvfp4_attn_input_sm70_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                  Tensor& gate, Tensor& k, Tensor& v,

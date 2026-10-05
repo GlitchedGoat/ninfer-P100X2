@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "ops/kernel/bidirectional_gqa_attention.cuh"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/kernel/bidirectional_gqa_attention_volta.cuh"
 #include "ops/kernel/swa_volta.cuh"
 #endif
@@ -96,7 +96,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             throw std::invalid_argument("swa: inconsistent plan");
         }
         constexpr int KeyBlock = 32;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         const dim3 partial_grid(kBidirectionalGqaQHeads * Tokens, plan.split_capacity, q.ne[3]);
         if (direct) {
             noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, true, float>

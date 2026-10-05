@@ -1,7 +1,7 @@
 #include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/linear/ggml_k/ggml_k_codec.cuh"
-#ifdef NINFER_VOLTA_BUILD
-#include "ops/linear/ggml_k/ggml_k_cutlass_sm70.h"
+#ifdef NINFER_PRE_AMPERE_BUILD
+#include "ops/linear/ggml_k/ggml_k_prefill.h"
 #endif
 
 #include <cuda_bf16.h>
@@ -197,6 +197,157 @@ __global__ void gemv(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+template <typename Elem> __device__ __forceinline__ Elem to_operand(float value);
+template <> __device__ __forceinline__ __half to_operand<__half>(float value) {
+    return __float2half_rn(value);
+}
+template <> __device__ __forceinline__ float to_operand<float>(float value) { return value; }
+
+// Decodes one row's 128-value half of a native K256 block into a shared-memory GEMM tile.
+// Eight threads own a row; `inner` selects this thread's four packed bytes. Every value is
+// formed in FP32 from the stored code and scales and rounded once to the operand type.
+template <typename Elem>
+__device__ __forceinline__ void decode_half_block(Elem* __restrict__ a_row,
+                                                  const unsigned char* __restrict__ block,
+                                                  bool q6, int half, int inner) {
+    if (!q6) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(block));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+        const unsigned scale_low = load_u32_maybe_unaligned(block + 4);
+        const unsigned min_low = load_u32_maybe_unaligned(block + 8);
+        const unsigned high = load_u32_maybe_unaligned(block + 12);
+#pragma unroll
+        for (int local_segment = 0; local_segment < 2; ++local_segment) {
+            const int segment = half * 2 + local_segment;
+            constexpr unsigned mask = 63;
+            const int shift = (segment & 1) * 16;
+            const unsigned s = scale_low >> shift;
+            const unsigned m = min_low >> shift;
+            const unsigned h = high >> shift;
+            const int scale0 = segment < 2 ? s & mask : (h & 15) | ((s >> 6 & 3) << 4);
+            const int scale1 = segment < 2 ? (s >> 8) & mask
+                                           : (h >> 8 & 15) | ((s >> 14 & 3) << 4);
+            const int min0 = segment < 2 ? m & mask : (h >> 4 & 15) | ((m >> 6 & 3) << 4);
+            const int min1 = segment < 2 ? (m >> 8) & mask
+                                         : (h >> 12 & 15) | ((m >> 14 & 3) << 4);
+            const float scale_f0 = d * static_cast<float>(scale0);
+            const float scale_f1 = d * static_cast<float>(scale1);
+            const float min_f0 = dmin * static_cast<float>(min0);
+            const float min_f1 = dmin * static_cast<float>(min1);
+            const unsigned packed = load_u32_maybe_unaligned(
+                block + 16 + segment * 32 + inner * 4);
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) {
+                const unsigned code = (packed >> (byte * 8)) & 255;
+                a_row[local_segment * 64 + inner * 4 + byte] =
+                    to_operand<Elem>(scale_f0 * static_cast<float>(code & 15) - min_f0);
+                a_row[local_segment * 64 + 32 + inner * 4 + byte] =
+                    to_operand<Elem>(scale_f1 * static_cast<float>(code >> 4) - min_f1);
+            }
+        }
+    } else {
+        const float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+        const unsigned lo0 = load_u32_maybe_unaligned(
+            block + half * 64 + inner * 4);
+        const unsigned lo1 = load_u32_maybe_unaligned(
+            block + half * 64 + 32 + inner * 4);
+        const unsigned hi = load_u32_maybe_unaligned(
+            block + 128 + half * 32 + inner * 4);
+#pragma unroll
+        for (int section = 0; section < 4; ++section) {
+            const int scale = static_cast<std::int8_t>(
+                __ldg(block + 192 + half * 8 + section * 2 + (inner >> 2)));
+            const float scale_f = d * static_cast<float>(scale);
+            const unsigned lo = (section & 1) == 0 ? lo0 : lo1;
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) {
+                const int code = static_cast<int>(
+                    ((lo >> (byte * 8 + (section >> 1) * 4)) & 15) |
+                    (((hi >> (byte * 8 + section * 2)) & 3) << 4)) - 32;
+                a_row[section * 32 + inner * 4 + byte] =
+                    to_operand<Elem>(scale_f * static_cast<float>(code));
+            }
+        }
+    }
+}
+
+#ifdef NINFER_PASCAL_BUILD
+// GP100 has no Tensor Cores: the 5..127-token tile multiplies FP32 operands on the SIMT pipeline.
+// A CTA of 256 threads owns 32 rows x TokenTile tokens and walks K in 128-wide halves of the
+// native K256 blocks. Rows are decoded once per CTA into shared memory (same decoder as the Volta
+// tile); activations are widened exactly from BF16 and stored k-major so one 16-byte broadcast
+// load feeds a thread's TokenTile/8 token accumulators. Lane i owns row i, so the A reads are
+// bank-conflict free with the odd row stride. Peak static shared memory is 33 KiB (< 48 KiB).
+template <int TokenTile, bool TiledGdn>
+__global__ void __launch_bounds__(256) gemm(const __nv_bfloat16* __restrict__ x,
+                                            const unsigned char* __restrict__ rows,
+                                            const std::uint64_t* __restrict__ descriptors,
+                                            Outputs out, int n, int k, int tokens) {
+    static_assert(TokenTile == 16 || TokenTile == 32);
+    constexpr int kTile = 128;
+    constexpr int kStride = kTile + 1;
+    constexpr int kTokensPerThread = TokenTile / 8;
+    constexpr int kBStride = TokenTile + 4;
+    __shared__ float a[32 * kStride];
+    __shared__ __align__(16) float b[kTile * kBStride];
+    const int row_begin = blockIdx.x * 32;
+    const int token_begin = blockIdx.y * TokenTile;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int row_local = threadIdx.x / 8;
+    const int row = row_begin + row_local;
+    const int inner = threadIdx.x & 7;
+    const std::uint64_t descriptor = row < n ? descriptors[row] : 0;
+    const bool q6 = (descriptor & 1u) != 0;
+    const int block_bytes = q6 ? 210 : 144;
+    float acc[kTokensPerThread] = {};
+    for (int base = 0; base < k; base += kTile) {
+        const unsigned char* block = rows + (descriptor >> 1) + (base >> 8) * block_bytes;
+        const int half = (base & 255) >> 7;
+        if (row < n) {
+            decode_half_block(a + row_local * kStride, block, q6, half, inner);
+        } else {
+#pragma unroll
+            for (int column = inner; column < kTile; column += 8) {
+                a[row_local * kStride + column] = 0.0f;
+            }
+        }
+        for (int index = threadIdx.x; index < TokenTile * kTile; index += blockDim.x) {
+            const int t = token_begin + index / kTile;
+            const int column = index % kTile;
+            b[column * kBStride + index / kTile] =
+                t < tokens ? __bfloat162float(x[static_cast<std::int64_t>(t) * k +
+                                               input_column<TiledGdn>(base + column, k)])
+                           : 0.0f;
+        }
+        __syncthreads();
+        const float* a_row = a + lane * kStride;
+        const float* b_tokens = b + warp * kTokensPerThread;
+#pragma unroll 8
+        for (int kk = 0; kk < kTile; ++kk) {
+            const float w = a_row[kk];
+            if constexpr (kTokensPerThread == 4) {
+                const float4 v = *reinterpret_cast<const float4*>(b_tokens + kk * kBStride);
+                acc[0] = fmaf(w, v.x, acc[0]);
+                acc[1] = fmaf(w, v.y, acc[1]);
+                acc[2] = fmaf(w, v.z, acc[2]);
+                acc[3] = fmaf(w, v.w, acc[3]);
+            } else {
+                const float2 v = *reinterpret_cast<const float2*>(b_tokens + kk * kBStride);
+                acc[0] = fmaf(w, v.x, acc[0]);
+                acc[1] = fmaf(w, v.y, acc[1]);
+            }
+        }
+        __syncthreads();
+    }
+    const int out_row = row_begin + lane;
+#pragma unroll
+    for (int j = 0; j < kTokensPerThread; ++j) {
+        const int t = token_begin + warp * kTokensPerThread + j;
+        if (out_row < n && t < tokens) { out.store(out_row, t, acc[j]); }
+    }
+}
+#else
 // Volta's WMMA layout is provided by CUDA. Only the private multiplication operands
 // are FP16; public activations/results remain BF16 and accumulators remain FP32.
 template <int TokenTile, bool TiledGdn>
@@ -233,65 +384,7 @@ __global__ void gemm(const __nv_bfloat16* __restrict__ x,
         const unsigned char* block = rows + (descriptor >> 1) + (base >> 8) * block_bytes;
         const int half = (base & 255) >> 7;
         if (row < n) {
-            if (!q6) {
-                const float d = __half2float(*reinterpret_cast<const __half*>(block));
-                const float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
-                const unsigned scale_low = load_u32_maybe_unaligned(block + 4);
-                const unsigned min_low = load_u32_maybe_unaligned(block + 8);
-                const unsigned high = load_u32_maybe_unaligned(block + 12);
-#pragma unroll
-                for (int local_segment = 0; local_segment < 2; ++local_segment) {
-                    const int segment = half * 2 + local_segment;
-                    constexpr unsigned mask = 63;
-                    const int shift = (segment & 1) * 16;
-                    const unsigned s = scale_low >> shift;
-                    const unsigned m = min_low >> shift;
-                    const unsigned h = high >> shift;
-                    const int scale0 = segment < 2 ? s & mask : (h & 15) | ((s >> 6 & 3) << 4);
-                    const int scale1 = segment < 2 ? (s >> 8) & mask
-                                                   : (h >> 8 & 15) | ((s >> 14 & 3) << 4);
-                    const int min0 = segment < 2 ? m & mask : (h >> 4 & 15) | ((m >> 6 & 3) << 4);
-                    const int min1 = segment < 2 ? (m >> 8) & mask
-                                                 : (h >> 12 & 15) | ((m >> 14 & 3) << 4);
-                    const float scale_f0 = d * static_cast<float>(scale0);
-                    const float scale_f1 = d * static_cast<float>(scale1);
-                    const float min_f0 = dmin * static_cast<float>(min0);
-                    const float min_f1 = dmin * static_cast<float>(min1);
-                    const unsigned packed = load_u32_maybe_unaligned(
-                        block + 16 + segment * 32 + inner * 4);
-#pragma unroll
-                    for (int byte = 0; byte < 4; ++byte) {
-                        const unsigned code = (packed >> (byte * 8)) & 255;
-                        a[row_local * kStride + local_segment * 64 + inner * 4 + byte] =
-                            __float2half_rn(scale_f0 * static_cast<float>(code & 15) - min_f0);
-                        a[row_local * kStride + local_segment * 64 + 32 + inner * 4 + byte] =
-                            __float2half_rn(scale_f1 * static_cast<float>(code >> 4) - min_f1);
-                    }
-                }
-            } else {
-                const float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
-                const unsigned lo0 = load_u32_maybe_unaligned(
-                    block + half * 64 + inner * 4);
-                const unsigned lo1 = load_u32_maybe_unaligned(
-                    block + half * 64 + 32 + inner * 4);
-                const unsigned hi = load_u32_maybe_unaligned(
-                    block + 128 + half * 32 + inner * 4);
-#pragma unroll
-                for (int section = 0; section < 4; ++section) {
-                    const int scale = static_cast<std::int8_t>(
-                        __ldg(block + 192 + half * 8 + section * 2 + (inner >> 2)));
-                    const float scale_f = d * static_cast<float>(scale);
-                    const unsigned lo = (section & 1) == 0 ? lo0 : lo1;
-#pragma unroll
-                    for (int byte = 0; byte < 4; ++byte) {
-                        const int code = static_cast<int>(
-                            ((lo >> (byte * 8 + (section >> 1) * 4)) & 15) |
-                            (((hi >> (byte * 8 + section * 2)) & 3) << 4)) - 32;
-                        a[row_local * kStride + section * 32 + inner * 4 + byte] =
-                            __float2half_rn(scale_f * static_cast<float>(code));
-                    }
-                }
-            }
+            decode_half_block(a + row_local * kStride, block, q6, half, inner);
         } else {
 #pragma unroll
             for (int column = inner; column < kTile; column += 8) {
@@ -329,6 +422,8 @@ __global__ void gemm(const __nv_bfloat16* __restrict__ x,
         if (row < n && t < tokens) { out.store(row, t, c[index]); }
     }
 }
+
+#endif // NINFER_PASCAL_BUILD
 
 __global__ void embedding(const std::int32_t* ids, const unsigned char* rows,
                           const std::uint64_t* descriptors, __nv_bfloat16* out, int k) {
@@ -381,13 +476,13 @@ void project(const Tensor& x, const Weight& weight, const Tensor* outputs,
     if (total_rows != weight.n) {
         throw std::invalid_argument("GGML K projection: output sections do not cover rows");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // The public GGML_K wrappers historically used the SIMT decoder directly, bypassing the
-    // SM70 CUTLASS route selected by `linear()`.  For prefill-sized BF16 projections, route each
-    // contiguous output section through the validated dequant+Tensor-Core implementation.  The
+    // pre-Ampere prefill route selected by `linear()`.  For prefill-sized projections, route each
+    // contiguous output section through the dequant + dense GEMM implementation.  The
     // descriptor plane remains shared and row offsets are applied only to descriptor lookup, so
     // Q4_K/Q6_K payload bytes and mixed-row semantics are unchanged. Residual addition uses the
-    // FP32 CUTLASS epilogue's beta=1 path; GDN input permutes exactly during the BF16->FP16 cast.
+    // FP32 CUTLASS epilogue's beta=1 path; GDN input permutes exactly while staging activations.
     if (workspace != nullptr && x.ne[1] >= 128) {
         bool eligible = true;
         std::size_t need = 0;
@@ -397,14 +492,14 @@ void project(const Tensor& x, const Weight& weight, const Tensor* outputs,
                 eligible = false;
                 break;
             }
-            need = std::max(need, ggml_k_cutlass_sm70_workspace_bytes(
+            need = std::max(need, ggml_k_prefill_workspace_bytes(
                                      outputs[i].ne[0], weight.k, x.ne[1]));
         }
         if (eligible && workspace->capacity() >= workspace->used() &&
             workspace->capacity() - workspace->used() >= need) {
             int row_offset = 0;
             for (int i = 0; i < count; ++i) {
-                ggml_k_cutlass_sm70_launch(x, weight, outputs[i], *workspace, stream, row_offset,
+                ggml_k_prefill_launch(x, weight, outputs[i], *workspace, stream, row_offset,
                                            add, TiledGdn);
                 row_offset += outputs[i].ne[0];
             }
@@ -433,8 +528,14 @@ void project(const Tensor& x, const Weight& weight, const Tensor* outputs,
             gemm<32, TiledGdn><<<dim3((n + 31) / 32, (tokens + 31) / 32), 256, 0, stream>>>(
                 input, rows, descriptors, output, n, k, tokens);
         } else {
+#ifdef NINFER_PASCAL_BUILD
+            // The 48 KiB per-block shared-memory limit caps the Pascal SIMT tile at 32 tokens.
+            gemm<32, TiledGdn><<<dim3((n + 31) / 32, (tokens + 31) / 32), 256, 0, stream>>>(
+                input, rows, descriptors, output, n, k, tokens);
+#else
             gemm<64, TiledGdn><<<dim3((n + 31) / 32, (tokens + 63) / 64), 256, 0, stream>>>(
                 input, rows, descriptors, output, n, k, tokens);
+#endif
         }
     }
 }

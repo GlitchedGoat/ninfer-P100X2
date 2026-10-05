@@ -148,7 +148,7 @@ template <class Schedule, int ColsPerWarp, int WarpsPerCta, int PipelineStages, 
           W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput,
           int ColWarpsPerRow = 1>
 __global__
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // ncu measured this kernel (the w8 vocab/lm-head projection, N=248320) at 81 registers/thread,
 // Block Limit Registers=2, Theoretical Occupancy only 25% -- no __launch_bounds__ existed here
 // at all before this. Swept minBlocks 3/4/5/6/8 (each measured via ncu occupancy + nsys/decode

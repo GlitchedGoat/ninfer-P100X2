@@ -1,7 +1,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q5/q5_launch.h"
@@ -34,7 +34,7 @@ struct RouteSpec {
     Q4Q5AttnInputScheduleId schedule;
 };
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // GroupedHomogeneousPairMma* need Ampere+ mma/ldmatrix and are trap-stubbed on sm_70.
 // ParentSplitFixed's underlying kernels take cols as a runtime grid parameter (see
 // q4_q5_attn_input_small_t.cu), so it generalizes past T=16 unchanged and stays the route for
@@ -170,7 +170,7 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
         case Q4Q5AttnInputScheduleId::ParentSplitFixed:
         case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
         case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             // Inside its band the fused route replaces whatever the table selected, so it becomes
             // the schedule and owns the workspace figure outright.
             if (attn_uses_volta_mma(problem)) {
@@ -180,14 +180,14 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
 #endif
             return plan;
         case Q4Q5AttnInputScheduleId::VoltaMmaFused:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             plan.workspace_bytes = attn_volta_mma_workspace_bytes(problem);
             return plan;
 #else
             throw std::logic_error("Q4/Q5 attention input: VoltaMmaFused is Volta-only");
 #endif
         case Q4Q5AttnInputScheduleId::CutlassSm70TensorCore:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
             if (attn_uses_volta_mma(problem)) {
                 return {Q4Q5AttnInputScheduleId::VoltaMmaFused,
                         attn_volta_mma_workspace_bytes(problem)};
@@ -220,7 +220,7 @@ std::size_t q4_q5_attn_input_capacity_workspace_bytes(std::int32_t min_cols,
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         maximum = std::max(maximum, at(std::min(route.cols.last, max_cols)));
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // The fused route displaces the table inside [kVoltaMmaMinCols, kVoltaMmaMaxCols], which cuts
     // across kRoutes' second span. Probing only the table's own endpoints therefore misses the
     // fused band's right edge whenever the interval runs past it into CutlassSm70TensorCore.
@@ -244,7 +244,7 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
 
     switch (plan.schedule) {
     case Q4Q5AttnInputScheduleId::VoltaMmaFused:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         // Each stored parent is one [query_rows + kv_rows, k] weight: rows [0,query_rows) feed
         // q (resp. gate), the rest feed k (resp. v).
         launch_q4_volta_mma(x, query_key_weight, q, workspace, stream, /*weight_row_offset=*/0);
@@ -271,7 +271,7 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
                                                        gate, k, v, stream);
         return;
     case Q4Q5AttnInputScheduleId::CutlassSm70TensorCore:
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         q4_q5_attn_input_cutlass_sm70_launch(x, query_key_weight, gate_value_weight, q, gate, k,
                                              v, workspace, stream);
         return;
@@ -307,7 +307,7 @@ void q4_q5_attn_input_dispatch_shard(const Tensor& x, const Weight& query_key_we
         throw std::invalid_argument(
             "Q4/Q5 attention input column-parallel: exact shard problem is not admitted");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     launch_q4_volta_mma(x, query_key_weight, q, workspace, stream, 0);
     launch_q4_volta_mma(x, query_key_weight, k, workspace, stream, problem.query_rows);
     launch_q5_volta_mma(x, gate_value_weight, gate, false, 0, workspace, stream);
@@ -324,7 +324,7 @@ std::size_t q4_q5_attn_input_shard_capacity_workspace_bytes(std::int32_t min_col
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("Q4/Q5 attention shard: invalid column interval");
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     // The split count can drop as T grows; inspect each supported extent to keep the bound exact.
     std::size_t bytes = 0;
     for (std::int64_t cols = min_cols; cols <= max_cols; ++cols) {

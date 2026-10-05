@@ -17,7 +17,7 @@ struct RouteSpec {
     W8LinearSwiGluScheduleId schedule;
 };
 
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 // The DFlash MLP is W8-only and its tuned routes all use Ampere+ MMA past
 // decode. The paired SIMT kernel streams gate/up rows together and tiles any T.
 constexpr std::array<RouteSpec, 3> kRoutes{{

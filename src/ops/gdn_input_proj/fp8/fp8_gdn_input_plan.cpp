@@ -3,7 +3,7 @@
 #include "ops/linear/fp8/fp8_launch.h"
 
 #include "ops/linear/fp8/fp8_config.h"
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.h"
 #endif
 
@@ -41,7 +41,7 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
     if (resolve_route(policy, max_tokens) == Fp8GdnInputRoute::A8) {
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8GdnInputGeometry::kInputRows);
     }
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (max_tokens >= kVoltaCutlassMinT) {
         return fp8_gdn_input_cutlass_workspace_bytes(max_tokens);
     }
@@ -53,7 +53,7 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
                                 WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT) {
         if (workspace == nullptr) {
             throw std::invalid_argument("fp8 Volta GDN prefill requires caller workspace");
@@ -80,7 +80,7 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_fp8_gdn_input_volta_qpn(input_chunk, weight, qkv_chunk, z_chunk, stream);
             continue;
@@ -101,7 +101,7 @@ void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Ten
                                       cudaStream_t stream) {
     constexpr std::int32_t kQkvRows = 5120;
     constexpr std::int32_t kZRows   = 3072;
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
         fp8_gdn_input_cutlass_sm70_launch_shard(x, weight, qkv, z, *workspace, stream);
         return;
@@ -124,7 +124,7 @@ void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Ten
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
-#ifdef NINFER_VOLTA_BUILD
+#ifdef NINFER_PRE_AMPERE_BUILD
         if (active > 1 && fp8_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_fp8_gdn_input_volta_qpn_shard(input_chunk, weight, qkv_chunk, z_chunk, stream);
             continue;
