@@ -87,8 +87,23 @@ python3 tools/v100/bench_tp.py --weights $W --bench build-p100/bench/ninfer_benc
   (C-6); otherwise find the largest capacity that loads.
 - Record prefill tok/s and committed decode tok/s at 3k/8k/32k/85k occupied tokens, MTP
   acceptance, and the same for the owner's llama.cpp P100 baseline (C-4).
-- Expect long-prompt prefill to be slow until the Pascal flash prefill attention lands (T-005).
+- Attention prefill uses the Pascal flash route (T-011); confirm the load log or profile shows
+  `pascal_flash` for long prompts.
 - `nsys profile` one 8k-prompt request to attribute time (attention vs GGML_K vs all-reduce).
+
+### 6a. A/B: exact fast conversions (`NINFER_PASCAL_FAST_CONVERT`, D-11, W-17)
+
+The default build (`build-p100`) has the flag ON. Build a second tree with it OFF, apps only:
+
+```bash
+cmake -S . -B build-p100-cvt-off -G Ninja -DCMAKE_CUDA_ARCHITECTURES=60 \
+      -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ -DNINFER_BUILD_BENCHMARKS=ON -DNINFER_PASCAL_FAST_CONVERT=OFF
+cmake --build build-p100-cvt-off -j"$(( $(nproc) * 8 / 10 ))" --target ninfer ninfer_bench
+```
+- Same prompts, TP2, NVFP4 and Q4_K_M: committed decode tok/s at 3k and 32k, prefill tok/s at
+  8k. Greedy output must be **token-identical** between ON and OFF (the conversions are bit-exact).
+- Record both in T-010 (implemented table, W-17). If ON gives no measurable gain, note it there:
+  D-11 then says delete the flag. Delete `build-p100-cvt-off` afterwards (disk).
 
 ## Results
 
