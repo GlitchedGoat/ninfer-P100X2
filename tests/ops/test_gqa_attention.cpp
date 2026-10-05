@@ -491,6 +491,25 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+int run_wide_prefill_cases() {
+    // Single-batch INT8 prefill wide enough for the flash routes (Volta staging, Pascal paged
+    // in-place): exact envelopes, a fresh cache, a long prefix, a partial final query block, and
+    // the TP2 head-local geometry. Every output is compared with the fixture's FP64 oracle.
+    constexpr Geometry geometries[] = {{"qwen3_6_27b", 24, 4}, {"qwen3_6_27b_tp2", 12, 2}};
+    constexpr AttentionCase cases[] = {
+        {128, 0, 128, 701u},
+        {257, 300, 557, 702u},
+        {1024, 3000, 4024, 703u},
+    };
+    int failures = 0;
+    for (const Geometry& geometry : geometries) {
+        for (const AttentionCase& test_case : cases) {
+            failures += run_a1_case(geometry, DType::I8, test_case, MappingPattern::Fragmented);
+        }
+    }
+    return failures;
+}
+
 int run_int8_split_policy_cases() {
     // Volta's TP2 INT8 producer must use the same active split policy as its reducer.
     // The short windows demand more splits than BF16; the loose 6K envelope permits
@@ -554,6 +573,7 @@ int main() {
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_int8_split_policy_cases();
+    failures += run_wide_prefill_cases();
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";
