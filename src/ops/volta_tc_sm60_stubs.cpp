@@ -73,6 +73,9 @@ void q4_q5_attn_input_cutlass_sm70_launch(const Tensor& x, const Weight& query_k
 
 std::size_t q4_q5_attn_input_cutlass_workspace_bytes(std::int32_t cols) { unavailable("q4_q5_attn_input_cutlass_workspace_bytes"); }
 
+bool q4_volta_qpn_supported(std::int32_t n, std::int32_t k,
+                            std::int32_t t) noexcept { return false; }
+
 bool q4_volta_mma_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept { return false; }
 
