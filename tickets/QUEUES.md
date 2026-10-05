@@ -12,7 +12,7 @@
 | C-5 | Keep `sm_70`/`sm_86`/`sm_89` builds in this fork, or make it P100-only? | Keep them; Pascal is an added single-arch build, V100 routes untouched. | open |
 | C-6 | Is 180000-token capacity still the goal on 2×16 GB with FP32 routes (more workspace)? | Keep 180k as target; fall back to 131072 if FP32 prefill workspace does not fit — decided by measurement. | open |
 | C-7 | Flash attention: owner asked for it (VRAM). | Implemented a native direct-paged FP32 kernel (zero workspace) instead of vendoring llama.cpp's tile kernel, which would need the 368 MB FP16 staging (T-011). | resolved |
-| C-8 | Which NVFP4 artifact file? The registered identity is the official v3 container `neroued/Qwen3.8-27B-nvfp4-NInfer` (23.72 GB; mixed NVFP4 MLP + row-FP8 attention/GDN/head + W8 MTP). Is that the file you'll use, and its path on the P100 host? | Use the same file the V100X2 setup used; record the path in AGENTS.md's resource table. | open |
+| C-8 | Which NVFP4 artifact? | **Answered 2026-10-05:** the official upstream v3 container `neroued/Qwen3.8-27B-nvfp4-NInfer` → `qwen3_8_27b_nvfp4.ninfer` (23.72 GB, identity `qwen3.8-27b/nvfp4`). Its DFlash2 package and Vision objects are not loaded on Pascal. Still needed: its path on the P100 host. | resolved (path pending) |
 
 ## Work queue (executable now, in order)
 

@@ -8,6 +8,13 @@
 Owner direction (2026-10-05): NVFP4 `.ninfer` is the main incoming quant, as on V100X2.
 Admit `qwen3.8-27b/nvfp4` on SM60 for TP1/TP2 Text/None/MTP with FP32 SIMT arithmetic.
 
+## Target artifact
+
+The official upstream v3 container `neroued/Qwen3.8-27B-nvfp4-NInfer`, file
+`qwen3_8_27b_nvfp4.ninfer` (23.72 GB, `NINFER\x00\x03`), read as `qwen3.8-27b/nvfp4` without
+repacking (artifact doc §1.1). Not QUASAR. Its optional DFlash2 package (~2.2 GB) and Vision objects
+are not materialized on Pascal (Text/None/MTP only).
+
 ## What the identity actually contains (artifact doc §3.1, §9.2)
 
 It is **mixed-format**, not NVFP4 everywhere:

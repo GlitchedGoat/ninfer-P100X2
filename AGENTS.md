@@ -368,6 +368,7 @@ These are conventional project resources, not a checklist of resources every tas
 | Q4_K_M source | `/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
 | companion Vision source | same directory, `mmproj-Qwen3.8-27B-BF16.gguf` |
 | product artifact | `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer` |
+| P100X2 target artifact | official NVFP4 v3 container `neroued/Qwen3.8-27B-nvfp4-NInfer` (`qwen3_8_27b_nvfp4.ninfer`, identity `qwen3.8-27b/nvfp4`); host path TBD |
 | conversion report | product artifact path plus `.conversion.json` |
 | normal build | `build-v100/` |
 | private dependency prefix | `build/_deps/install/` |
