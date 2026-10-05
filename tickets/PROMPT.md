@@ -33,6 +33,8 @@ INT8 group-64 KV, CUDA Graphs, single request. Other identities are out of first
 - Develop on branch `claude/ninfer-p100-adaptation-xicv3d` (or the branch the owner names).
 - Every unit of work is a ticket `tickets/T-NNN-<slug>.md`. Keep its **Status**, **Log** and
   **Results** current as you work; log real commands and outcomes, not intentions.
+- **Decision log:** `tickets/DECISIONS.md` records the reasoning behind every non-obvious choice
+  (context, why, what would change it). Add an entry whenever you decide something novel.
 - **Optimization backlog:** `T-010-p100-perf-tuning.md` is the single list of Pascal/P100 tuning
   opportunities. Append every opportunity you notice there (ID, location, reason, how to verify),
   even if you do not act on it.
